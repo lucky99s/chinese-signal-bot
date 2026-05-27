@@ -8,8 +8,8 @@ app.use(cors());
 app.use(express.json());
 
 // ================== YOUR TELEGRAM SETTINGS ==================
-const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";   //
-const TELEGRAM_CHAT_ID = "7293402395";       //
+const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
+const TELEGRAM_CHAT_ID = "7293402395";
 
 // Function to send message to your Telegram
 async function sendTelegramMessage(text) {
@@ -29,21 +29,18 @@ async function sendTelegramMessage(text) {
 // ================== LICENSE + NAME ACTIVATION ==================
 app.post('/api/license-activate', async (req, res) => {
     const { licenseKey, userName, action, timestamp, timezone } = req.body;
-    
+   
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-    
+   
     const message = `
 🔑 <b>New License Activation</b>
-
 👤 <b>Name:</b> ${userName}
 🔑 <b>License:</b> ${licenseKey}
 🌍 <b>IP Address:</b> ${ip}
 ⏰ <b>Time (PKT):</b> ${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}
 📍 <b>Timezone:</b> Pakistan
-
 📱 Notification Permission: ${req.body.notificationPermission || "Unknown"}
     `.trim();
-
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
@@ -51,16 +48,31 @@ app.post('/api/license-activate', async (req, res) => {
 // ================== ACTIVITY TRACKING ==================
 app.post('/api/track-activity', async (req, res) => {
     const { action, userName, ...extra } = req.body;
-    
+   
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-
     const message = `
 📊 <b>User Activity</b>
-
 Action: <b>${action}</b>
 👤 Name: <b>${userName || "Unknown"}</b>
 🌍 IP: <b>${ip}</b>
 ⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
+    `.trim();
+    await sendTelegramMessage(message);
+    res.status(200).send({ status: "success" });
+});
+
+// ================== NEW: NOTIFICATION PERMISSION ==================
+app.post('/api/notification-permission', async (req, res) => {
+    const { userName, permission, timestamp } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+
+    const message = `
+🛎️ <b>Notification Permission Update</b>
+
+👤 <b>Name:</b> ${userName || "Unknown"}
+📱 <b>Permission Status:</b> ${permission}
+🌍 <b>IP Address:</b> ${ip}
+⏰ <b>Time (PKT):</b> ${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}
     `.trim();
 
     await sendTelegramMessage(message);
