@@ -12,3 +12,7 @@
     "axios": "^1.7.2"
   }
 }
+"scripts": {
+  "bot": "node bot.js",
+  "start": "node server.js"   // or whatever your main file is
+}
