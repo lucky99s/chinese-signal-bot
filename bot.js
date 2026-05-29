@@ -1,37 +1,36 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
-// Replace with your token
 const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-console.log("🤖 Telegram Bot is running...");
+console.log("🤖 Chinese Signal Bot Trigger is Running...");
 
-// Command: /trigger Name
+// Command: /trigger <name>
 bot.onText(/\/trigger (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    const userName = match[1].trim();   // Get the name after /trigger
+    const userName = match[1].trim();
 
     if (!userName) {
-        return bot.sendMessage(chatId, "❌ Please enter a name. Example: /trigger Ahmed");
+        return bot.sendMessage(chatId, "❌ Please enter name.\nExample: /trigger Ahmed");
     }
 
     try {
-        const triggerUrl = `https://chinese-signal-bot.onrender.com/api/trigger-connected?userName=${encodeURIComponent(userName)}`;
+        const url = `https://chinese-signal-bot.onrender.com/api/trigger-connected?userName=${encodeURIComponent(userName)}`;
         
-        await axios.get(triggerUrl);
+        await axios.get(url);
 
-        bot.sendMessage(chatId, `✅ Trigger sent successfully!\n\nUser: **${userName}**\nThey should now see "Account is Connected Successfully" popup.`, { parse_mode: "Markdown" });
+        bot.sendMessage(chatId, `✅ Trigger sent successfully!\n\n👤 User: **${userName}**\nThey should now see the popup.`, { parse_mode: "Markdown" });
     } catch (error) {
-        bot.sendMessage(chatId, "❌ Failed to trigger. Make sure your server is running.");
+        bot.sendMessage(chatId, "❌ Failed to trigger. Check if server is running.");
         console.error(error);
     }
 });
 
-// Simple start command
+// Start command
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, "Welcome! Use /trigger Name to show popup on website.\n\nExample: /trigger Ahmed");
+    bot.sendMessage(msg.chat.id, "Welcome!\n\nUse this command:\n/trigger Name\n\nExample: /trigger Ahmed");
 });
 
-console.log("✅ Bot commands ready: /trigger Name");
+console.log("✅ Ready! Use /trigger Name in your bot");
