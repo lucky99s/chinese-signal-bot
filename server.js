@@ -249,3 +249,65 @@ app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`📁 users.json location: ${DATA_FILE}`);
 });
+// ADD THESE ROUTES TO server.js
+
+// License storage
+const LICENSE_FILE = path.join(__dirname, 'licenses.json');
+let licenses = [];
+
+// Load licenses
+function loadLicenses() {
+    try {
+        if (fs.existsSync(LICENSE_FILE)) {
+            licenses = JSON.parse(fs.readFileSync(LICENSE_FILE, 'utf8'));
+        } else {
+            fs.writeFileSync(LICENSE_FILE, JSON.stringify([]));
+        }
+    } catch(e) {}
+}
+
+loadLicenses();
+
+function saveLicenses() {
+    fs.writeFileSync(LICENSE_FILE, JSON.stringify(licenses, null, 2));
+}
+
+// GET licenses
+app.get('/api/licenses', (req, res) => {
+    res.json(licenses);
+});
+
+// POST new license
+app.post('/api/licenses', (req, res) => {
+    const { key, type, expiry, maxUses } = req.body;
+    licenses.unshift({
+        key,
+        type,
+        status: 'Active',
+        usesLeft: maxUses || 999,
+        assignedTo: '',
+        addedDate: new Date().toISOString()
+    });
+    saveLicenses();
+    res.json({success: true});
+});
+
+// PUT toggle status
+app.put('/api/licenses/:key', (req, res) => {
+    const license = licenses.find(l => l.key === req.params.key);
+    if (license) {
+        license.status = license.status === 'Active' ? 'Inactive' : 'Active';
+        saveLicenses();
+    }
+    res.json({success: true});
+});
+
+// DELETE license
+app.delete('/api/licenses/:key', (req, res) => {
+    licenses = licenses.filter(l => l.key !== req.params.key);
+    saveLicenses();
+    res.json({success: true});
+});
+
+// Update license activation to validate against licenses
+// In /api/license-activate route, you can add validation if needed
