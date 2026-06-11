@@ -487,6 +487,25 @@ app.get('/api/poll-messages', (req, res) => {
     res.json({ messages: msgs });
 });
 
+// ================== MAINTENANCE MODE ==================
+let maintenanceMode = { active: false, until: null, message: 'Under Maintenance. Please check back soon.' };
+
+app.get('/api/maintenance', (req, res) => {
+    res.json(maintenanceMode);
+});
+
+app.post('/api/maintenance', (req, res) => {
+    const { active, until, message, adminKey } = req.body;
+    if (adminKey !== 'CSBotAdmin2024') return res.status(403).json({ error: 'Unauthorized' });
+    maintenanceMode = {
+        active:  !!active,
+        until:   until   || null,
+        message: message || 'Under Maintenance. Please check back soon.'
+    };
+    broadcastSSE('maintenance_update', maintenanceMode);
+    res.json({ ok: true, mode: maintenanceMode });
+});
+
 // ================== STATS & DATA ==================
 app.get('/api/stats', (req, res) => {
     res.json({
