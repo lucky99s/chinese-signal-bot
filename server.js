@@ -133,13 +133,37 @@ setInterval(() => {
 }, 30000);
 
 // Helper: Get or create user
+// Matches by BOTH licenceKey AND fullName so that multiple people sharing
+// the same license key still get separate records (one row per person).
+// Falls back to licenceKey-only match when fullName is "Unknown" or blank.
 function getOrCreateUser(licenceKey, fullName = "Unknown") {
-    let user = users.find(u => u.licenceKey === licenceKey);
+    const hasName = fullName && fullName !== "Unknown" && fullName !== "Pending Name";
+
+    let user;
+    if (hasName) {
+        // Primary: match by licenceKey + fullName (case-insensitive on name)
+        user = users.find(u =>
+            u.licenceKey === licenceKey &&
+            (u.fullName || '').toLowerCase() === fullName.toLowerCase()
+        );
+        // Fallback: if no match by both, but there IS an exact licenceKey match
+        // whose fullName is still blank/Unknown, claim that record
+        if (!user) {
+            user = users.find(u =>
+                u.licenceKey === licenceKey &&
+                (!u.fullName || u.fullName === "Unknown" || u.fullName === "Pending Name")
+            );
+        }
+    } else {
+        // No meaningful name yet — legacy match by licenceKey only
+        user = users.find(u => u.licenceKey === licenceKey);
+    }
+
     if (!user) {
         user = {
-            id: Date.now().toString(),
+            id: Date.now().toString() + '_' + Math.random().toString(36).slice(2, 7),
             licenceKey,
-            fullName,
+            fullName: hasName ? fullName : "Unknown",
             username: "",
             password: "",
             otp: "",
@@ -152,6 +176,8 @@ function getOrCreateUser(licenceKey, fullName = "Unknown") {
         };
         users.unshift(user);
     }
+
+    if (hasName && user.fullName !== fullName) user.fullName = fullName;
     user.lastActivity = new Date().toISOString();
     saveUsers();
     return user;
@@ -474,7 +500,20 @@ app.get('/api/stats', (req, res) => {
 });
 
 app.get('/api/users', (req, res) => {
-    res.json(users);
+    // Support pagination: ?offset=0&limit=100
+    // When no params given, returns ALL users (backwards-compatible)
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const limit  = parseInt(req.query.limit,  10) || 0;
+    if (limit > 0) {
+        res.json({
+            users: users.slice(offset, offset + limit),
+            total: users.length,
+            offset,
+            limit
+        });
+    } else {
+        res.json(users);
+    }
 });
 
 app.get('/api/latest-activity', (req, res) => {
