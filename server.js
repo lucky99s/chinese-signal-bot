@@ -955,7 +955,8 @@ app.get('/api/analytics', (req, res) => {
     res.json({ days, topUsers, actionBreakdown });
 });
 
-app.get('/',      (req, res) => res.send("✅ Chinese Signal Bot Server v4 — SQLite Powered — Permanent Storage"));
+app.get('/',           (req, res) => res.send("✅ Chinese Signal Bot Server v4 — SQLite Powered — Permanent Storage"));
+app.get('/api/healthz',(req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin_panel.html')));
 app.get('/bot',   (req, res) => res.sendFile(path.join(__dirname, 'main-bot.html')));
 
