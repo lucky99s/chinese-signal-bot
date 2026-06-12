@@ -1,17 +1,17 @@
 {
   "name": "chinese-signal-bot-server",
-  "version": "4.0.0",
-  "description": "Chinese Signal Bot — Express server with SQLite permanent storage",
+  "version": "3.1.0",
+  "description": "Chinese Signal Bot Backend — Permanent PostgreSQL Storage",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
   "dependencies": {
-    "axios": "^1.7.2",
-    "better-sqlite3": "^11.9.1",
+    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "axios": "^1.6.0",
+    "pg": "^8.11.3"
   },
   "engines": {
     "node": ">=18.0.0"
