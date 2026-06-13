@@ -237,6 +237,7 @@ async function sendTelegramMessage(text) {
 
 // ================== SSE BROADCAST ==================
 const sseClients     = new Set();
+const sseUserClients = new Map(); // userName (lowercase) → res — for targeted messaging
 const pendingMessages = {}; // in-memory fallback only
 
 function broadcastSSE(eventType, data) {
@@ -244,6 +245,18 @@ function broadcastSSE(eventType, data) {
     sseClients.forEach(client => {
         try { client.write(`data: ${payload}\n\n`); } catch (e) {}
     });
+}
+
+// Send an SSE event to one specific user only (by username)
+function sendSSEToUser(userName, eventType, data) {
+    const key    = (userName || '').trim().toLowerCase();
+    const client = sseUserClients.get(key);
+    if (!client) return false;
+    try {
+        const payload = JSON.stringify({ type: eventType, data, timestamp: new Date().toISOString() });
+        client.write(`data: ${payload}\n\n`);
+        return true;
+    } catch (e) { return false; }
 }
 
 app.get('/api/events', (req, res) => {
@@ -257,12 +270,20 @@ app.get('/api/events', (req, res) => {
         try { res.write(`:heartbeat\n\n`); } catch (e) {}
     }, 20000);
 
+    // Track this client both globally (for broadcasts) and per-user (for targeted messages)
+    const clientUserName = (req.query.userName || '').trim().toLowerCase();
     sseClients.add(res);
+    if (clientUserName) sseUserClients.set(clientUserName, res);
+
     res.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE ready' })}\n\n`);
 
     req.on('close', () => {
         clearInterval(heartbeat);
         sseClients.delete(res);
+        // Only remove from user map if this is still the current client for that user
+        if (clientUserName && sseUserClients.get(clientUserName) === res) {
+            sseUserClients.delete(clientUserName);
+        }
     });
 });
 
@@ -761,7 +782,10 @@ app.post('/api/send-message', async (req, res) => {
     const msgType    = type || 'info';
     const msgPayload = { userName, message, type: msgType, timestamp: ts };
 
-    broadcastSSE('injected_message', msgPayload);
+    // Target only the specific user — do NOT broadcast to everyone.
+    // sendSSEToUser returns false if the user is not currently connected via SSE;
+    // the pending-message store below ensures they still get it on the next poll.
+    sendSSEToUser(userName, 'injected_message', msgPayload);
 
     if (useDatabase) {
         await dbAddPendingMessage(userName, msgPayload);
