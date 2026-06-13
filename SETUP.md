@@ -1,3 +1,4 @@
+[SETUP.md](https://github.com/user-attachments/files/28907913/SETUP.md)
 # Chinese Signal Bot v4 — MongoDB Setup Guide
 
 ## What Changed
