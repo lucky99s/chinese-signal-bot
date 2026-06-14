@@ -72,6 +72,31 @@ const License        = mongoose.model('License',        licenseSchema);
 const PendingMessage = mongoose.model('PendingMessage', pendingMessageSchema);
 const Note           = mongoose.model('Note',           noteSchema);
 
+const settingSchema = new mongoose.Schema({
+    _id:         { type: String, default: 'bot' },
+    telegramUrl: { type: String, default: '' },
+    whatsappUrl: { type: String, default: '' },
+    botName:     { type: String, default: 'Chinese Signal Bot' },
+    updatedAt:   { type: Date,   default: Date.now },
+}, { _id: false, minimize: false });
+
+const orderSchema = new mongoose.Schema({
+    id:            { type: String, required: true, unique: true },
+    fullName:      { type: String, required: true },
+    planKey:       { type: String, required: true },   // week | month | lifetime
+    planLabel:     { type: String, default: '' },
+    planPricePKR:  { type: String, default: '' },
+    planPriceUSD:  { type: String, default: '' },
+    paymentMethod: { type: String, default: '' },
+    whatsapp:      { type: String, default: '' },
+    status:        { type: String, default: 'New', index: true }, // New | Contacted | Paid | Completed | Rejected
+    createdAt:     { type: Date,   default: Date.now },
+});
+
+const Setting = mongoose.model('Setting', settingSchema);
+const Order   = mongoose.model('Order',   orderSchema);
+
+
 // ================== DB HELPERS ==================
 
 async function dbGetOrCreateUser(licenceKey, fullName = 'Unknown') {
@@ -303,6 +328,32 @@ function saveSettings() {
     try { ensureDataDir(); fs.writeFileSync(SETTINGS_FILE, JSON.stringify(botSettings, null, 2)); } catch(e) {}
 }
 loadSettings();
+
+// DB-backed settings (survives container/file-disk resets on Render etc.)
+async function loadSettingsFromDB() {
+    if (!useDatabase) return botSettings;
+    try {
+        const doc = await Setting.findById('bot').lean();
+        if (doc) {
+            if (doc.telegramUrl !== undefined) botSettings.telegramUrl = doc.telegramUrl;
+            if (doc.whatsappUrl !== undefined) botSettings.whatsappUrl = doc.whatsappUrl;
+            if (doc.botName)                   botSettings.botName     = doc.botName;
+        }
+    } catch (e) { console.warn('loadSettingsFromDB:', e.message); }
+    return botSettings;
+}
+async function saveSettingsToDB() {
+    if (!useDatabase) return;
+    try {
+        await Setting.findByIdAndUpdate(
+            'bot',
+            { ...botSettings, updatedAt: new Date() },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+    } catch (e) { console.warn('saveSettingsToDB:', e.message); }
+}
+// Initial DB load shortly after Mongo connects
+setTimeout(() => { loadSettingsFromDB().catch(()=>{}); }, 2500);
 
 function ensureDataDir() {
     try {
@@ -1025,17 +1076,129 @@ app.get('/api/export-users', (req, res) => {
 });
 
 // ================== BOT SETTINGS ==================
-app.get('/api/bot-settings', (req, res) => res.json(botSettings));
+app.get('/api/bot-settings', async (req, res) => {
+    // Re-hydrate from DB so multiple instances / cold starts always see latest
+    try { await loadSettingsFromDB(); } catch(e) {}
+    res.json(botSettings);
+});
 
-app.post('/api/bot-settings', (req, res) => {
+app.post('/api/bot-settings', async (req, res) => {
     const { telegramUrl, whatsappUrl, botName, adminKey } = req.body || {};
     if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
     if (telegramUrl !== undefined) botSettings.telegramUrl = telegramUrl;
     if (whatsappUrl !== undefined) botSettings.whatsappUrl = whatsappUrl;
     if (botName     !== undefined) botSettings.botName     = botName;
     saveSettings();
+    await saveSettingsToDB();
     broadcastSSE('settings_updated', botSettings);
     res.json({ ok: true, settings: botSettings });
+});
+
+// ================== ORDERS (License purchase requests) ==================
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+let ordersMem = [];
+function loadOrdersFile() {
+    try { if (fs.existsSync(ORDERS_FILE)) ordersMem = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch(e) { ordersMem = []; }
+}
+function saveOrdersFile() {
+    try { ensureDataDir(); fs.writeFileSync(ORDERS_FILE, JSON.stringify(ordersMem, null, 2)); } catch(e) {}
+}
+loadOrdersFile();
+
+function isAdmin(req) {
+    const key = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString();
+    return key === 'CSAI-NEWX-ADMI-N999';
+}
+
+// Public: submit a new order from main-bot
+app.post('/api/orders', async (req, res) => {
+    try {
+        const b = req.body || {};
+        const clean = s => (typeof s === 'string' ? s.trim().slice(0, 300) : '');
+        const fullName      = clean(b.fullName);
+        const planKey       = clean(b.planKey);
+        const planLabel     = clean(b.planLabel);
+        const planPricePKR  = clean(b.planPricePKR);
+        const planPriceUSD  = clean(b.planPriceUSD);
+        const paymentMethod = clean(b.paymentMethod);
+        const whatsapp      = clean(b.whatsapp);
+
+        if (!fullName || !planKey || !paymentMethod || !whatsapp) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+        if (!['week','month','lifetime'].includes(planKey)) {
+            return res.status(400).json({ error: 'Invalid plan' });
+        }
+
+        const id = 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2,6).toUpperCase();
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, status: 'New', createdAt: new Date() };
+
+        if (useDatabase) {
+            await Order.create(order);
+        } else {
+            ordersMem.unshift(order);
+            saveOrdersFile();
+        }
+
+        broadcastSSE('new_order', order);
+        res.json({ ok: true, order: { id: order.id } });
+    } catch (e) {
+        console.error('POST /api/orders error:', e);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Admin: list orders
+app.get('/api/orders', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        if (useDatabase) {
+            const list = await Order.find({}).sort({ createdAt: -1 }).limit(1000).lean();
+            return res.json(list);
+        }
+        return res.json(ordersMem);
+    } catch (e) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Admin: update status
+app.patch('/api/orders/:id', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { id } = req.params;
+    const status = (req.body?.status || '').toString();
+    const allowed = ['New','Contacted','Paid','Completed','Rejected'];
+    if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    try {
+        if (useDatabase) {
+            const o = await Order.findOneAndUpdate({ id }, { status }, { new: true });
+            if (!o) return res.status(404).json({ error: 'Not found' });
+            broadcastSSE('order_updated', { id, status });
+            return res.json({ ok: true, order: o });
+        }
+        const o = ordersMem.find(x => x.id === id);
+        if (!o) return res.status(404).json({ error: 'Not found' });
+        o.status = status;
+        saveOrdersFile();
+        broadcastSSE('order_updated', { id, status });
+        res.json({ ok: true, order: o });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// Admin: delete
+app.delete('/api/orders/:id', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { id } = req.params;
+    try {
+        if (useDatabase) {
+            await Order.deleteOne({ id });
+        } else {
+            ordersMem = ordersMem.filter(x => x.id !== id);
+            saveOrdersFile();
+        }
+        broadcastSSE('order_deleted', { id });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/', (req, res) => {
