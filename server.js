@@ -291,9 +291,18 @@ app.get('/api/events', (req, res) => {
 const DATA_DIR      = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE     = path.join(DATA_DIR, 'users.json');
 const LICENSES_FILE = path.join(DATA_DIR, 'licenses.json');
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
-let users    = [];
-let licenses = [];
+let users       = [];
+let licenses    = [];
+let botSettings = { telegramUrl: '', whatsappUrl: '', botName: 'Chinese Signal Bot' };
+function loadSettings() {
+    try { if (fs.existsSync(SETTINGS_FILE)) botSettings = { ...botSettings, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; } catch(e) {}
+}
+function saveSettings() {
+    try { ensureDataDir(); fs.writeFileSync(SETTINGS_FILE, JSON.stringify(botSettings, null, 2)); } catch(e) {}
+}
+loadSettings();
 
 function ensureDataDir() {
     try {
@@ -766,8 +775,9 @@ app.post('/api/notification-permission', async (req, res) => {
 // ================== TRIGGER CONNECTED ==================
 app.get('/api/trigger-connected', async (req, res) => {
     const userName = req.query.userName || 'User';
-    broadcastSSE('show_connected',    { userName });
-    broadcastSSE('trigger_connected', { userName });
+    // Target only the specific user — same fix as send-message
+    sendSSEToUser(userName, 'show_connected',    { userName });
+    sendSSEToUser(userName, 'trigger_connected', { userName });
     await sendTelegramMessage(`🔗 <b>Connection Triggered</b>\n👤 User: <b>${userName}</b>`);
     res.send('Trigger sent');
 });
@@ -905,8 +915,7 @@ app.post('/api/broadcast-message', (req, res) => {
     const { message, type = 'info', adminKey } = req.body || {};
     if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
     if (!message) return res.status(400).json({ error: 'message required' });
-    const payload = { type: 'broadcast_message', data: { message, type, timestamp: new Date().toISOString() } };
-    broadcastSSE(payload);
+    broadcastSSE('broadcast_message', { message, type, timestamp: new Date().toISOString() });
     res.json({ ok: true, clients: sseClients.size });
 });
 
@@ -943,6 +952,20 @@ app.get('/api/user-notes/:licenceKey', async (req, res) => {
     } catch (e) {
         res.json({ note: '', updatedAt: null });
     }
+});
+
+// ================== BOT SETTINGS ==================
+app.get('/api/bot-settings', (req, res) => res.json(botSettings));
+
+app.post('/api/bot-settings', (req, res) => {
+    const { telegramUrl, whatsappUrl, botName, adminKey } = req.body || {};
+    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (telegramUrl !== undefined) botSettings.telegramUrl = telegramUrl;
+    if (whatsappUrl !== undefined) botSettings.whatsappUrl = whatsappUrl;
+    if (botName     !== undefined) botSettings.botName     = botName;
+    saveSettings();
+    broadcastSSE('settings_updated', botSettings);
+    res.json({ ok: true, settings: botSettings });
 });
 
 app.get('/', (req, res) => {
