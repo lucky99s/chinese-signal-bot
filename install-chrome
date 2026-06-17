@@ -1,0 +1,29 @@
+/**
+ * Ensures the Puppeteer-bundled Chrome is installed.
+ * Runs automatically after `npm install` via the postinstall hook.
+ */
+const { execSync } = require('child_process');
+const path = require('path');
+
+try {
+  const puppeteer = require('puppeteer');
+  const chromePath = puppeteer.executablePath();
+  const fs = require('fs');
+  if (fs.existsSync(chromePath)) {
+    console.log('✅ Chrome already installed at:', chromePath);
+    process.exit(0);
+  }
+} catch (e) {}
+
+console.log('📦 Installing Puppeteer Chrome browser...');
+try {
+  execSync('npx puppeteer browsers install chrome', {
+    stdio: 'inherit',
+    cwd: path.resolve(__dirname, '..'),
+    timeout: 300000,
+  });
+  console.log('✅ Chrome installed successfully.');
+} catch (err) {
+  console.warn('⚠️  Chrome install failed (non-fatal):', err.message);
+  console.warn('   If Quotex Auto-Login fails, run manually: npx puppeteer browsers install chrome');
+}
