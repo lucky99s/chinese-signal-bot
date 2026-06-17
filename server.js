@@ -235,36 +235,32 @@ async function launchQuotexSession(session) {
     try {
         await updateSession(session, 'launching', '🚀 Starting browser...');
 
-        // ── Resolve Chrome executable path ──────────────────────
-        let executablePath;
-        try {
-            executablePath = puppeteer.executablePath();
-        } catch(ex) {
-            // Fallback: try common cloud / render.com paths
-            const candidates = [
-                '/usr/bin/google-chrome',
-                '/usr/bin/chromium-browser',
-                '/usr/bin/chromium',
-                '/snap/bin/chromium',
-                process.env.PUPPETEER_EXECUTABLE_PATH,
-            ].filter(Boolean);
-            const fs2 = require('fs');
-            executablePath = candidates.find(p => { try { return fs2.existsSync(p); } catch(_){return false;} });
+        const launchOpts = {
+            headless: 'new',
+            args: [
+                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+                '--single-process', '--disable-gpu',
+                '--window-size=1280,800',
+            ],
+        };
+        // Allow hosts (Render/Heroku/Docker) to point to a system-installed Chrome
+        if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+            launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
         }
-
-        const launchArgs = [
-            '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
-            '--disable-gpu', '--window-size=1280,800',
-            '--disable-extensions', '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
-        ];
-
-        browser = await puppeteer.launch({
-            headless: true,
-            executablePath: executablePath || undefined,
-            args: launchArgs,
-        });
+        try {
+            browser = await puppeteer.launch(launchOpts);
+        } catch (e) {
+            if (/Could not find Chrome/i.test(e.message)) {
+                throw new Error(
+                    'Chrome is not installed for Puppeteer. Fix on Render: set Build Command to ' +
+                    '"npm install && npx puppeteer browsers install chrome" and redeploy. ' +
+                    'Or set PUPPETEER_EXECUTABLE_PATH env var to a system Chrome binary. ' +
+                    'Original: ' + e.message
+                );
+            }
+            throw e;
+        }
         session.browser = browser;
 
         const page = await browser.newPage();
@@ -1630,63 +1626,6 @@ app.get('/api/qx/history', async (req, res) => {
         }
         res.json([]);
     } catch(e) { res.json([]); }
-});
-
-// ================== PROFIT TRACKER ==================
-// In-memory profit log (also saved to file when no MongoDB)
-const PROFIT_FILE = path.join(DATA_DIR, 'profits.json');
-let profitLog = [];
-function loadProfitFile() { try { if (fs.existsSync(PROFIT_FILE)) profitLog = JSON.parse(fs.readFileSync(PROFIT_FILE, 'utf8')); } catch(e) { profitLog = []; } }
-function saveProfitFile() { try { ensureDataDir(); fs.writeFileSync(PROFIT_FILE, JSON.stringify(profitLog, null, 2)); } catch(e) {} }
-loadProfitFile();
-
-// POST /api/profit — log a profit entry
-app.post('/api/profit', async (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    const { clientName, licenceKey, tradeAmount, profitAmount, profitPct, note = '' } = req.body || {};
-    if (!clientName || profitAmount === undefined) return res.status(400).json({ error: 'clientName and profitAmount required' });
-    const entry = {
-        id: 'P-' + Date.now().toString(36).toUpperCase(),
-        clientName, licenceKey: licenceKey || '',
-        tradeAmount: parseFloat(tradeAmount) || 0,
-        profitAmount: parseFloat(profitAmount) || 0,
-        profitPct: parseFloat(profitPct) || 0,
-        note,
-        createdAt: new Date().toISOString(),
-    };
-    profitLog.unshift(entry);
-    if (profitLog.length > 500) profitLog.pop();
-    saveProfitFile();
-    broadcastSSE('profit_logged', entry);
-    res.json({ ok: true, entry });
-});
-
-// GET /api/profit — get profit log
-app.get('/api/profit', (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    const limit = parseInt(req.query.limit) || 100;
-    res.json({ entries: profitLog.slice(0, limit), totalProfit: profitLog.reduce((s, e) => s + e.profitAmount, 0) });
-});
-
-// DELETE /api/profit/:id — delete a profit entry
-app.delete('/api/profit/:id', (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    profitLog = profitLog.filter(e => e.id !== req.params.id);
-    saveProfitFile();
-    res.json({ ok: true });
-});
-
-// POST /api/qx/retry — retry a failed/error session
-app.post('/api/qx/retry', async (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    const { sessionId } = req.body || {};
-    const session = quotexSessions.get(sessionId);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
-    if (session.browser) { try { await session.browser.close(); } catch(e) {} }
-    session.browser = null; session.page = null; session.otpAttempts = 0;
-    session.screenshotBase64 = null;
-    launchQuotexSession(session).catch(e => console.error('retry launch error:', e.message));
-    res.json({ ok: true, message: `Retrying session for ${session.clientName}` });
 });
 
 // ================== EXPORT USERS CSV ==================
