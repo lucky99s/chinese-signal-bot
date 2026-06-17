@@ -1,123 +1,89 @@
-[README.md](https://github.com/user-attachments/files/28907915/README.md)
-# Chinese Signal Bot — Deployment Guide v3.1
+[README.md](https://github.com/user-attachments/files/29049341/README.md)
+# Chinese Signal Bot — Deploy Package
 
-## What's New in This Version
+## Stack
+- Node.js 18+ / Express 4
+- MongoDB (Mongoose 8)
+- Puppeteer 22 (Quotex auto-login)
+- Telegram Bot API
+- Two HTML frontends (no build step needed)
 
-- **Permanent PostgreSQL storage** — data survives ALL server restarts and sleep cycles
-- **100k+ concurrent users** — connection pool of 100, proper indexes on all query fields
-- **Admin key updated** — new key: `CSAI-NEWX-ADMI-N999`
-- **Zero data loss** — users, licenses, OTPs, activities, messages all stored permanently
-- **Smart fallback** — works without a database too (file-based storage)
+## Quick Start
 
----
-
-## Files Included
-
-| File | Description |
-|------|-------------|
-| `server.js` | Main backend server (PostgreSQL + file fallback) |
-| `admin_panel.html` | Admin panel (serve as static file or open directly) |
-| `main-bot.html` | Main bot page (serve as static file or open directly) |
-| `package.json` | Dependencies including `pg` for PostgreSQL |
-| `.env.example` | Environment variable template |
-
----
-
-## Quick Deploy on Render.com (Recommended — Free Tier)
-
-### Step 1 — Create a PostgreSQL database (FREE)
-
-1. Go to [render.com](https://render.com) → **New → PostgreSQL**
-2. Name it `csbot-db`, choose Free plan → **Create Database**
-3. Copy the **"External Database URL"** (starts with `postgresql://`)
-
-### Step 2 — Deploy the server
-
-1. Push these files to a GitHub repo (or use Render's manual deploy)
-2. **New → Web Service** → connect your repo
-3. Set:
-   - **Build Command:** `npm install`
-   - **Start Command:** `node server.js`
-4. Under **Environment Variables**, add:
-   ```
-   DATABASE_URL = postgresql://... (paste the URL from Step 1)
-   ```
-5. Click **Deploy**
-
-### Step 3 — Verify it's working
-
-Visit `https://your-app.onrender.com/` — you should see:
+### 1. Install dependencies
+```bash
+npm install
 ```
-✅ Chinese Signal Bot Server v3 Running — Storage: PostgreSQL (Permanent)
-```
+The `postinstall` script (`scripts/install-chrome.js`) will automatically
+download a compatible Chromium binary if `puppeteer` cannot find one.
 
----
-
-## Deploy on Railway.app (Also Free)
-
-1. **New Project → Deploy from GitHub**
-2. Add a **PostgreSQL** plugin (click +)
-3. Railway auto-sets `DATABASE_URL` — no manual config needed
-4. Set start command: `node server.js`
-
----
-
-## Deploy on Fly.io
+### 2. Set environment variables
+Copy `.env.example` to `.env` and fill in your values:
 
 ```bash
-fly launch
-fly postgres create --name csbot-db
-fly postgres attach csbot-db
-fly deploy
+cp .env.example .env
 ```
 
----
+| Variable | Description |
+|---|---|
+| `MONGO_URI` | MongoDB connection string |
+| `ADMIN_KEY` | Admin panel access key |
+| `BOT_TOKEN` | Telegram bot token |
+| `CHAT_ID` | Telegram chat/channel ID |
+| `PORT` | Server port (default 3000) |
+| `SESSION_SECRET` | Express session secret |
 
-## Free PostgreSQL Options (No Credit Card)
+### 3. Start the server
+```bash
+npm start         # production
+npm run dev       # development (nodemon)
+```
 
-| Provider | Free Tier | Notes |
-|----------|-----------|-------|
-| [Neon.tech](https://neon.tech) | 3 GB | Serverless, auto-scales |
-| [Supabase](https://supabase.com) | 500 MB | Great dashboard |
-| [Railway](https://railway.app) | $5/month credit | Easy setup |
-| Render PostgreSQL | 90 days free | Then $7/month |
-
----
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABASE_URL` | **Yes** (for permanent storage) | PostgreSQL connection string |
-| `PORT` | No (default: 3000) | Server port |
-| `DATA_DIR` | No | File storage path (file-mode only) |
+### 4. Access frontends
+- **Admin Panel:** `http://localhost:3000/admin`
+- **Client Bot Page:** `http://localhost:3000/`
 
 ---
 
-## Admin Panel
+## Deploying to Render.com
 
-Open `admin_panel.html` in your browser.
+1. Push this folder to a GitHub repo
+2. Create a new **Web Service** on Render
+3. Set **Build Command:** `npm install`
+4. Set **Start Command:** `npm start`
+5. Add all environment variables in the Render dashboard
+6. Deploy
 
-- **Admin Login:** `Lucky8i` / `Jana8i` / `22045`
-- **Maintenance Admin Key:** `CSAI-NEWX-ADMI-N999`
-
----
-
-## Important Notes
-
-1. **The main bot URL** (`https://chinese-signal-bot.onrender.com`) is hardcoded in `main-bot.html` — update it if your server URL changes.
-2. **Maintenance mode** is stored in memory (resets on restart). This is intentional — maintenance should be manually toggled.
-3. **File storage fallback** — if `DATABASE_URL` is not set, data is stored in the `data/` folder. On Render free tier, this WILL be lost on restart unless you mount a persistent disk.
+> **Note:** Render's free tier may kill long-running Puppeteer processes.
+> Use a paid plan or set `PUPPETEER_EXECUTABLE_PATH` to a preinstalled Chrome.
 
 ---
 
-## Database Tables Created Automatically
+## New Features (v2)
 
-| Table | Purpose |
-|-------|---------|
-| `users` | All user records (credentials, OTPs, status) |
-| `licenses` | License keys and their status |
-| `pending_messages` | Messages queued for users via Msg Injector |
-| `activity_log` | Global activity history |
+### Auto-Login (Broker) Section
+- **Session filter tabs** — view All / Active / Need OTP / Logged In / Errors / Closed
+- **Auto-refresh toggle** — polls every 10s automatically
+- **Retry button** — re-launch failed/closed sessions without reloading
+- **Profit shortcut** — click 💰 on a logged-in session card to log profit
 
-No manual migration needed — tables are created on first startup.
+### Profit Tracker Section
+- Log trade profit + your commission % per client
+- Running totals (count, total profit, average per trade)
+- Delete individual entries
+- Summary card updates live in broker section stats
+
+---
+
+## File Map
+```
+csbot-deploy/
+├── server.js           Main Express server (Puppeteer fix + new APIs)
+├── admin_panel.html    Admin interface (redesigned broker + profit tracker)
+├── main-bot.html       Client-facing Telegram bot page
+├── package.json        Dependencies + postinstall Chrome installer
+├── scripts/
+│   └── install-chrome.js  Auto Chromium downloader
+├── .env.example        Environment variable template
+└── README.md           This file
+```
