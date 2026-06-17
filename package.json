@@ -1,11 +1,12 @@
 {
   "name": "chinese-signal-bot-server",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "description": "Chinese Signal Bot — Broker Management System with Quotex Auto-Login",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "postinstall": "node scripts/install-chrome.js"
   },
   "engines": {
     "node": ">=18.0.0"
