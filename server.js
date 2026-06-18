@@ -525,98 +525,120 @@ async function launchQuotexSession(session) {
             }
         }).catch(() => {});
 
-        // ── Take a debug screenshot BEFORE filling so admin can see the form ──
-        await updateSession(session, 'filling', '📸 Capturing pre-fill screenshot...', { screenshot: true });
-
-        // ── Fill form via evaluate() — bypasses all "not clickable" issues ──
-        await updateSession(session, 'filling', '✍️ Filling login form...');
-        const fillResult = await page.evaluate((emailVal, passVal) => {
-            function setNativeValue(el, value) {
-                const nativeSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                nativeSetter.call(el, value);
-                el.dispatchEvent(new Event('input',  { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent('keydown',  { bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent('keyup',    { bubbles: true }));
-            }
-
-            const allInputs = Array.from(document.querySelectorAll('input'))
-                .filter(el => el.type !== 'hidden');
-
-            const emailEl = allInputs.find(el =>
+        // ── STEP 1: Inspect the form — get stable CSS selectors ──────────────
+        await updateSession(session, 'filling', '🔍 Inspecting form fields...');
+        const urlBeforeSubmit = page.url();
+        const formInspect = await page.evaluate(() => {
+            const all = Array.from(document.querySelectorAll('input'));
+            const visible = all.filter(el =>
+                el.type !== 'hidden' && el.type !== 'checkbox' &&
+                el.type !== 'radio'  && !el.disabled
+            );
+            const emailEl = visible.find(el =>
                 el.type === 'email' ||
-                el.name === 'email' || el.name === 'login' || el.name === 'username' ||
-                el.id   === 'email' || el.id   === 'login' || el.id   === 'username' ||
-                (el.getAttribute('autocomplete') || '').includes('email') ||
-                (el.getAttribute('autocomplete') || '').includes('username') ||
-                (el.placeholder || '').toLowerCase().includes('email') ||
-                (el.placeholder || '').toLowerCase().includes('login') ||
-                (el.placeholder || '').toLowerCase().includes('username') ||
-                (el.placeholder || '').toLowerCase().includes('e-mail')
-            ) || allInputs.find(el => el.type === 'text');
+                ['email','login','username','user'].includes((el.name||'').toLowerCase()) ||
+                ['email','login','username'].includes((el.id||'').toLowerCase()) ||
+                (el.getAttribute('autocomplete')||'').toLowerCase().includes('email') ||
+                (el.getAttribute('autocomplete')||'').toLowerCase().includes('username') ||
+                (el.placeholder||'').toLowerCase().includes('email') ||
+                (el.placeholder||'').toLowerCase().includes('login') ||
+                (el.placeholder||'').toLowerCase().includes('username')
+            ) || visible.find(el => el.type === 'text') || visible[0];
 
-            const passEl = allInputs.find(el =>
+            const passEl = visible.find(el =>
                 el.type === 'password' ||
-                el.name === 'password' || el.name === 'pass' ||
-                el.id   === 'password' || el.id   === 'pass' ||
-                (el.getAttribute('autocomplete') || '').includes('password') ||
-                (el.placeholder || '').toLowerCase().includes('password') ||
-                (el.placeholder || '').toLowerCase().includes('pass')
+                ['password','pass'].includes((el.name||'').toLowerCase()) ||
+                ['password','pass'].includes((el.id||'').toLowerCase())
             );
 
-            const debugInfo = {
-                inputCount: allInputs.length,
-                inputTypes: allInputs.map(el => `${el.type}|${el.name}|${el.placeholder}|${el.id}`),
-                url: window.location.href,
+            if (!emailEl || !passEl) {
+                return {
+                    ok: false,
+                    error: `Form inputs not found (visible:${visible.length} total:${all.length})`,
+                    debug: visible.map(el => `[${el.type}] name="${el.name}" id="${el.id}" placeholder="${el.placeholder}"`),
+                };
+            }
+            const makeSel = el => {
+                if (el.id)   return '#' + CSS.escape(el.id);
+                if (el.name) return `input[name="${el.name}"]`;
+                if (el.type === 'email')    return 'input[type="email"]';
+                if (el.type === 'password') return 'input[type="password"]';
+                // positional fallback
+                const idx = Array.from(document.querySelectorAll('input')).indexOf(el);
+                return `input:nth-of-type(${idx + 1})`;
             };
-
-            if (!emailEl) return { ok: false, error: 'Email input not found on page', debug: debugInfo };
-            if (!passEl)  return { ok: false, error: 'Password input not found on page', debug: debugInfo };
-
-            emailEl.focus();
-            setNativeValue(emailEl, emailVal);
-
-            passEl.focus();
-            setNativeValue(passEl, passVal);
-
-            return { ok: true };
-        }, email, password);
-
-        if (!fillResult.ok) {
-            const dbg = fillResult.debug ? ` | inputs(${fillResult.debug.inputCount}): ${(fillResult.debug.inputTypes||[]).slice(0,5).join('; ')} | url: ${fillResult.debug.url}` : '';
-            await updateSession(session, 'error', `❌ ${fillResult.error} — check screenshot`, { screenshot: true });
-            throw new Error((fillResult.error || 'Could not fill login form') + dbg);
-        }
-
-        await sleep(800);
-        await updateSession(session, 'filling', '🖱️ Submitting login form...', { screenshot: true });
-
-        // Submit: try button click via DOM, fallback to Enter
-        const submitted = await page.evaluate(() => {
-            const btn = document.querySelector('button[type="submit"]') ||
-                        document.querySelector('form button') ||
-                        Array.from(document.querySelectorAll('button')).find(b =>
-                            (b.textContent || '').toLowerCase().includes('sign') ||
-                            (b.textContent || '').toLowerCase().includes('login') ||
-                            (b.textContent || '').toLowerCase().includes('log in') ||
-                            (b.textContent || '').toLowerCase().includes('enter')
-                        );
-            if (btn) { btn.click(); return true; }
-            return false;
+            return { ok: true, emailSel: makeSel(emailEl), passSel: makeSel(passEl) };
         });
-        if (!submitted) {
+
+        if (!formInspect.ok) {
+            await updateSession(session, 'error', `❌ ${formInspect.error}`, { screenshot: true });
+            throw new Error(formInspect.error + ' | ' + JSON.stringify(formInspect.debug || []));
+        }
+        const { emailSel, passSel } = formInspect;
+
+        // ── STEP 2: Fill fields using REAL keystrokes (required for Vue 3 / React) ──
+        // page.type() fires: keydown → keypress → input → keyup for every character,
+        // which is what SPA frameworks need to update their reactive state.
+        // setNativeValue / dispatchEvent alone does NOT work with Vue 3.
+        await updateSession(session, 'filling', `⌨️ Typing email into ${emailSel}...`);
+        try {
+            await page.click(emailSel, { clickCount: 3 }); // triple-click = select all
+            await page.keyboard.press('Backspace');         // clear existing content
+        } catch(_) {}
+        await page.type(emailSel, email, { delay: 60 });
+
+        await sleep(400);
+
+        await updateSession(session, 'filling', '⌨️ Typing password...');
+        try {
+            await page.click(passSel, { clickCount: 3 });
+            await page.keyboard.press('Backspace');
+        } catch(_) {}
+        await page.type(passSel, password, { delay: 60 });
+
+        await sleep(700);
+        await updateSession(session, 'filling', '📸 Pre-submit screenshot...', { screenshot: true });
+
+        // ── STEP 3: Wait for submit button to become enabled, then click ──────
+        await updateSession(session, 'filling', '🖱️ Looking for submit button...');
+        let btnFound = false;
+        for (let i = 0; i < 8; i++) {
+            btnFound = await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                const btn = btns.find(b => !b.disabled && b.type === 'submit')
+                    || btns.find(b => {
+                        if (b.disabled) return false;
+                        const t = (b.textContent || b.value || '').toLowerCase().trim();
+                        return t.includes('sign') || t.includes('login') || t.includes('log in') ||
+                               t.includes('enter') || t.includes('continue');
+                       })
+                    || btns.find(b => !b.disabled && (b.type === 'submit' || b.getAttribute('form')));
+                if (btn) { btn.click(); return true; }
+                return false;
+            });
+            if (btnFound) break;
+            await sleep(500);
+        }
+        if (!btnFound) {
+            // No button found — press Enter in password field as last resort
+            await page.focus(passSel);
             await page.keyboard.press('Enter');
         }
 
-        // Wait for SPA to navigate away from sign-in page
-        // Use waitForNavigation (race with a fallback timeout) so we catch fast redirects
-        await Promise.race([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {}),
-            sleep(12000),
-        ]);
-        await sleep(1500); // let Vue/React finish rendering
+        // ── STEP 4: Wait for the page to react ─────────────────────────────────
+        await updateSession(session, 'filling', '⏳ Waiting for Quotex to respond...');
+        // Watch for URL change (navigation) OR in-place DOM change (OTP screen)
+        try {
+            await page.waitForFunction(
+                (startUrl) => window.location.href !== startUrl,
+                { timeout: 15000 },
+                urlBeforeSubmit
+            );
+        } catch(_) {
+            // URL didn't change — page may be showing OTP screen or error in-place
+            await sleep(3000);
+        }
+        await sleep(1200);
         await updateSession(session, 'filling', '⏳ Checking login result...', { screenshot: true });
 
         await checkQuotexLoginResult(session, clientName, email);
@@ -644,93 +666,132 @@ async function checkQuotexLoginResult(session, clientName, email) {
 
     const currentUrl = page.url();
 
-    // Detect OTP / 2FA requirement
-    const needOTP = await page.evaluate(() => {
-        const body = document.body?.innerText?.toLowerCase() || '';
-        const hasOTPInput = !!(
-            document.querySelector('input[maxlength="6"][type="text"]') ||
-            document.querySelector('input[maxlength="6"][type="number"]') ||
-            document.querySelector('input[maxlength="1"]') ||
-            document.querySelector('[class*="confirm"], [class*="verification"], [class*="otp"], [class*="two-factor"]')
-        );
-        const hasOTPText = body.includes('verification code') || body.includes('otp') ||
-                           body.includes('two-factor') || body.includes('confirm your') ||
-                           body.includes('check your email') || body.includes('sent a code') ||
-                           body.includes('enter code') || body.includes('security code');
-        return hasOTPInput || hasOTPText;
-    }).catch(() => false);
+    // 1. URL already left sign-in page
+    const isSignInUrl = currentUrl.includes('sign-in') || currentUrl.includes('/login');
+    if (!isSignInUrl) {
+        const otpOnPage = await page.evaluate(() => {
+            const inputs = Array.from(document.querySelectorAll('input'));
+            const singleDigit = inputs.filter(function(el){ return el.maxLength === 1 && el.type !== 'hidden'; }).length;
+            const codeField   = inputs.some(function(el){
+                return (el.maxLength >= 4 && el.maxLength <= 8 && el.type !== 'password' && el.type !== 'hidden') ||
+                       (el.name || '').toLowerCase().includes('otp') ||
+                       (el.name || '').toLowerCase().includes('code');
+            });
+            return singleDigit >= 4 || codeField;
+        }).catch(function(){ return false; });
+        if (!otpOnPage) { await handleLoginSuccess(session, clientName, email); return; }
+    }
 
-    if (needOTP) {
+    // 2. Deep scan of page state
+    const pageState = await page.evaluate(() => {
+        const body   = document.body ? document.body.innerText.toLowerCase()  : '';
+        const html   = document.body ? document.body.innerHTML.toLowerCase()  : '';
+        const inputs = Array.from(document.querySelectorAll('input'));
+        const singleDigitInputs = inputs.filter(function(el){ return el.maxLength === 1 && el.type !== 'hidden'; }).length;
+        const otpCodeInput = inputs.some(function(el){
+            return (el.maxLength >= 4 && el.maxLength <= 8 && el.type !== 'password' && el.type !== 'hidden') ||
+                   (el.name || '').toLowerCase().includes('otp') ||
+                   (el.name || '').toLowerCase().includes('code') ||
+                   (el.id   || '').toLowerCase().includes('otp') ||
+                   (el.placeholder || '').toLowerCase().includes('code');
+        });
+        const hasOTPClass = !!(
+            document.querySelector('[class*="otp"]')         ||
+            document.querySelector('[class*="verify"]')      ||
+            document.querySelector('[class*="confirm"]')     ||
+            document.querySelector('[class*="two-factor"]')  ||
+            document.querySelector('[class*="2fa"]')
+        );
+        const hasOTPText = body.includes('verification')      || body.includes('verify') ||
+                           body.includes('confirmation code') || body.includes('check your email') ||
+                           body.includes('sent a code')       || body.includes('enter the code') ||
+                           body.includes('security code')     || body.includes('one-time') ||
+                           html.includes('otp')               || html.includes('2fa');
+        const needOTP = singleDigitInputs >= 4 || otpCodeInput || hasOTPClass || hasOTPText;
+
+        var errorMsg = null;
+        var errorCandidates = Array.from(document.querySelectorAll(
+            '[class*="error"],[class*="invalid"],[class*="alert"],[class*="warning"],[class*="danger"],[role="alert"],.toast'
+        ));
+        for (var i = 0; i < errorCandidates.length; i++) {
+            var txt = (errorCandidates[i].innerText || '').trim();
+            if (txt.length > 3 && txt.length < 250) { errorMsg = txt; break; }
+        }
+        return { needOTP: needOTP, errorMsg: errorMsg, url: window.location.href,
+                 title: document.title || '', bodySnippet: body.slice(0, 300) };
+    }).catch(function(){ return { needOTP: false, errorMsg: null, url: currentUrl, bodySnippet: '' }; });
+
+    // 3. OTP required
+    if (pageState.needOTP) {
         await updateSession(session, 'waiting_otp',
             '🔢 OTP required — waiting for admin to enter the code', { screenshot: true });
-
         const ts = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
         await sendTelegramMessage(
-            `🔢 <b>OTP Required — Quotex Login</b>\n` +
-            `👤 Client: <b>${clientName}</b>\n📧 Email: <b>${email}</b>\n⏰ Time: <b>${ts}</b>\n\n` +
-            `Send OTP code:\n<code>/otp ${session.id} 123456</code>`
+            '🔢 <b>OTP Required — Quotex Login</b>\n' +
+            '👤 Client: <b>' + clientName + '</b>\n📧 Email: <b>' + email + '</b>\n⏰ Time: <b>' + ts + '</b>\n\n' +
+            'Send OTP code:\n<code>/otp ' + session.id + ' 123456</code>'
         );
-
-        // Inline keyboard for easy OTP from Telegram
         await tgApi('sendMessage', {
             chat_id: TELEGRAM_CHAT_ID,
             parse_mode: 'HTML',
-            text: `🔢 <b>Enter OTP for ${clientName}</b> (${email})\nSession: <code>${session.id}</code>`,
+            text: '🔢 <b>Enter OTP for ' + clientName + '</b> (' + email + ')\nSession: <code>' + session.id + '</code>',
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: '✏️ Enter OTP Now', callback_data: `ask_qxotp|${session.id}|${encodeURIComponent(clientName)}` }],
-                    [{ text: '🔄 Retry Login',   callback_data: `qxretry|${session.id}` }],
-                    [{ text: '❌ Cancel Session', callback_data: `qxclose|${session.id}` }],
+                    [{ text: '✏️ Enter OTP Now', callback_data: 'ask_qxotp|' + session.id + '|' + encodeURIComponent(clientName) }],
+                    [{ text: '🔄 Retry Login',   callback_data: 'qxretry|' + session.id }],
+                    [{ text: '❌ Cancel Session', callback_data: 'qxclose|' + session.id }],
                 ],
             },
         });
         return;
     }
 
-    // Detect login error (wrong credentials)
-    const errorText = await page.evaluate(() => {
-        const selectors = [
-            '.error-message', '.alert-danger', '.alert-error', '[class*="error-text"]',
-            '[class*="invalid"]', '[class*="alert"]', 'form .error', '.form-error',
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el && el.innerText?.trim()) return el.innerText.trim();
-        }
-        return null;
-    }).catch(() => null);
-
-    // Check if URL indicates we left sign-in page (success)
-    // Works for both market-qx.pro and market-qx.trade — any URL that no longer
-    // contains 'sign-in' or 'login' after we were ON a sign-in page counts as success.
-    const isSignInPage = currentUrl.includes('sign-in') || currentUrl.includes('/login');
-    const isKnownSuccessPath = currentUrl.includes('/trade') || currentUrl.includes('/cabinet') ||
-        currentUrl.includes('/profile') || currentUrl.includes('/dashboard') ||
-        currentUrl.includes('/platform') || currentUrl.includes('/en/') && !isSignInPage;
-    const isSuccessUrl = !isSignInPage && isKnownSuccessPath;
-
-    if (isSuccessUrl) {
-        await handleLoginSuccess(session, clientName, email);
-        return;
-    }
-
-    if (errorText) {
-        await updateSession(session, 'error', `❌ ${errorText.slice(0, 150)}`, { screenshot: true });
+    // 4. Known error message on page
+    if (pageState.errorMsg) {
+        await updateSession(session, 'error', '❌ ' + pageState.errorMsg.slice(0, 150), { screenshot: true });
         await sendTelegramMessage(
-            `❌ <b>Quotex Login Failed</b>\n👤 Client: <b>${clientName}</b>\n📧 Email: <b>${email}</b>\n` +
-            `⚠️ Reason: <b>${errorText.slice(0, 200)}</b>`
+            '❌ <b>Quotex Login Failed</b>\n👤 Client: <b>' + clientName + '</b>\n📧 Email: <b>' + email + '</b>\n' +
+            '⚠️ Reason: <b>' + pageState.errorMsg.slice(0, 200) + '</b>'
         );
         return;
     }
 
-    // Unknown state — take screenshot and notify
-    await updateSession(session, 'error',
-        '⚠️ Unknown state after login — check screenshot in admin panel', { screenshot: true });
-    await sendTelegramMessage(
-        `⚠️ <b>Quotex — Unknown Login State</b>\n👤 Client: <b>${clientName}</b>\n📧 Email: <b>${email}</b>\n` +
-        `🌐 URL: <code>${currentUrl.slice(0, 100)}</code>\nCheck screenshot in admin panel.`
-    );
+    // 5. Still on sign-in page — form submit had no visible effect
+    if (isSignInUrl) {
+        await sleep(5000);
+        const retryUrl = page.url();
+        if (!retryUrl.includes('sign-in') && !retryUrl.includes('/login')) {
+            return checkQuotexLoginResult(session, clientName, email);
+        }
+        const retryError = await page.evaluate(() => {
+            var els = Array.from(document.querySelectorAll('[class*="error"],[class*="invalid"],[role="alert"]'));
+            for (var i = 0; i < els.length; i++) {
+                var t = (els[i].innerText || '').trim();
+                if (t.length > 3) return t;
+            }
+            return null;
+        }).catch(function(){ return null; });
+        if (retryError) {
+            await updateSession(session, 'error', '❌ ' + retryError.slice(0, 150), { screenshot: true });
+            await sendTelegramMessage('❌ <b>Quotex Login Failed</b>\n👤 <b>' + clientName + '</b>\n📧 <b>' + email + '</b>\n⚠️ <b>' + retryError.slice(0, 200) + '</b>');
+            return;
+        }
+        await updateSession(session, 'error',
+            '⚠️ Form submit had no effect — possible CAPTCHA. Check screenshot in admin panel.', { screenshot: true });
+        await sendTelegramMessage(
+            '⚠️ <b>Quotex — Submit Had No Effect</b>\n' +
+            '👤 Client: <b>' + clientName + '</b>\n📧 Email: <b>' + email + '</b>\n' +
+            '🌐 URL: <code>' + retryUrl.slice(0, 120) + '</code>\n' +
+            '📄 Page snippet: <i>' + (pageState.bodySnippet || '').slice(0, 150) + '</i>\n' +
+            '📸 Screenshot saved — open Admin Panel → Broker Sessions to view.'
+        );
+        return;
+    }
+
+    // 6. Off sign-in URL, nothing matched — treat as success
+    await handleLoginSuccess(session, clientName, email);
 }
+
 
 async function handleLoginSuccess(session, clientName, email) {
     await sleep(2500); // Let page settle
