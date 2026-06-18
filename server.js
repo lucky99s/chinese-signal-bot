@@ -1500,7 +1500,6 @@ async function tgHandleCallback(chatId, data, callbackId) {
         if (!maintenanceMode.active) { maintenanceMode.active = true; }
         broadcastSSE('maintenance_update', maintenanceMode);
         const label = presetVal === '0' ? '♾️ No limit' : presetVal === '30m' ? '30 minutes' : presetVal + ' hour(s)';
-        await tgApi('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: `⏱️ Maintenance set to ${label}` });
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
             text: `🔧 <b>Maintenance ON</b> — Duration: <b>${label}</b>
 All users will see the maintenance page.`,
@@ -1761,7 +1760,6 @@ All users will see the maintenance page.`,
         sendSSEToUser(tcUser, 'show_connected',    { userName: tcUser });
         sendSSEToUser(tcUser, 'trigger_connected', { userName: tcUser });
         await sendTelegramMessage(`🔗 <b>Trigger Connected</b> fired\n👤 User: <b>${tcUser}</b>`);
-        await tgApi('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: '🔗 Connected trigger sent!' });
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
             text: `✅ <b>Trigger Connected</b> sent to <b>${tcUser}</b>\n🔗 Their bot session now shows "Account Connected".`,
             reply_markup: tgUserActionKeyboard(tcUser) });
@@ -2012,6 +2010,51 @@ async function tgCmdCredsMenu(chatId) {
 
 async function tgHandleMessage(msg) {
     const chatId = msg.chat.id;
+    const text0  = (msg.text || '').trim();
+
+    // ── /start handler — works for ALL users (admin + regular) ──────────
+    if (text0 === '/start') {
+        const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL || '@A_ToolsX';
+        const BOT_URL          = process.env.BOT_URL || '';
+
+        // Admin always gets the admin panel directly
+        if (String(chatId) === String(TELEGRAM_CHAT_ID)) {
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                reply_markup: tgMainMenuKeyboard(),
+                text: '🤖 <b>Chinese Signal Bot — Admin Control</b>\n\nSend a <b>username</b> to manage that user, or pick an option.' });
+        }
+
+        // For regular users: check channel membership
+        try {
+            const memberResp = await tgApi('getChatMember', { chat_id: REQUIRED_CHANNEL, user_id: chatId });
+            const status     = memberResp?.result?.status;
+            const isMember   = ['member', 'administrator', 'creator', 'restricted'].includes(status);
+
+            if (isMember) {
+                return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                    text: `✅ <b>Welcome!</b> You are a verified channel member.\n\n` +
+                          (BOT_URL
+                              ? `🔗 Access the trading bot here:\n${BOT_URL}`
+                              : `📩 Contact the admin to receive your access link.`) });
+            } else {
+                return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '📢 Join Channel Now', url: `https://t.me/${REQUIRED_CHANNEL.replace('@', '')}` }]] },
+                    text: `🚀 <b>To use this bot, you must join our channel:</b>\n` +
+                          `https://t.me/${REQUIRED_CHANNEL.replace('@', '')}\n\n` +
+                          `✅ After joining, send /start again.` });
+            }
+        } catch(e) {
+            // getChatMember failed — bot is likely not a channel admin.
+            // Add the bot as an admin of the channel so membership checks work.
+            // For now, fall through gracefully.
+            console.warn('getChatMember failed (is the bot a channel admin?):', e.message);
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `✅ <b>Welcome!</b>` +
+                      (BOT_URL ? `\n\n🔗 Access the bot here:\n${BOT_URL}` : `\n\n📩 Contact the admin for your access link.`) });
+        }
+    }
+    // ────────────────────────────────────────────────────────────────────
+
     if (String(chatId) !== String(TELEGRAM_CHAT_ID)) {
         return tgApi('sendMessage', { chat_id: chatId, text: '⛔ Unauthorized.' });
     }
@@ -2561,10 +2604,11 @@ async function telegramPollLoop() {
             });
             for (const up of (r.data?.result || [])) {
                 tgOffset = up.update_id + 1;
-                try {
-                    if (up.message) await tgHandleMessage(up.message);
-                    else if (up.callback_query) await tgHandleCallback(up.callback_query.message.chat.id, up.callback_query.data, up.callback_query.id);
-                } catch(e) { console.error('tg update error:', e.message); }
+                if (up.message)
+                    tgHandleMessage(up.message).catch(e => console.error('tg msg error:', e.message));
+                else if (up.callback_query)
+                    tgHandleCallback(up.callback_query.message.chat.id, up.callback_query.data, up.callback_query.id)
+                        .catch(e => console.error('tg callback error:', e.message));
             }
         } catch(e) { await new Promise(r => setTimeout(r, 3000)); }
     }
