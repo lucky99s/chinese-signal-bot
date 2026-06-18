@@ -225,24 +225,20 @@ let autoOtpConfig = {
 // ── Extract OTP from raw email source ──────────────────────────────────────────
 function extractOtpFromEmail(source) {
     const raw  = source.toString();
-    // Decode common HTML entities and strip tags for clean text matching
+    // Decode HTML entities and strip tags for clean text matching
     const text = raw
         .replace(/&nbsp;/gi, ' ')
         .replace(/&#\d+;/g, ' ')
         .replace(/<[^>]+>/g, ' ')
         .replace(/\s+/g, ' ');
-    // Priority patterns: context-aware first, then fallbacks
+    // Priority patterns: context-aware first, then broadening fallbacks
     const patterns = [
-        // "Your verification code is 123456" / "OTP: 123456"
         /(?:verification|confirmation|security|one.?time|confirm(?:ation)?|login)\s*(?:code|pin|otp)[^\d]{0,25}(\d{4,8})/i,
         /(?:code|otp|pin)\s*(?:is|:|=|-|\s)\s*[\s:-]*(\d{4,8})/i,
         /(\d{6})\s*(?:is your|verification|confirm|code|otp)/i,
-        // Quotex-style: bold or spaced OTP presentation
         /(?:enter|use|input|submit)[^\d]{0,20}(\d{4,8})/i,
-        // Fallback: standalone 6-digit number (most common Quotex OTP length)
-        /\b(\d{6})\b/,
-        // Last resort: 4-digit OTP
-        /\b(\d{4})\b/,
+        /\b(\d{6})\b/,  // 6-digit standalone (most common Quotex OTP)
+        /\b(\d{4})\b/,  // 4-digit last resort
     ];
     for (const re of patterns) {
         const m = text.match(re);
