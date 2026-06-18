@@ -19,3 +19,6 @@
     "puppeteer": "^22.0.0"
   }
 }
+"dependencies": {
+  "imapflow": "^1.0.0"
+}
