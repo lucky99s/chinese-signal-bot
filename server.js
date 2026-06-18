@@ -193,6 +193,165 @@ try {
     console.warn('⚠️  Puppeteer not installed. Run: npm install puppeteer  to enable Auto-Login.');
 }
 
+// ================== AUTO-OTP (IMAP EMAIL WATCHER) ==================
+// Install: npm install imapflow
+// Required env: OTP_EMAIL, OTP_EMAIL_PASSWORD
+// Optional env: OTP_IMAP_HOST (default: imap.gmail.com), OTP_IMAP_PORT (default: 993)
+// For Gmail: enable IMAP in Gmail settings + use an App Password (not your normal password)
+let ImapFlow = null;
+let imapflowAvailable = false;
+try {
+    ImapFlow = require('imapflow').ImapFlow;
+    imapflowAvailable = true;
+} catch(e) {
+    console.warn('⚠️  imapflow not installed. Run: npm install imapflow  to enable Auto-OTP.');
+}
+
+const OTP_EMAIL          = process.env.OTP_EMAIL          || '';
+const OTP_EMAIL_PASSWORD = process.env.OTP_EMAIL_PASSWORD || '';
+const OTP_IMAP_HOST      = process.env.OTP_IMAP_HOST      || 'imap.gmail.com';
+const OTP_IMAP_PORT      = parseInt(process.env.OTP_IMAP_PORT || '993', 10);
+
+let autoOtpConfig = {
+    enabled:      imapflowAvailable && !!(OTP_EMAIL && OTP_EMAIL_PASSWORD),
+    available:    imapflowAvailable,
+    emailSet:     !!(OTP_EMAIL && OTP_EMAIL_PASSWORD),
+    lastOtp:      null,
+    lastOtpTime:  null,
+    lastCheck:    null,
+    lastError:    null,
+};
+
+// ── Extract OTP from raw email source ──────────────────────────────────────────
+function extractOtpFromEmail(source) {
+    const text = source.toString();
+    // Priority patterns: context-aware first
+    const patterns = [
+        /(?:verification|confirmation|security|one.?time|confirm(?:ation)?)s*(?:code|pin|otp)[^d]{0,20}(d{4,6})/i,
+        /(?:code|otp|pin)[^d]{0,10}(?:is|:|s)s*[s:-]*(d{4,6})/i,
+        /(d{6})s*(?:is your|verification|code|otp)/i,
+        /(d{6})/,   // 6-digit standalone (most common Quotex OTP length)
+        /(d{4})/,   // 4-digit fallback
+    ];
+    for (const re of patterns) {
+        const m = text.match(re);
+        if (m) return m[1];
+    }
+    return null;
+}
+
+// ── Single IMAP check pass ─────────────────────────────────────────────────────
+async function checkEmailForOTP(waitingSessions) {
+    if (!imapflowAvailable || !OTP_EMAIL || !OTP_EMAIL_PASSWORD) return;
+
+    const client = new ImapFlow({
+        host:    OTP_IMAP_HOST,
+        port:    OTP_IMAP_PORT,
+        secure:  true,
+        auth:    { user: OTP_EMAIL, pass: OTP_EMAIL_PASSWORD },
+        logger:  false,
+    });
+
+    try {
+        await client.connect();
+        const lock = await client.getMailboxLock('INBOX');
+
+        try {
+            // Search for unseen messages in the last 3 minutes
+            const since = new Date(Date.now() - 3 * 60 * 1000);
+            const uids = await client.search({ seen: false, since }, { uid: true });
+
+            if (!uids || uids.length === 0) return;
+
+            for await (const msg of client.fetch(uids, { source: true, envelope: true }, { uid: true })) {
+                const source  = msg.source?.toString() || '';
+                const subject = msg.envelope?.subject || '';
+                const from    = (msg.envelope?.from?.[0]?.address || '').toLowerCase();
+
+                // Is this a Quotex / verification email?
+                const isRelevant =
+                    from.includes('quotex') || from.includes('market-qx') ||
+                    from.includes('qxbroker') || from.includes('noreply') ||
+                    from.includes('support') || from.includes('info@') ||
+                    /(?:verification|otp|code|confirm)/i.test(subject);
+
+                if (!isRelevant) continue;
+
+                const otp = extractOtpFromEmail(source);
+                if (!otp) continue;
+
+                // Mark as seen so we don't re-process it
+                await client.messageFlagsAdd(msg.uid, ['\Seen'], { uid: true });
+
+                autoOtpConfig.lastOtp     = otp;
+                autoOtpConfig.lastOtpTime = new Date().toISOString();
+                broadcastSSE('auto_otp_update', { ...autoOtpConfig });
+
+await sendTelegramMessage(
+                    '🤖 <b>Auto-OTP Detected!</b>\n' +
+                    '━━━━━━━━━━━━━━━━━\n' +
+                    '🔢 OTP: <b>' + otp + '</b>\n' +
+                    '📧 From: <code>' + from + '</code>\n' +
+                    '📋 Subject: ' + subject.slice(0, 60) + '\n' +
+                    '⏰ Time: ' + ts + '\n' +
+                    '⚡ Submitting automatically...'
+                );
+
+                // Submit to the MOST RECENT session waiting for OTP
+                // Try to match by email first, fall back to most recent
+                const matchSession = waitingSessions.find(s =>
+                    s.email && (from.includes(s.email.split('@')[1] || '___') || true)
+                ) || waitingSessions[waitingSessions.length - 1];
+
+                if (matchSession) {
+                    const result = await submitQuotexOTP(matchSession.id, otp);
+                    if (result?.ok) {
+                        await sendTelegramMessage(
+                            '✅ <b>Auto-OTP Success!</b>\n' +
+                            '👤 Client: <b>' + matchSession.clientName + '</b>\n' +
+                            '🔢 OTP <b>' + otp + '</b> accepted — Logging in...'
+                        );
+                    } else {
+                        await sendTelegramMessage(
+                            '❌ <b>Auto-OTP Submitted but Rejected</b>\n' +
+                            '👤 Client: <b>' + matchSession.clientName + '</b>\n' +
+                            '⚠️ ' + (result?.error || result?.message || 'Unknown error') + '\n' +
+                            '💡 Check screenshot in admin panel.'
+                        );
+                    }
+                }
+
+                break; // Process only the first matching OTP email
+            }
+        } finally {
+            lock.release();
+        }
+
+        autoOtpConfig.lastCheck  = new Date().toISOString();
+        autoOtpConfig.lastError  = null;
+        await client.logout();
+
+    } catch(e) {
+        autoOtpConfig.lastError = e.message.slice(0, 120);
+        try { await client.logout(); } catch(ex) {}
+    }
+}
+
+// ── Background watcher — polls every 5 seconds when sessions wait for OTP ─────
+let autoOtpWatcherStarted = false;
+function startAutoOtpWatcher() {
+    if (autoOtpWatcherStarted) return;
+    autoOtpWatcherStarted = true;
+    setInterval(async () => {
+        if (!autoOtpConfig.enabled) return;
+        const waiting = [...quotexSessions.values()]
+            .filter(s => ['waiting_otp', 'wrong_otp'].includes(s.status));
+        if (waiting.length === 0) return;
+        try { await checkEmailForOTP(waiting); } catch(e) {}
+    }, 5000);
+    console.log('🤖 Auto-OTP watcher started (polling every 5s)');
+}
+
 // ── Session state machine ───────────────────────────────────
 // launching → navigating → filling → waiting_otp → submitting_otp → logged_in
 //                                                                   → wrong_otp → submitting_otp → ...
@@ -296,36 +455,100 @@ async function launchQuotexSession(session) {
         });
 
         await updateSession(session, 'navigating', '🌐 Opening Quotex login page...');
-        await page.goto('https://qxbroker.com/en/sign-in', { waitUntil: 'domcontentloaded', timeout: 40000 });
+        await page.goto('https://market-qx.trade/en/sign-in/', { waitUntil: 'networkidle2', timeout: 60000 });
         await sleep(1500);
         await updateSession(session, 'navigating', '🌐 Page loaded — finding form...', { screenshot: true });
 
-        // Fill email
-        await updateSession(session, 'filling', '✍️ Entering email...');
-        const emailSel = 'input[type="email"], input[name="email"], input[placeholder*="mail" i], input[placeholder*="Email" i]';
-        await page.waitForSelector(emailSel, { visible: true, timeout: 20000 });
-        await safeClick(page, emailSel);
-        await sleep(300);
-        await page.type(emailSel, email, { delay: 60 });
+        // Wait for Vue SPA to render the login form (market-qx.trade is async)
+        await updateSession(session, 'filling', '⏳ Waiting for login form to render...');
+        await page.waitForFunction(() => {
+            const inputs = Array.from(document.querySelectorAll('input'));
+            return inputs.some(el =>
+                el.type === 'email' || el.name === 'email' ||
+                (el.placeholder || '').toLowerCase().includes('email') ||
+                (el.placeholder || '').toLowerCase().includes('login')
+            );
+        }, { timeout: 30000 }).catch(() => {});
+        await sleep(1000);
 
-        // Fill password
-        await updateSession(session, 'filling', '✍️ Entering password...');
-        const passSel = 'input[type="password"], input[name="password"], input[placeholder*="assword" i]';
-        await page.waitForSelector(passSel, { visible: true, timeout: 10000 });
-        await safeClick(page, passSel);
-        await sleep(300);
-        await page.type(passSel, password, { delay: 60 });
+        // Dismiss any cookie/modal overlay that might block interaction
+        await page.evaluate(() => {
+            const overlaySelectors = [
+                '[class*="cookie"]', '[class*="modal"]', '[class*="popup"]',
+                '[class*="overlay"]', '[class*="dialog"]', '[class*="consent"]',
+            ];
+            for (const sel of overlaySelectors) {
+                const el = document.querySelector(sel);
+                if (el) el.remove();
+            }
+        }).catch(() => {});
 
+        // ── Fill form via evaluate() — bypasses all "not clickable" issues ──
+        // Uses the React/Vue native setter so framework state updates correctly
+        await updateSession(session, 'filling', '✍️ Filling login form...');
+        const fillResult = await page.evaluate((emailVal, passVal) => {
+            function setNativeValue(el, value) {
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(el, value);
+                el.dispatchEvent(new Event('input',  { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keydown',  { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keyup',    { bubbles: true }));
+            }
+
+            const allInputs = Array.from(document.querySelectorAll('input'));
+
+            // Find email field
+            const emailEl = allInputs.find(el =>
+                el.type === 'email' || el.name === 'email' ||
+                (el.placeholder || '').toLowerCase().includes('email') ||
+                (el.placeholder || '').toLowerCase().includes('login') ||
+                (el.placeholder || '').toLowerCase().includes('username')
+            );
+
+            // Find password field
+            const passEl = allInputs.find(el =>
+                el.type === 'password' || el.name === 'password' ||
+                (el.placeholder || '').toLowerCase().includes('password') ||
+                (el.placeholder || '').toLowerCase().includes('pass')
+            );
+
+            if (!emailEl) return { ok: false, error: 'Email input not found on page' };
+            if (!passEl)  return { ok: false, error: 'Password input not found on page' };
+
+            // Fill values
+            emailEl.focus();
+            setNativeValue(emailEl, emailVal);
+
+            passEl.focus();
+            setNativeValue(passEl, passVal);
+
+            return { ok: true };
+        }, email, password);
+
+        if (!fillResult.ok) {
+            throw new Error(fillResult.error || 'Could not fill login form');
+        }
+
+        await sleep(800);
         await updateSession(session, 'filling', '🖱️ Submitting login form...', { screenshot: true });
-        await sleep(400);
 
-        // Click submit
-        const btnSel = 'button[type="submit"], form button, [class*="sign-in"] button, [class*="login"] button, [class*="submit"] button';
-        const submitBtn = await page.$(btnSel);
-        if (submitBtn) {
-            await safeClick(page, btnSel);
-        } else {
-            // Press Enter on password field
+        // Submit: try button click via DOM, fallback to Enter
+        const submitted = await page.evaluate(() => {
+            const btn = document.querySelector('button[type="submit"]') ||
+                        document.querySelector('form button') ||
+                        Array.from(document.querySelectorAll('button')).find(b =>
+                            (b.textContent || '').toLowerCase().includes('sign') ||
+                            (b.textContent || '').toLowerCase().includes('login') ||
+                            (b.textContent || '').toLowerCase().includes('log in') ||
+                            (b.textContent || '').toLowerCase().includes('enter')
+                        );
+            if (btn) { btn.click(); return true; }
+            return false;
+        });
+        if (!submitted) {
             await page.keyboard.press('Enter');
         }
 
@@ -413,7 +636,7 @@ async function checkQuotexLoginResult(session, clientName, email) {
     const isSuccessUrl = !currentUrl.includes('sign-in') && !currentUrl.includes('login') &&
                          (currentUrl.includes('trade') || currentUrl.includes('cabinet') ||
                           currentUrl.includes('profile') || currentUrl.includes('dashboard') ||
-                          currentUrl.includes('qxbroker.com/en/') && !currentUrl.includes('sign'));
+                          currentUrl.includes('market-qx.trade/en/') && !currentUrl.includes('sign'));
 
     if (isSuccessUrl) {
         await handleLoginSuccess(session, clientName, email);
@@ -1486,6 +1709,12 @@ Send any <b>username</b> → user action keyboard
 <b>━━━ MAINTENANCE ━━━</b>
 /maint — Toggle + set duration (30m/1h/2h/6h/24h)
 
+<b>━━━ AUTO-OTP ━━━</b>
+/autootp — Toggle auto-OTP on/off (reads inbox automatically)
+/autootp on — Enable auto-OTP
+/autootp off — Disable auto-OTP
+/otpstatus — Show auto-OTP status &amp; config
+
 <b>━━━ AUTO-LOGIN (QUOTEX) ━━━</b>
 /qxlaunch &lt;email&gt; &lt;pass&gt; [name] — Start Quotex login
 /otp &lt;sessionId&gt; &lt;code&gt; — Submit OTP
@@ -1720,6 +1949,41 @@ async function tgHandleMessage(msg) {
     if (text === '/retry')   return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
         text: `⚙️ <b>Auto-Retry Config</b>\nEnabled: <b>${autoRetryConfig.enabled}</b>\nMax: <b>${autoRetryConfig.maxAttempts}</b>\nDelay: <b>${autoRetryConfig.delaySeconds}s</b>`,
         reply_markup: tgRetryConfigKeyboard() });
+
+    // /autootp — toggle auto-OTP watcher on/off
+    if (text === '/autootp' || text === '/autootp on' || text === '/autootp off') {
+        if (!imapflowAvailable) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '⚠️ <b>imapflow not installed</b>\n\nRun this on your server:\n<code>npm install imapflow</code>\nThen restart.' });
+        if (!OTP_EMAIL || !OTP_EMAIL_PASSWORD) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '⚠️ <b>Email not configured</b>\n\nSet these environment variables on your server:\n<code>OTP_EMAIL=your@gmail.com</code>\n<code>OTP_EMAIL_PASSWORD=your-app-password</code>' });
+        if (text === '/autootp on')       autoOtpConfig.enabled = true;
+        else if (text === '/autootp off') autoOtpConfig.enabled = false;
+        else autoOtpConfig.enabled = !autoOtpConfig.enabled;
+        broadcastSSE('auto_otp_update', { ...autoOtpConfig });
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: autoOtpConfig.enabled
+                ? '🤖 <b>Auto-OTP ENABLED</b>\n✅ I will now watch your inbox and auto-submit OTPs to waiting Quotex sessions.'
+                : '⚪ <b>Auto-OTP DISABLED</b>\nYou will need to submit OTPs manually with /otp command.' });
+    }
+
+    // /otpstatus — show auto-OTP status
+    if (text === '/otpstatus') {
+        const status = autoOtpConfig.enabled ? '✅ ENABLED' : '⚪ DISABLED';
+        const pkg    = imapflowAvailable ? '✅ Installed' : '❌ Not installed';
+        const creds  = (OTP_EMAIL && OTP_EMAIL_PASSWORD) ? '✅ Set' : '❌ Not set';
+        const last   = autoOtpConfig.lastOtpTime
+            ? new Date(autoOtpConfig.lastOtpTime).toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })
+            : 'Never';
+        const err    = autoOtpConfig.lastError ? '\n⚠️ Last error: ' + autoOtpConfig.lastError : '';
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: '🤖 <b>Auto-OTP Status</b>\n━━━━━━━━━━━━━━━━━\n' +
+                  '🔌 Status: <b>' + status + '</b>\n' +
+                  '📦 imapflow: ' + pkg + '\n' +
+                  '🔑 Credentials: ' + creds + '\n' +
+                  '📧 IMAP: ' + OTP_IMAP_HOST + ':' + OTP_IMAP_PORT + '\n' +
+                  '🔢 Last OTP: <b>' + (autoOtpConfig.lastOtp || 'None yet') + '</b>\n' +
+                  '⏰ Last detected: ' + last + err });
+    }
 
     // /lowbal username — low balance warning
     if (text.startsWith('/lowbal ') || text.startsWith('/lowbalance ')) {
@@ -2068,9 +2332,7 @@ async function tgHandleMessage(msg) {
     if (text.startsWith('/tc ')) {
         const tcUser = text.slice(4).trim();
         if (!tcUser) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: '📌 Usage: <code>/tc username</code>
-
-Sends the "Account Connected" signal to a specific user's live session.' });
+            text: '📌 Usage: <code>/tc username</code>\n\nSends the \"Account Connected\" signal to a specific user\'s live session.' });
         sendSSEToUser(tcUser, 'show_connected',    { userName: tcUser });
         sendSSEToUser(tcUser, 'trigger_connected', { userName: tcUser });
         await sendTelegramMessage(`🔗 <b>Trigger Connected</b> fired from Telegram\n👤 User: <b>${tcUser}</b>`);
@@ -2639,6 +2901,43 @@ app.get('/api/kick-user', (req, res) => {
     res.json({ ok: true, wasConnected: !!client });
 });
 
+// ================== AUTO-OTP API ==================
+app.get('/api/auto-otp/status', (req, res) => {
+    res.json({
+        ...autoOtpConfig,
+        imapHost: OTP_IMAP_HOST,
+        imapPort: OTP_IMAP_PORT,
+        emailConfigured: !!(OTP_EMAIL && OTP_EMAIL_PASSWORD),
+        email: OTP_EMAIL ? OTP_EMAIL.replace(/(.{2}).*(@.*)/, '$1***$2') : '',
+    });
+});
+
+app.post('/api/auto-otp/toggle', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!imapflowAvailable)  return res.status(400).json({ error: 'imapflow not installed. Run: npm install imapflow' });
+    if (!OTP_EMAIL || !OTP_EMAIL_PASSWORD) return res.status(400).json({ error: 'OTP_EMAIL and OTP_EMAIL_PASSWORD env vars not set.' });
+    autoOtpConfig.enabled = !autoOtpConfig.enabled;
+    broadcastSSE('auto_otp_update', { ...autoOtpConfig });
+    res.json({ ok: true, enabled: autoOtpConfig.enabled });
+});
+
+app.post('/api/auto-otp/test', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!imapflowAvailable)  return res.status(400).json({ error: 'imapflow not installed' });
+    if (!OTP_EMAIL || !OTP_EMAIL_PASSWORD) return res.status(400).json({ error: 'Email credentials not set' });
+    try {
+        const client = new ImapFlow({ host: OTP_IMAP_HOST, port: OTP_IMAP_PORT, secure: true,
+            auth: { user: OTP_EMAIL, pass: OTP_EMAIL_PASSWORD }, logger: false });
+        await client.connect();
+        const info = await client.getMailboxLock('INBOX');
+        info.release();
+        await client.logout();
+        res.json({ ok: true, message: '✅ IMAP connection successful! Auto-OTP is ready.' });
+    } catch(e) {
+        res.status(400).json({ ok: false, error: e.message });
+    }
+});
+
 // ================== BOT SETTINGS ==================
 app.get('/api/bot-settings', async (req, res) => { try { await loadSettingsFromDB(); } catch(e) {} res.json(botSettings); });
 app.post('/api/bot-settings', async (req, res) => {
@@ -2974,6 +3273,7 @@ async function startServer() {
         if (!puppeteerAvailable) console.log('   → To enable Quotex Auto-Login: npm install puppeteer');
         if (process.env.AUTO_LAUNCH_ON_LOGIN === 'true') console.log('🔄 Auto-Launch on Login: ENABLED');
         telegramPollLoop().catch(e => console.error('Telegram poll loop crashed:', e.message));
+        startAutoOtpWatcher();
     });
 }
 startServer().catch(err => { console.error('Failed to start server:', err); process.exit(1); });
