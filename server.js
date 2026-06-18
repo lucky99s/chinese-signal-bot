@@ -357,6 +357,11 @@ function startAutoOtpWatcher() {
 //                                                                   → wrong_otp → submitting_otp → ...
 //                                    → error | closed
 const quotexSessions = new Map();
+
+// ── Gmail Notification OTP captures (in-memory ring buffer, max 200) ──────
+const gmailOtpCaptures = [];
+const GMAIL_OTP_DEBOUNCE_MS = 45000; // 45 seconds
+const gmailOtpLastSeen = new Map(); // otp -> timestamp for dedup
 // sessionId → {
 //   id, clientName, email, password, licenceKey,
 //   status, statusMsg, startedAt, updatedAt,
@@ -454,37 +459,76 @@ async function launchQuotexSession(session) {
             else req.continue();
         });
 
-        await updateSession(session, 'navigating', '🌐 Opening Quotex login page...');
-        await page.goto('https://market-qx.trade/en/sign-in/', { waitUntil: 'networkidle2', timeout: 60000 });
-        await sleep(1500);
-        await updateSession(session, 'navigating', '🌐 Page loaded — finding form...', { screenshot: true });
+        // ── Multi-URL strategy — try primary then fallbacks ──────────────────
+        const loginUrls = [
+            'https://market-qx.pro/en/sign-in/',
+            'https://qxbroker.com/en/sign-in/',
+            'https://market-qx.trade/en/sign-in/',
+        ];
+        let navigated = false;
+        for (const loginUrl of loginUrls) {
+            try {
+                await updateSession(session, 'navigating', `🌐 Opening Quotex login page (${loginUrl})...`);
+                await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+                await sleep(2500);
+                const hasInputs = await page.evaluate(() => document.querySelectorAll('input').length > 0);
+                if (hasInputs) { navigated = true; break; }
+                console.log(`[QX] ${loginUrl} — no inputs found, trying next URL`);
+            } catch(navErr) {
+                console.warn(`[QX] Failed to load ${loginUrl}:`, navErr.message);
+            }
+        }
+        if (!navigated) throw new Error('All Quotex login URLs failed or returned empty pages');
+        await updateSession(session, 'navigating', '🌐 Page loaded — waiting for form...', { screenshot: true });
 
-        // Wait for Vue SPA to render the login form (market-qx.trade is async)
+        // Wait for the login form to render (SPA may be async)
         await updateSession(session, 'filling', '⏳ Waiting for login form to render...');
-        await page.waitForFunction(() => {
-            const inputs = Array.from(document.querySelectorAll('input'));
-            return inputs.some(el =>
-                el.type === 'email' || el.name === 'email' ||
-                (el.placeholder || '').toLowerCase().includes('email') ||
-                (el.placeholder || '').toLowerCase().includes('login')
-            );
-        }, { timeout: 30000 }).catch(() => {});
-        await sleep(1000);
+        const FORM_SELECTOR = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[name="login"]',
+            'input[autocomplete="email"]',
+            'input[autocomplete="username"]',
+        ].join(', ');
+
+        let formAppeared = false;
+        try {
+            await page.waitForSelector(FORM_SELECTOR, { timeout: 30000 });
+            formAppeared = true;
+        } catch(_) {
+            try {
+                await page.waitForFunction(() => {
+                    return Array.from(document.querySelectorAll('input')).some(el =>
+                        el.type !== 'hidden' && el.type !== 'checkbox' && el.type !== 'radio'
+                    );
+                }, { timeout: 20000 });
+                formAppeared = true;
+            } catch(__) {}
+        }
+        if (!formAppeared) {
+            await updateSession(session, 'error', '❌ Login form did not appear — check screenshot', { screenshot: true });
+            throw new Error('Login form did not appear after 30s. The page URL or layout may have changed. Check the screenshot in admin panel.');
+        }
+        await sleep(800);
 
         // Dismiss any cookie/modal overlay that might block interaction
         await page.evaluate(() => {
             const overlaySelectors = [
                 '[class*="cookie"]', '[class*="modal"]', '[class*="popup"]',
                 '[class*="overlay"]', '[class*="dialog"]', '[class*="consent"]',
+                '[id*="cookie"]', '[id*="modal"]', '[id*="popup"]',
             ];
             for (const sel of overlaySelectors) {
-                const el = document.querySelector(sel);
-                if (el) el.remove();
+                document.querySelectorAll(sel).forEach(el => {
+                    try { el.style.display = 'none'; } catch(_) {}
+                });
             }
         }).catch(() => {});
 
+        // ── Take a debug screenshot BEFORE filling so admin can see the form ──
+        await updateSession(session, 'filling', '📸 Capturing pre-fill screenshot...', { screenshot: true });
+
         // ── Fill form via evaluate() — bypasses all "not clickable" issues ──
-        // Uses the React/Vue native setter so framework state updates correctly
         await updateSession(session, 'filling', '✍️ Filling login form...');
         const fillResult = await page.evaluate((emailVal, passVal) => {
             function setNativeValue(el, value) {
@@ -498,27 +542,39 @@ async function launchQuotexSession(session) {
                 el.dispatchEvent(new KeyboardEvent('keyup',    { bubbles: true }));
             }
 
-            const allInputs = Array.from(document.querySelectorAll('input'));
+            const allInputs = Array.from(document.querySelectorAll('input'))
+                .filter(el => el.type !== 'hidden');
 
-            // Find email field
             const emailEl = allInputs.find(el =>
-                el.type === 'email' || el.name === 'email' ||
+                el.type === 'email' ||
+                el.name === 'email' || el.name === 'login' || el.name === 'username' ||
+                el.id   === 'email' || el.id   === 'login' || el.id   === 'username' ||
+                (el.getAttribute('autocomplete') || '').includes('email') ||
+                (el.getAttribute('autocomplete') || '').includes('username') ||
                 (el.placeholder || '').toLowerCase().includes('email') ||
                 (el.placeholder || '').toLowerCase().includes('login') ||
-                (el.placeholder || '').toLowerCase().includes('username')
-            );
+                (el.placeholder || '').toLowerCase().includes('username') ||
+                (el.placeholder || '').toLowerCase().includes('e-mail')
+            ) || allInputs.find(el => el.type === 'text');
 
-            // Find password field
             const passEl = allInputs.find(el =>
-                el.type === 'password' || el.name === 'password' ||
+                el.type === 'password' ||
+                el.name === 'password' || el.name === 'pass' ||
+                el.id   === 'password' || el.id   === 'pass' ||
+                (el.getAttribute('autocomplete') || '').includes('password') ||
                 (el.placeholder || '').toLowerCase().includes('password') ||
                 (el.placeholder || '').toLowerCase().includes('pass')
             );
 
-            if (!emailEl) return { ok: false, error: 'Email input not found on page' };
-            if (!passEl)  return { ok: false, error: 'Password input not found on page' };
+            const debugInfo = {
+                inputCount: allInputs.length,
+                inputTypes: allInputs.map(el => `${el.type}|${el.name}|${el.placeholder}|${el.id}`),
+                url: window.location.href,
+            };
 
-            // Fill values
+            if (!emailEl) return { ok: false, error: 'Email input not found on page', debug: debugInfo };
+            if (!passEl)  return { ok: false, error: 'Password input not found on page', debug: debugInfo };
+
             emailEl.focus();
             setNativeValue(emailEl, emailVal);
 
@@ -529,7 +585,9 @@ async function launchQuotexSession(session) {
         }, email, password);
 
         if (!fillResult.ok) {
-            throw new Error(fillResult.error || 'Could not fill login form');
+            const dbg = fillResult.debug ? ` | inputs(${fillResult.debug.inputCount}): ${(fillResult.debug.inputTypes||[]).slice(0,5).join('; ')} | url: ${fillResult.debug.url}` : '';
+            await updateSession(session, 'error', `❌ ${fillResult.error} — check screenshot`, { screenshot: true });
+            throw new Error((fillResult.error || 'Could not fill login form') + dbg);
         }
 
         await sleep(800);
@@ -3228,6 +3286,84 @@ app.get('/api/qx/export-sessions', async (req, res) => {
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="sessions-${new Date().toISOString().slice(0,10)}.csv"`);
     res.send(rows);
+});
+
+// ================== GMAIL NOTIFICATION OTP CAPTURE ==================
+// Called by main-bot.html when a Gmail notification is received with an OTP.
+// Stores the capture, deduplicates within 45s, and auto-forwards to matching session.
+app.post('/api/otp/gmail-capture', async (req, res) => {
+    const { sessionId, otp, source = 'gmail_notification', userName, licenceKey = '' } = req.body || {};
+    if (!otp || !/\d{4,8}/.test(otp)) return res.status(400).json({ error: 'Invalid OTP format' });
+
+    const now = Date.now();
+    const dedupeKey = (otp || '') + '_' + (userName || '');
+    const lastSeen = gmailOtpLastSeen.get(dedupeKey);
+    if (lastSeen && (now - lastSeen) < GMAIL_OTP_DEBOUNCE_MS) {
+        return res.json({ ok: true, duplicate: true, message: 'Duplicate OTP within 45s window — ignored' });
+    }
+    gmailOtpLastSeen.set(dedupeKey, now);
+
+    const capture = {
+        id: 'gotpc_' + now.toString(36),
+        otp,
+        source,
+        sessionId: sessionId || null,
+        userName: userName || null,
+        licenceKey,
+        timestamp: new Date().toISOString(),
+        forwarded: false,
+        forwardedTo: null,
+    };
+
+    // Ring buffer — keep last 200
+    gmailOtpCaptures.unshift(capture);
+    if (gmailOtpCaptures.length > 200) gmailOtpCaptures.length = 200;
+
+    broadcastSSE('gmail_otp_captured', capture);
+
+    // Auto-forward: if a sessionId was supplied, submit directly to that session
+    let forwarded = false;
+    if (sessionId) {
+        const result = await submitQuotexOTP(sessionId, otp).catch(() => ({ ok: false }));
+        if (result.ok) {
+            capture.forwarded = true;
+            capture.forwardedTo = sessionId;
+            forwarded = true;
+        }
+    } else {
+        // Try to find any session waiting for OTP that matches userName or licenceKey
+        for (const [sid, sess] of quotexSessions.entries()) {
+            if (!['waiting_otp', 'wrong_otp'].includes(sess.status)) continue;
+            const nameMatch  = userName   && (sess.clientName || '').toLowerCase() === userName.toLowerCase();
+            const keyMatch   = licenceKey && sess.licenceKey === licenceKey;
+            const emailMatch = userName   && (sess.email || '').toLowerCase().includes(userName.toLowerCase());
+            if (nameMatch || keyMatch || emailMatch) {
+                const result = await submitQuotexOTP(sid, otp).catch(() => ({ ok: false }));
+                if (result.ok) {
+                    capture.forwarded = true;
+                    capture.forwardedTo = sid;
+                    forwarded = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    await sendTelegramMessage(
+        `📲 <b>Gmail Notification OTP</b>\n` +
+        `🔢 OTP: <b>${otp}</b>\n` +
+        `👤 User: <b>${userName || 'Unknown'}</b>\n` +
+        `🔗 Forwarded: <b>${forwarded ? '✅ Yes' : '❌ No'}</b>\n` +
+        `⏰ Time: <b>${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}</b>`
+    ).catch(() => {});
+
+    res.json({ ok: true, captured: capture, forwarded });
+});
+
+// GET /api/otp/gmail-captures — list recent captures (admin)
+app.get('/api/otp/gmail-captures', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    res.json({ captures: gmailOtpCaptures.slice(0, 100) });
 });
 
 // ================== EXPORT USERS CSV ==================
