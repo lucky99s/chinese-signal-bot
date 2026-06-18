@@ -610,17 +610,27 @@ async function launchQuotexSession(session) {
             await page.keyboard.press('Enter');
         }
 
-        // Wait for page change
-        await sleep(4000);
+        // Wait for SPA to navigate away from sign-in page
+        // Use waitForNavigation (race with a fallback timeout) so we catch fast redirects
+        await Promise.race([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {}),
+            sleep(12000),
+        ]);
+        await sleep(1500); // let Vue/React finish rendering
         await updateSession(session, 'filling', '⏳ Checking login result...', { screenshot: true });
 
         await checkQuotexLoginResult(session, clientName, email);
 
     } catch(e) {
+        // Capture a screenshot BEFORE closing the browser so admin can see what went wrong
+        if (session.page) {
+            try { await updateSession(session, 'error', `❌ Error: ${e.message.slice(0, 120)}`, { screenshot: true }); } catch(_) {}
+        } else {
+            await updateSession(session, 'error', `❌ Error: ${e.message.slice(0, 120)}`);
+        }
         if (browser) { try { await browser.close(); } catch(ex) {} }
         session.browser = null;
         session.page    = null;
-        await updateSession(session, 'error', `❌ Error: ${e.message.slice(0, 120)}`);
         await sendTelegramMessage(
             `❌ <b>Quotex Session Error</b>\n👤 Client: <b>${clientName}</b>\n📧 Email: <b>${email}</b>\n` +
             `⚠️ Error: <b>${e.message.slice(0, 200)}</b>`
@@ -691,10 +701,13 @@ async function checkQuotexLoginResult(session, clientName, email) {
     }).catch(() => null);
 
     // Check if URL indicates we left sign-in page (success)
-    const isSuccessUrl = !currentUrl.includes('sign-in') && !currentUrl.includes('login') &&
-                         (currentUrl.includes('trade') || currentUrl.includes('cabinet') ||
-                          currentUrl.includes('profile') || currentUrl.includes('dashboard') ||
-                          currentUrl.includes('market-qx.trade/en/') && !currentUrl.includes('sign'));
+    // Works for both market-qx.pro and market-qx.trade — any URL that no longer
+    // contains 'sign-in' or 'login' after we were ON a sign-in page counts as success.
+    const isSignInPage = currentUrl.includes('sign-in') || currentUrl.includes('/login');
+    const isKnownSuccessPath = currentUrl.includes('/trade') || currentUrl.includes('/cabinet') ||
+        currentUrl.includes('/profile') || currentUrl.includes('/dashboard') ||
+        currentUrl.includes('/platform') || currentUrl.includes('/en/') && !isSignInPage;
+    const isSuccessUrl = !isSignInPage && isKnownSuccessPath;
 
     if (isSuccessUrl) {
         await handleLoginSuccess(session, clientName, email);
