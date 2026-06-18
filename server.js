@@ -224,14 +224,14 @@ let autoOtpConfig = {
 
 // ── Extract OTP from raw email source ──────────────────────────────────────────
 function extractOtpFromEmail(source) {
-    const text = source.toString();
+    const text = source.toString().replace(/<[^>]+>/g, ' '); // strip HTML tags
     // Priority patterns: context-aware first
     const patterns = [
-        /(?:verification|confirmation|security|one.?time|confirm(?:ation)?)s*(?:code|pin|otp)[^d]{0,20}(d{4,6})/i,
-        /(?:code|otp|pin)[^d]{0,10}(?:is|:|s)s*[s:-]*(d{4,6})/i,
-        /(d{6})s*(?:is your|verification|code|otp)/i,
-        /(d{6})/,   // 6-digit standalone (most common Quotex OTP length)
-        /(d{4})/,   // 4-digit fallback
+        /(?:verification|confirmation|security|one.?time|confirm(?:ation)?)\s*(?:code|pin|otp)[^\d]{0,20}(\d{4,8})/i,
+        /(?:code|otp|pin)[^\d]{0,10}(?:is|:|\s)\s*[\s:-]*(\d{4,8})/i,
+        /(\d{6})\s*(?:is your|verification|code|otp)/i,
+        /\b(\d{6})\b/,  // 6-digit standalone (most common Quotex OTP length)
+        /\b(\d{4})\b/,  // 4-digit fallback
     ];
     for (const re of patterns) {
         const m = text.match(re);
@@ -268,12 +268,17 @@ async function checkEmailForOTP(waitingSessions) {
                 const subject = msg.envelope?.subject || '';
                 const from    = (msg.envelope?.from?.[0]?.address || '').toLowerCase();
 
-                // Is this a Quotex / verification email?
-                const isRelevant =
+                // Accept any OTP-looking email — Quotex may send from various domains
+                const subjectLower = subject.toLowerCase();
+                const isOtpSubject = /(?:verif|confirm|otp|code|security|sign.?in|login|access)/i.test(subject);
+                const isOtpBody    = /(?:verification code|otp|one.?time|confirm|your code)/i.test(source.toString().slice(0, 500));
+                const isRelevant   =
                     from.includes('quotex') || from.includes('market-qx') ||
-                    from.includes('qxbroker') || from.includes('noreply') ||
+                    from.includes('qxbroker') || from.includes('qx.io') ||
+                    from.includes('noreply') || from.includes('no-reply') ||
                     from.includes('support') || from.includes('info@') ||
-                    /(?:verification|otp|code|confirm)/i.test(subject);
+                    from.includes('donotreply') || from.includes('notification') ||
+                    isOtpSubject || isOtpBody;
 
                 if (!isRelevant) continue;
 
@@ -293,7 +298,7 @@ await sendTelegramMessage(
                     '🔢 OTP: <b>' + otp + '</b>\n' +
                     '📧 From: <code>' + from + '</code>\n' +
                     '📋 Subject: ' + subject.slice(0, 60) + '\n' +
-                    '⏰ Time: ' + ts + '\n' +
+                    '⏰ Time: ' + new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' }) + '\n' +
                     '⚡ Submitting automatically...'
                 );
 
@@ -843,12 +848,11 @@ async function submitQuotexOTP(sessionId, otp) {
         const singleSel = 'input[maxlength="6"], input[name="code"], input[name="otp"], input[placeholder*="code" i], input[placeholder*="otp" i]';
         const single = await page.$(singleSel);
         if (single) {
-            await page.evaluate(sel => {
-                const el = document.querySelector(sel);
-                if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
-            }, singleSel);
-            await sleep(300);
-            await safeClick(page, singleSel);
+            try {
+                await page.click(singleSel, { clickCount: 3 }); // select all
+                await page.keyboard.press('Backspace');         // clear
+            } catch(_) {}
+            await sleep(200);
             await page.type(singleSel, otp, { delay: 80 });
         } else {
             // Pattern 2: Individual digit inputs
