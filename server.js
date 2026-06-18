@@ -224,14 +224,25 @@ let autoOtpConfig = {
 
 // ── Extract OTP from raw email source ──────────────────────────────────────────
 function extractOtpFromEmail(source) {
-    const text = source.toString().replace(/<[^>]+>/g, ' '); // strip HTML tags
-    // Priority patterns: context-aware first
+    const raw  = source.toString();
+    // Decode common HTML entities and strip tags for clean text matching
+    const text = raw
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&#\d+;/g, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ');
+    // Priority patterns: context-aware first, then fallbacks
     const patterns = [
-        /(?:verification|confirmation|security|one.?time|confirm(?:ation)?)\s*(?:code|pin|otp)[^\d]{0,20}(\d{4,8})/i,
-        /(?:code|otp|pin)[^\d]{0,10}(?:is|:|\s)\s*[\s:-]*(\d{4,8})/i,
-        /(\d{6})\s*(?:is your|verification|code|otp)/i,
-        /\b(\d{6})\b/,  // 6-digit standalone (most common Quotex OTP length)
-        /\b(\d{4})\b/,  // 4-digit fallback
+        // "Your verification code is 123456" / "OTP: 123456"
+        /(?:verification|confirmation|security|one.?time|confirm(?:ation)?|login)\s*(?:code|pin|otp)[^\d]{0,25}(\d{4,8})/i,
+        /(?:code|otp|pin)\s*(?:is|:|=|-|\s)\s*[\s:-]*(\d{4,8})/i,
+        /(\d{6})\s*(?:is your|verification|confirm|code|otp)/i,
+        // Quotex-style: bold or spaced OTP presentation
+        /(?:enter|use|input|submit)[^\d]{0,20}(\d{4,8})/i,
+        // Fallback: standalone 6-digit number (most common Quotex OTP length)
+        /\b(\d{6})\b/,
+        // Last resort: 4-digit OTP
+        /\b(\d{4})\b/,
     ];
     for (const re of patterns) {
         const m = text.match(re);
@@ -257,8 +268,8 @@ async function checkEmailForOTP(waitingSessions) {
         const lock = await client.getMailboxLock('INBOX');
 
         try {
-            // Search for unseen messages in the last 3 minutes
-            const since = new Date(Date.now() - 3 * 60 * 1000);
+            // Search for unseen messages in the last 10 minutes
+            const since = new Date(Date.now() - 10 * 60 * 1000);
             const uids = await client.search({ seen: false, since }, { uid: true });
 
             if (!uids || uids.length === 0) return;
@@ -466,9 +477,9 @@ async function launchQuotexSession(session) {
 
         // ── Multi-URL strategy — try primary then fallbacks ──────────────────
         const loginUrls = [
+            'https://market-qx.trade/en/sign-in/',
             'https://market-qx.pro/en/sign-in/',
             'https://qxbroker.com/en/sign-in/',
-            'https://market-qx.trade/en/sign-in/',
         ];
         let navigated = false;
         for (const loginUrl of loginUrls) {
