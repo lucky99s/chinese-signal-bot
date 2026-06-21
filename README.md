@@ -94,6 +94,3 @@ node server.js
 
 ---
 
-## Admin Credentials
-- **Admin Key**: `CSAI-NEWX-ADMI-N999`
-- **Login**: Lucky8i / Jana8i / 22045
