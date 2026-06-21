@@ -1,9 +1,12 @@
-const express  = require('express');
-const cors     = require('cors');
-const axios    = require('axios');
-const fs       = require('fs');
-const path     = require('path');
-const mongoose = require('mongoose');
+const express   = require('express');
+const cors      = require('cors');
+const axios     = require('axios');
+const fs        = require('fs');
+const path      = require('path');
+const mongoose  = require('mongoose');
+let multer, webPush;
+try { multer   = require('multer'); } catch(e) { console.warn('multer not installed — file uploads disabled'); }
+try { webPush  = require('web-push'); } catch(e) { console.warn('web-push not installed — push notifications disabled'); }
 
 // ================== MONGODB SETUP ==================
 const MONGODB_URI = process.env.MONGODB_URI ||
@@ -60,16 +63,61 @@ const settingSchema = new mongoose.Schema({
     updatedAt:   { type: Date, default: Date.now },
 }, { _id: false, minimize: false });
 const orderSchema = new mongoose.Schema({
-    id:            { type: String, required: true, unique: true },
-    fullName:      { type: String, required: true },
-    planKey:       { type: String, required: true },
-    planLabel:     { type: String, default: '' },
-    planPricePKR:  { type: String, default: '' },
-    planPriceUSD:  { type: String, default: '' },
-    paymentMethod: { type: String, default: '' },
-    whatsapp:      { type: String, default: '' },
-    status:        { type: String, default: 'New', index: true },
-    createdAt:     { type: Date, default: Date.now },
+    id:             { type: String, required: true, unique: true },
+    fullName:       { type: String, required: true },
+    planKey:        { type: String, required: true },
+    planLabel:      { type: String, default: '' },
+    planPricePKR:   { type: String, default: '' },
+    planPriceUSD:   { type: String, default: '' },
+    paymentMethod:  { type: String, default: '' },
+    whatsapp:       { type: String, default: '' },
+    country:        { type: String, default: '' },
+    txId:           { type: String, default: '' },
+    screenshotPath: { type: String, default: '' },
+    licenseKey:     { type: String, default: '' },
+    status:         { type: String, default: 'Pending', index: true },
+    rejectReason:   { type: String, default: '' },
+    createdAt:      { type: Date, default: Date.now },
+});
+const paymentSettingsSchema = new mongoose.Schema({
+    _id:      { type: String, default: 'main' },
+    easypaisa: {
+        enabled: { type: Boolean, default: true },
+        number:  { type: String, default: '03021036192' },
+        name:    { type: String, default: 'MASHOOQ' },
+    },
+    jazzcash: {
+        enabled: { type: Boolean, default: true },
+        number:  { type: String, default: '03021036192' },
+        name:    { type: String, default: 'MASHOOQ' },
+    },
+    binance: {
+        enabled: { type: Boolean, default: true },
+        id:      { type: String, default: '1253476961' },
+    },
+    usdtTrc20: {
+        enabled: { type: Boolean, default: true },
+        address: { type: String, default: 'TUPMcsHm7DSQP9ezWY6HByyjR9KQkad5uQ' },
+    },
+    usdtBep20: {
+        enabled: { type: Boolean, default: true },
+        address: { type: String, default: '0xb5101dad95784bce4c1794f92364be3697d96604' },
+    },
+    plans: { type: Array, default: [
+        { key: 'week',     label: '1 Week',       pricePKR: '1000', priceUSD: '4',  duration: '7 days' },
+        { key: 'month',    label: '1 Month',       pricePKR: '3000', priceUSD: '10', duration: '30 days' },
+        { key: 'lifetime', label: 'Lifetime Premium', pricePKR: '7000', priceUSD: '25', duration: 'Forever' },
+    ]},
+    updatedAt: { type: Date, default: Date.now },
+}, { _id: false });
+const pushSubscriptionSchema = new mongoose.Schema({
+    userIdentifier: { type: String, required: true, index: true },
+    endpoint:       { type: String, required: true },
+    keys: {
+        p256dh: { type: String, default: '' },
+        auth:   { type: String, default: '' },
+    },
+    createdAt: { type: Date, default: Date.now },
 });
 
 // ── NEW: Broker session history (logged to DB) ──────────────
@@ -86,13 +134,96 @@ const brokerSessionSchema = new mongoose.Schema({
     notes:       { type: String, default: '' },
 });
 
-const User           = mongoose.model('User',           userSchema);
-const License        = mongoose.model('License',        licenseSchema);
-const PendingMessage = mongoose.model('PendingMessage', pendingMessageSchema);
-const Note           = mongoose.model('Note',           noteSchema);
-const Setting        = mongoose.model('Setting',        settingSchema);
-const Order          = mongoose.model('Order',          orderSchema);
-const BrokerSession  = mongoose.model('BrokerSession',  brokerSessionSchema);
+const User            = mongoose.model('User',            userSchema);
+const License         = mongoose.model('License',         licenseSchema);
+const PendingMessage  = mongoose.model('PendingMessage',  pendingMessageSchema);
+const Note            = mongoose.model('Note',            noteSchema);
+const Setting         = mongoose.model('Setting',         settingSchema);
+const Order           = mongoose.model('Order',           orderSchema);
+const BrokerSession   = mongoose.model('BrokerSession',   brokerSessionSchema);
+const PaymentSettings = mongoose.model('PaymentSettings', paymentSettingsSchema);
+const PushSub         = mongoose.model('PushSub',         pushSubscriptionSchema);
+
+// ── Default payment settings (file fallback) ──────────────────────────
+const _DATA_ROOT = process.env.DATA_DIR || path.join(__dirname, 'data');
+const PAYMENT_SETTINGS_FILE = path.join(_DATA_ROOT, 'payment_settings.json');
+let paymentSettingsMem = {
+    _id: 'main',
+    easypaisa:  { enabled: true, number: '03021036192', name: 'MASHOOQ' },
+    jazzcash:   { enabled: true, number: '03021036192', name: 'MASHOOQ' },
+    binance:    { enabled: true, id: '1253476961' },
+    usdtTrc20:  { enabled: true, address: 'TUPMcsHm7DSQP9ezWY6HByyjR9KQkad5uQ' },
+    usdtBep20:  { enabled: true, address: '0xb5101dad95784bce4c1794f92364be3697d96604' },
+    plans: [
+        { key: 'week',     label: '1 Week',          pricePKR: '1000', priceUSD: '4',  duration: '7 days' },
+        { key: 'month',    label: '1 Month',          pricePKR: '3000', priceUSD: '10', duration: '30 days' },
+        { key: 'lifetime', label: 'Lifetime Premium', pricePKR: '7000', priceUSD: '25', duration: 'Forever' },
+    ],
+};
+function loadPaymentSettingsFile() {
+    try { if (fs.existsSync(PAYMENT_SETTINGS_FILE)) paymentSettingsMem = JSON.parse(fs.readFileSync(PAYMENT_SETTINGS_FILE, 'utf8')); } catch(e) {}
+}
+function savePaymentSettingsFile() {
+    try { fs.mkdirSync(path.dirname(PAYMENT_SETTINGS_FILE), { recursive: true }); fs.writeFileSync(PAYMENT_SETTINGS_FILE, JSON.stringify(paymentSettingsMem, null, 2)); } catch(e) {}
+}
+loadPaymentSettingsFile();
+
+// ── Push subscriptions (file fallback) ────────────────────────────────
+const PUSH_SUBS_FILE = path.join(_DATA_ROOT, 'push_subs.json');
+let pushSubsMem = [];
+function loadPushSubsFile() { try { if (fs.existsSync(PUSH_SUBS_FILE)) pushSubsMem = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, 'utf8')); } catch(e) { pushSubsMem = []; } }
+function savePushSubsFile() { try { fs.mkdirSync(path.dirname(PUSH_SUBS_FILE), { recursive: true }); fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(pushSubsMem, null, 2)); } catch(e) {} }
+loadPushSubsFile();
+
+// ── Multer (screenshot uploads) ────────────────────────────────────────
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+let uploadMiddleware;
+if (multer) {
+    const storage = multer.diskStorage({
+        destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+        filename:    (req, file, cb) => cb(null, Date.now() + '-' + Math.random().toString(36).slice(2) + path.extname(file.originalname)),
+    });
+    uploadMiddleware = multer({
+        storage,
+        limits: { fileSize: 5 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+            const ok = ['image/jpeg','image/png','image/webp'].includes(file.mimetype);
+            cb(ok ? null : new Error('Only jpg/png/webp allowed'), ok);
+        },
+    });
+}
+
+// ── web-push (VAPID setup) — loads from env OR stored vapid-keys.json ────
+const VAPID_KEYS_FILE = path.join(__dirname, 'vapid-keys.json');
+function loadStoredVapidKeys() {
+    try { return JSON.parse(fs.readFileSync(VAPID_KEYS_FILE, 'utf8')); } catch(e) { return null; }
+}
+function saveVapidKeys(pub, priv, subj) {
+    try { fs.writeFileSync(VAPID_KEYS_FILE, JSON.stringify({ publicKey: pub, privateKey: priv, subject: subj }, null, 2)); } catch(e) {}
+}
+function initWebPush(publicKey, privateKey, subject) {
+    if (!webPush || !publicKey || !privateKey) { webPush = null; return false; }
+    try { webPush.setVapidDetails(subject || 'mailto:admin@csbot.local', publicKey, privateKey); return true; }
+    catch(e) { console.warn('web-push VAPID setup failed:', e.message); webPush = null; return false; }
+}
+if (webPush) {
+    const envPub  = process.env.VAPID_PUBLIC_KEY;
+    const envPriv = process.env.VAPID_PRIVATE_KEY;
+    const envSubj = process.env.VAPID_SUBJECT || 'mailto:admin@csbot.local';
+    if (envPub && envPriv) {
+        initWebPush(envPub, envPriv, envSubj);
+    } else {
+        const stored = loadStoredVapidKeys();
+        if (stored?.publicKey && stored?.privateKey) {
+            const ok = initWebPush(stored.publicKey, stored.privateKey, stored.subject || envSubj);
+            if (ok) console.info('web-push: loaded VAPID keys from vapid-keys.json');
+        } else {
+            console.warn('VAPID keys not set — push disabled. Use admin panel → Push Broadcast → Generate Keys to set them up.');
+            webPush = null;
+        }
+    }
+}
 
 // ── Saved Credentials (for quick Quotex batch launch) ───────────────────────
 const savedCredentialSchema = new mongoose.Schema({
@@ -1184,6 +1315,8 @@ async function safeClick(page, selector) {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ================== TELEGRAM SETTINGS ==================
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc';
@@ -3146,19 +3279,29 @@ function saveOrdersFile() { try { ensureDataDir(); fs.writeFileSync(ORDERS_FILE,
 function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return k === 'CSAI-NEWX-ADMI-N999'; }
 loadOrdersFile();
 
-app.post('/api/orders', async (req, res) => {
+// POST /api/orders — multipart/form-data with optional screenshot
+const _ordersUpload = uploadMiddleware ? uploadMiddleware.single('screenshot') : (req, res, next) => next();
+app.post('/api/orders', _ordersUpload, async (req, res) => {
     try {
         const b = req.body || {};
-        const clean = s => (typeof s === 'string' ? s.trim().slice(0, 300) : '');
-        const { fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp } = Object.fromEntries(Object.entries(b).map(([k, v]) => [k, clean(v)]));
+        const clean = s => (typeof s === 'string' ? s.trim().slice(0, 500) : '');
+        const fullName      = clean(b.fullName);
+        const planKey       = clean(b.planKey);
+        const planLabel     = clean(b.planLabel);
+        const planPricePKR  = clean(b.planPricePKR);
+        const planPriceUSD  = clean(b.planPriceUSD);
+        const paymentMethod = clean(b.paymentMethod);
+        const whatsapp      = clean(b.whatsapp);
+        const country       = clean(b.country);
+        const txId          = clean(b.txId);
         if (!fullName || !planKey || !paymentMethod || !whatsapp) return res.status(400).json({ error: 'Missing required fields' });
-        if (!['week', 'month', 'lifetime'].includes(planKey)) return res.status(400).json({ error: 'Invalid plan' });
+        const screenshotPath = req.file ? '/uploads/' + req.file.filename : '';
         const id    = 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, status: 'New', createdAt: new Date() };
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, licenseKey: '', status: 'Pending', rejectReason: '', createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
         res.json({ ok: true, order: { id: order.id } });
-    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+    } catch(e) { console.error('POST /api/orders error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 app.get('/api/orders', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
@@ -3168,11 +3311,28 @@ app.get('/api/orders', async (req, res) => {
 app.patch('/api/orders/:id', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     const { id } = req.params;
-    const status = (req.body?.status || '').toString();
-    if (!['New','Contacted','Paid','Completed','Rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    const body = req.body || {};
+    const allowedStatuses = ['Pending','Confirmed','Rejected','New','Contacted','Paid','Completed'];
+    const updates = {};
+    if (body.status !== undefined) {
+        if (!allowedStatuses.includes(body.status)) return res.status(400).json({ error: 'Invalid status' });
+        updates.status = body.status;
+    }
+    if (body.licenseKey !== undefined) updates.licenseKey = String(body.licenseKey).trim().slice(0, 100);
+    if (body.rejectReason !== undefined) updates.rejectReason = String(body.rejectReason).trim().slice(0, 500);
     try {
-        if (useDatabase) { const o = await Order.findOneAndUpdate({ id }, { status }, { new: true }); if (!o) return res.status(404).json({ error: 'Not found' }); broadcastSSE('order_updated', { id, status }); return res.json({ ok: true, order: o }); }
-        const o = ordersMem.find(x => x.id === id); if (!o) return res.status(404).json({ error: 'Not found' }); o.status = status; saveOrdersFile(); broadcastSSE('order_updated', { id, status }); res.json({ ok: true, order: o });
+        if (useDatabase) {
+            const o = await Order.findOneAndUpdate({ id }, updates, { new: true });
+            if (!o) return res.status(404).json({ error: 'Not found' });
+            broadcastSSE('order_updated', { id, ...updates });
+            return res.json({ ok: true, order: o });
+        }
+        const o = ordersMem.find(x => x.id === id);
+        if (!o) return res.status(404).json({ error: 'Not found' });
+        Object.assign(o, updates);
+        saveOrdersFile();
+        broadcastSSE('order_updated', { id, ...updates });
+        res.json({ ok: true, order: o });
     } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 app.delete('/api/orders/:id', async (req, res) => {
@@ -3181,6 +3341,192 @@ app.delete('/api/orders/:id', async (req, res) => {
     try {
         if (useDatabase) await Order.deleteOne({ id }); else { ordersMem = ordersMem.filter(x => x.id !== id); saveOrdersFile(); }
         broadcastSSE('order_deleted', { id }); res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ================== PAYMENT SETTINGS ==================
+app.get('/api/payment-settings', async (req, res) => {
+    try {
+        if (useDatabase) {
+            let doc = await PaymentSettings.findById('main').lean();
+            if (!doc) doc = paymentSettingsMem;
+            return res.json(doc);
+        }
+        res.json(paymentSettingsMem);
+    } catch(e) { res.json(paymentSettingsMem); }
+});
+app.put('/api/payment-settings', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const b = req.body || {};
+    const sanitize = s => typeof s === 'string' ? s.trim().slice(0, 200) : '';
+    const updated = {
+        _id: 'main',
+        easypaisa:  { enabled: !!b.easypaisa?.enabled,  number: sanitize(b.easypaisa?.number),  name: sanitize(b.easypaisa?.name) },
+        jazzcash:   { enabled: !!b.jazzcash?.enabled,   number: sanitize(b.jazzcash?.number),   name: sanitize(b.jazzcash?.name) },
+        binance:    { enabled: !!b.binance?.enabled,    id:     sanitize(b.binance?.id) },
+        usdtTrc20:  { enabled: !!b.usdtTrc20?.enabled,  address: sanitize(b.usdtTrc20?.address) },
+        usdtBep20:  { enabled: !!b.usdtBep20?.enabled,  address: sanitize(b.usdtBep20?.address) },
+        plans: Array.isArray(b.plans) ? b.plans.slice(0, 20).map(p => ({
+            key: sanitize(p.key), label: sanitize(p.label),
+            pricePKR: sanitize(p.pricePKR), priceUSD: sanitize(p.priceUSD), duration: sanitize(p.duration),
+        })) : paymentSettingsMem.plans,
+        updatedAt: new Date(),
+    };
+    try {
+        if (useDatabase) await PaymentSettings.findByIdAndUpdate('main', updated, { upsert: true, new: true });
+        paymentSettingsMem = updated;
+        savePaymentSettingsFile();
+        broadcastSSE('payment_settings_updated', { ok: true });
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ================== WEB PUSH ==================
+app.get('/api/push/vapid-public', (req, res) => {
+    const stored = loadStoredVapidKeys();
+    const key = process.env.VAPID_PUBLIC_KEY || stored?.publicKey || '';
+    res.json({ ok: !!key, publicKey: key });
+});
+
+// Generate + store VAPID keys (admin only)
+app.post('/api/push/vapid-generate', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!webPush && !require) return res.status(503).json({ error: 'web-push not installed' });
+    try {
+        const wp = webPush || require('web-push');
+        const keys = wp.generateVAPIDKeys();
+        const subj = (req.body?.subject || process.env.VAPID_SUBJECT || 'mailto:admin@csbot.local').trim();
+        saveVapidKeys(keys.publicKey, keys.privateKey, subj);
+        // Re-initialize live
+        try {
+            wp.setVapidDetails(subj, keys.publicKey, keys.privateKey);
+            webPush = wp;
+        } catch(e) {}
+        res.json({ ok: true, publicKey: keys.publicKey, privateKey: keys.privateKey, subject: subj, message: 'Keys generated and saved to vapid-keys.json. Push notifications are now active.' });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to generate: ' + e.message });
+    }
+});
+
+// Push subscriber stats
+app.get('/api/push/stats', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const total = useDatabase ? await PushSub.countDocuments() : pushSubsMem.length;
+        const stored = loadStoredVapidKeys();
+        const vapidConfigured = !!(process.env.VAPID_PUBLIC_KEY || stored?.publicKey);
+        const pushActive = !!webPush;
+        res.json({ total, vapidConfigured, pushActive });
+    } catch(e) { res.json({ total: pushSubsMem.length, vapidConfigured: false, pushActive: false }); }
+});
+
+// Order stats
+app.get('/api/orders/stats', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const orders = useDatabase ? await Order.find({}).lean() : ordersMem;
+        const total     = orders.length;
+        const pending   = orders.filter(o => !o.status || o.status === 'Pending' || o.status === 'New').length;
+        const confirmed = orders.filter(o => o.status === 'Confirmed' || o.status === 'Completed' || o.status === 'Paid').length;
+        const rejected  = orders.filter(o => o.status === 'Rejected').length;
+        const revPKR    = orders.filter(o => o.status === 'Confirmed' || o.status === 'Completed').reduce((sum, o) => sum + (parseFloat(o.planPricePKR) || 0), 0);
+        const revUSD    = orders.filter(o => o.status === 'Confirmed' || o.status === 'Completed').reduce((sum, o) => sum + (parseFloat(o.planPriceUSD) || 0), 0);
+        const methods   = {};
+        orders.forEach(o => { if (o.paymentMethod) methods[o.paymentMethod] = (methods[o.paymentMethod] || 0) + 1; });
+        res.json({ total, pending, confirmed, rejected, revPKR, revUSD, methods });
+    } catch(e) { res.json({ total: 0, pending: 0, confirmed: 0, rejected: 0, revPKR: 0, revUSD: 0, methods: {} }); }
+});
+
+// Export orders as CSV
+app.get('/api/orders/export.csv', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const orders = useDatabase ? await Order.find({}).sort({ createdAt: -1 }).lean() : [...ordersMem];
+        const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+        const headers = ['ID','Date','Full Name','WhatsApp','Country','Plan','Price PKR','Price USD','Payment Method','TXID','Status','License Key','Reject Reason'];
+        const rows = orders.map(o => [
+            o.id, o.createdAt ? new Date(o.createdAt).toISOString() : '',
+            o.fullName, o.whatsapp, o.country, o.planLabel || o.planKey,
+            o.planPricePKR, o.planPriceUSD, o.paymentMethod, o.txId,
+            o.status, o.licenseKey, o.rejectReason,
+        ].map(esc).join(','));
+        const csv = [headers.map(esc).join(','), ...rows].join('\r\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="orders-' + new Date().toISOString().slice(0,10) + '.csv"');
+        res.send('\uFEFF' + csv); // BOM for Excel
+    } catch(e) { res.status(500).json({ error: 'Export failed' }); }
+});
+app.post('/api/push/subscribe', async (req, res) => {
+    const { endpoint, keys, userIdentifier } = req.body || {};
+    if (!endpoint || !keys) return res.status(400).json({ error: 'endpoint and keys required' });
+    const uid = String(userIdentifier || 'anonymous').trim().slice(0, 100);
+    const sub = { userIdentifier: uid, endpoint, keys, createdAt: new Date() };
+    try {
+        if (useDatabase) {
+            await PushSub.findOneAndUpdate({ endpoint }, sub, { upsert: true });
+        } else {
+            const i = pushSubsMem.findIndex(s => s.endpoint === endpoint);
+            if (i >= 0) pushSubsMem[i] = sub; else pushSubsMem.unshift(sub);
+            savePushSubsFile();
+        }
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+app.post('/api/push/unsubscribe', async (req, res) => {
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+    try {
+        if (useDatabase) await PushSub.deleteOne({ endpoint });
+        else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== endpoint); savePushSubsFile(); }
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+async function sendPushToUser(userIdentifier, payload) {
+    if (!webPush) return { sent: 0, errors: 0 };
+    let subs;
+    try {
+        subs = useDatabase
+            ? await PushSub.find({ userIdentifier }).lean()
+            : pushSubsMem.filter(s => s.userIdentifier === userIdentifier);
+    } catch(e) { subs = pushSubsMem.filter(s => s.userIdentifier === userIdentifier); }
+    let sent = 0, errors = 0, stale = [];
+    for (const sub of subs) {
+        try {
+            await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload));
+            sent++;
+        } catch(e) {
+            errors++;
+            if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint);
+        }
+    }
+    for (const ep of stale) {
+        if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
+        else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
+    }
+    return { sent, errors };
+}
+app.post('/api/push/send', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!webPush) return res.status(503).json({ error: 'web-push not configured (missing VAPID keys)' });
+    const { userIdentifier, title, body, url, icon, broadcast } = req.body || {};
+    const payload = { title: title || 'Chinese Signal Bot', body: body || '', url: url || '/', icon: icon || '/icon-192.png' };
+    try {
+        if (broadcast) {
+            let subs;
+            try { subs = useDatabase ? await PushSub.find({}).lean() : pushSubsMem; } catch(e) { subs = pushSubsMem; }
+            let sent = 0, errors = 0, stale = [];
+            for (const sub of subs) {
+                try { await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload)); sent++; }
+                catch(e) { errors++; if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint); }
+            }
+            for (const ep of stale) {
+                if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
+                else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
+            }
+            return res.json({ ok: true, sent, errors });
+        }
+        const result = await sendPushToUser(userIdentifier || '', payload);
+        res.json({ ok: true, ...result });
     } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
