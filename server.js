@@ -74,6 +74,7 @@ const orderSchema = new mongoose.Schema({
     country:        { type: String, default: '' },
     txId:           { type: String, default: '' },
     screenshotPath: { type: String, default: '' },
+    screenshotData: { type: String, default: '' }, // base64 image — survives server restarts
     licenseKey:     { type: String, default: '' },
     status:         { type: String, default: 'Pending', index: true },
     rejectReason:   { type: String, default: '' },
@@ -180,10 +181,9 @@ const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 let uploadMiddleware;
 if (multer) {
-    const storage = multer.diskStorage({
-        destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-        filename:    (req, file, cb) => cb(null, Date.now() + '-' + Math.random().toString(36).slice(2) + path.extname(file.originalname)),
-    });
+    // Use memoryStorage so the file buffer survives across requests and can be
+    // saved as base64 in the database — disk files on Render are ephemeral.
+    const storage = multer.memoryStorage();
     uploadMiddleware = multer({
         storage,
         limits: { fileSize: 5 * 1024 * 1024 },
@@ -3312,9 +3312,17 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         const country       = clean(b.country);
         const txId          = clean(b.txId);
         if (!fullName || !planKey || !paymentMethod || !whatsapp) return res.status(400).json({ error: 'Missing required fields' });
-        const screenshotPath = req.file ? '/uploads/' + req.file.filename : '';
+        // Store screenshot as base64 in DB — disk files on Render are wiped on restart
+        let screenshotPath = '';
+        let screenshotData = '';
+        if (req.file) {
+            screenshotData = 'data:' + req.file.mimetype + ';base64,' + req.file.buffer.toString('base64');
+            screenshotPath = '/api/orders/' + 'PENDING' + '/screenshot'; // will be set properly below
+        }
         const id    = 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, licenseKey: '', status: 'Pending', rejectReason: '', createdAt: new Date() };
+        // Fix the screenshot API path now that we have the order id
+        if (screenshotData) screenshotPath = '/api/orders/' + id + '/screenshot';
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, screenshotData, licenseKey: '', status: 'Pending', rejectReason: '', createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
         res.json({ ok: true, order: { id: order.id } });
@@ -3324,6 +3332,26 @@ app.get('/api/orders', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     try { res.json(useDatabase ? await Order.find({}).sort({ createdAt: -1 }).limit(1000).lean() : ordersMem); }
     catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+// ── GET /api/orders/:id/screenshot — serve stored base64 image ───────────────
+app.get('/api/orders/:id/screenshot', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).send('Forbidden');
+    try {
+        const { id } = req.params;
+        let order;
+        if (useDatabase) order = await Order.findOne({ id }).lean();
+        else order = ordersMem.find(x => x.id === id);
+        if (!order || !order.screenshotData) return res.status(404).send('No screenshot');
+        // Parse data URL:  data:<mime>;base64,<data>
+        const match = order.screenshotData.match(/^data:([^;]+);base64,(.+)$/);
+        if (!match) return res.status(404).send('Invalid screenshot data');
+        const [, mime, b64] = match;
+        const buf = Buffer.from(b64, 'base64');
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Content-Length', buf.length);
+        res.setHeader('Cache-Control', 'private, max-age=86400');
+        res.send(buf);
+    } catch(e) { res.status(500).send('Server error'); }
 });
 app.patch('/api/orders/:id', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
