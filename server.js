@@ -1815,7 +1815,7 @@ All users will see the maintenance page.`,
     if (action === 'lic_add') {
         tgSessions[chatId] = { awaiting: 'lic_key' };
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: '🔑 <b>Add License</b>\nSend the license key (e.g. CSAI-XXXX-XXXX-XXXX):' });
+            text: '🔑 <b>Add License</b>\nSend the license key in format <code>CSAI-XXXX-XXXX-XXX</code>:' });
     }
     if (action === 'lic_revoke_ask') {
         tgSessions[chatId] = { awaiting: 'lic_revoke' };
@@ -1869,6 +1869,10 @@ All users will see the maintenance page.`,
                 await dbInsertLicense({ key: licKey, type: licType, status: 'Active' });
             } else {
                 if (licenses.find(l => l.key === licKey)) return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: `⚠️ License <code>${licKey}</code> already exists.` });
+                if (!isValidLicKey(licKey)) {
+                    await tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '❌ Invalid key format. Must be <code>CSAI-XXXX-XXXX-XXX</code> (e.g. CSAI-9F2K-7H3M-X8B).' });
+                    return;
+                }
                 licenses.unshift({ key: licKey, type: licType, status: 'Active', usesRemaining: null, assignedTo: null, dateAdded: new Date().toISOString(), expiry: null });
                 saveLicenses();
             }
@@ -2869,6 +2873,7 @@ app.get('/api/licenses', async (req, res) => {
 app.post('/api/licenses', async (req, res) => {
     const { key, type, expiry, maxUses, status } = req.body;
     if (!key) return res.status(400).json({ error: 'Key required' });
+    if (!isValidLicKey(key)) return res.status(400).json({ error: 'Invalid license key format. Must be CSAI-XXXX-XXXX-XXX (4-4-3 uppercase alphanumeric).' });
     try {
         const newLicense = { key, type: type || 'Standard', status: status || 'Active', usesRemaining: maxUses || null, assignedTo: null, dateAdded: new Date().toISOString(), expiry: expiry || null };
         if (useDatabase) {
@@ -2912,6 +2917,7 @@ app.delete('/api/licenses/:key', async (req, res) => {
 app.post('/api/validate-license', async (req, res) => {
     const { licenseKey } = req.body;
     if (!licenseKey) return res.json({ valid: false, message: 'No key provided' });
+    if (!isValidLicKey(licenseKey)) return res.json({ valid: false, message: 'Invalid license key format. Must be CSAI-XXXX-XXXX-XXX.' });
     try {
         const lic = useDatabase ? await dbFindLicense(licenseKey) : licenses.find(l => l.key === licenseKey);
         const valid = !!(lic && lic.status === 'Active' && (!lic.expiry || new Date(lic.expiry) > new Date()));
@@ -3277,6 +3283,17 @@ let ordersMem = [];
 function loadOrdersFile() { try { if (fs.existsSync(ORDERS_FILE)) ordersMem = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch(e) { ordersMem = []; } }
 function saveOrdersFile() { try { ensureDataDir(); fs.writeFileSync(ORDERS_FILE, JSON.stringify(ordersMem, null, 2)); } catch(e) {} }
 function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return k === 'CSAI-NEWX-ADMI-N999'; }
+
+// ── CSAI License Key Generator ───────────────────────────────────────────────
+// Format: CSAI-XXXX-XXXX-XXX  (4-4-3 uppercase alphanumeric after prefix)
+// Regex:  ^CSAI-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{3}$
+const CSAI_KEY_REGEX = /^CSAI-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{3}$/;
+function generateLicKey() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const seg = n => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+    return 'CSAI-' + seg(4) + '-' + seg(4) + '-' + seg(3);
+}
+function isValidLicKey(key) { return CSAI_KEY_REGEX.test(key); }
 loadOrdersFile();
 
 // POST /api/orders — multipart/form-data with optional screenshot
