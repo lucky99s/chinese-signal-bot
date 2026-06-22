@@ -1352,18 +1352,24 @@ async function tgApi(method, payload) {
 function tgMainMenuKeyboard() {
     return {
         inline_keyboard: [
-            [{ text: '👥 Users',        callback_data: 'menu_users' },
-             { text: '📊 Stats',        callback_data: 'stats' },
-             { text: '🤖 Sessions',     callback_data: 'qx_sessions' }],
-            [{ text: '💬 Inject Msg',   callback_data: 'menu_inject' },
-             { text: '📢 Broadcast',    callback_data: 'menu_broadcast' },
-             { text: '🔑 Licenses',     callback_data: 'menu_licenses' }],
-            [{ text: '📦 Orders',       callback_data: 'menu_orders' },
-             { text: '⚙️ Settings',     callback_data: 'menu_settings' },
-             { text: '🔧 Maintenance',  callback_data: 'menu_maint' }],
-            [{ text: '🚀 Launch QX',    callback_data: 'qxlaunch_start' },
-             { text: '📋 Credentials',  callback_data: 'menu_creds' },
-             { text: '❓ Help',         callback_data: 'help' }],
+            // Row 1: User management
+            [{ text: '👥 Users',           callback_data: 'menu_users'      },
+             { text: '📦 Orders',          callback_data: 'menu_orders'     }],
+            // Row 2: Inject & Broadcast
+            [{ text: '💬 Inject Message',  callback_data: 'menu_inject'     },
+             { text: '📢 Broadcast',       callback_data: 'menu_broadcast'  }],
+            // Row 3: Licenses & Credentials
+            [{ text: '🔑 Licenses',        callback_data: 'menu_licenses'   },
+             { text: '📋 Credentials',     callback_data: 'menu_creds'      }],
+            // Row 4: Sessions & Stats
+            [{ text: '🤖 QX Sessions',     callback_data: 'qx_sessions'     },
+             { text: '📊 Stats',           callback_data: 'stats'           }],
+            // Row 5: Settings & Maintenance
+            [{ text: '⚙️ Settings',        callback_data: 'menu_settings'   },
+             { text: '🔧 Maintenance',     callback_data: 'menu_maint'      }],
+            // Row 6: Launch & Help
+            [{ text: '🚀 Launch QX',       callback_data: 'qxlaunch_start'  },
+             { text: '❓ Help',            callback_data: 'help'            }],
         ],
     };
 }
@@ -1527,7 +1533,28 @@ function tgRetryConfigKeyboard() {
     };
 }
 
-async function tgInjectMessage(userName, type, text) {
+// ── Server-side inject cooldown (anti-spam) — per user, per type ─────────────
+const _injectCooldowns = new Map(); // key: `${userName}:${type}` → timestamp
+const _INJECT_COOLDOWN_MS = 90000; // 90 seconds cooldown
+function checkInjectCooldown(userName, type) {
+    const k = `${(userName||'').toLowerCase()}:${type}`;
+    const last = _injectCooldowns.get(k);
+    if (last && Date.now() - last < _INJECT_COOLDOWN_MS) {
+        return Math.ceil((_INJECT_COOLDOWN_MS - (Date.now() - last)) / 1000);
+    }
+    _injectCooldowns.set(k, Date.now());
+    return 0; // 0 = no cooldown, ok to send
+}
+
+async function tgInjectMessage(userName, type, text, skipCooldown = false) {
+    if (!skipCooldown) {
+        const wait = checkInjectCooldown(userName, type);
+        if (wait > 0) {
+            await tgApi('sendMessage', { chat_id: TELEGRAM_CHAT_ID, parse_mode: 'HTML',
+                text: `⏳ <b>Cooldown Active</b>\nUser: <b>${userName}</b>\nType: <b>${type}</b>\n⏱️ Wait <b>${wait}s</b> before sending again. (Anti-spam)` });
+            return;
+        }
+    }
     const ts = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
     const payload = { userName, message: text, type, timestamp: ts };
     sendSSEToUser(userName, 'injected_message', payload);
@@ -1605,6 +1632,58 @@ async function tgHandleCallback(chatId, data, callbackId) {
             text: `🔄 Retrying login for <b>${session.clientName}</b>...` });
     }
 
+
+    // ── ORDER ACTIONS FROM TELEGRAM ──────────────────────────────────
+    if (action === 'order_approve') {
+        const orderId = parts[1];
+        const newKey  = generateLicKey();
+        try {
+            const updates = { licenseKey: newKey, status: 'Approved' };
+            let orderDoc;
+            if (useDatabase) {
+                orderDoc = await Order.findOneAndUpdate({ id: orderId }, updates, { new: true });
+            } else {
+                orderDoc = ordersMem.find(x => x.id === orderId);
+                if (orderDoc) { Object.assign(orderDoc, updates); saveOrdersFile(); }
+            }
+            if (orderDoc) {
+                // Save license to License collection with correct expiry
+                const plan = orderDoc.planKey || '';
+                let expiry = null;
+                if (plan === 'week')  expiry = new Date(Date.now() + 7  * 24 * 3600000);
+                if (plan === 'month') expiry = new Date(Date.now() + 30 * 24 * 3600000);
+                const licData = {
+                    key: newKey, type: plan === 'lifetime' ? 'Lifetime' : plan === 'week' ? 'Weekly' : 'Monthly',
+                    status: 'Active', assignedTo: orderDoc.fullName || null, dateAdded: new Date(), expiry,
+                };
+                if (useDatabase) await License.findOneAndUpdate({ key: newKey }, licData, { upsert: true }).catch(() => {});
+                else { licenses.unshift(licData); saveLicenses(); }
+            }
+            broadcastSSE('order_updated', { id: orderId, ...updates });
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `✅ <b>Order Approved!</b>\n🆔 <code>${orderId}</code>\n🔑 Key: <code>${newKey}</code>\n\n📋 Send to customer via WhatsApp.`,
+                reply_markup: { inline_keyboard: [[
+                    { text: '💬 WhatsApp Customer', url: orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent('License Key: '+newKey)}` : '#' },
+                ]] }
+            });
+        } catch(e) {
+            return tgApi('sendMessage', { chat_id: chatId, text: `❌ Error: ${e.message}` });
+        }
+    }
+
+    if (action === 'order_status') {
+        const orderId   = parts[1];
+        const newStatus = parts[2];
+        const allowedSt = ['Pending','Reviewing','Confirmed','Approved','Rejected','New','Contacted','Paid','Completed','Cancelled','Fake'];
+        if (!allowedSt.includes(newStatus)) return tgApi('sendMessage', { chat_id: chatId, text: '❌ Invalid status.' });
+        try {
+            if (useDatabase) await Order.findOneAndUpdate({ id: orderId }, { status: newStatus });
+            else { const o = ordersMem.find(x => x.id === orderId); if (o) { o.status = newStatus; saveOrdersFile(); } }
+            broadcastSSE('order_updated', { id: orderId, status: newStatus });
+            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+                text: `✅ Order <code>${orderId}</code> → <b>${newStatus}</b>` });
+        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `❌ Error: ${e.message}` }); }
+    }
 
     // ── NEW SECTION MENUS ─────────────────────────────────────────────
     if (action === 'menu_users') return tgCmdUsersMenu(chatId);
@@ -3284,6 +3363,45 @@ function loadOrdersFile() { try { if (fs.existsSync(ORDERS_FILE)) ordersMem = JS
 function saveOrdersFile() { try { ensureDataDir(); fs.writeFileSync(ORDERS_FILE, JSON.stringify(ordersMem, null, 2)); } catch(e) {} }
 function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return k === 'CSAI-NEWX-ADMI-N999'; }
 
+// ── WhatsApp number normalization ─────────────────────────────────────────────
+// Normalizes Pakistani and international numbers to E.164-ish with + prefix
+function normalizeWhatsApp(raw) {
+    if (!raw) return raw;
+    // Strip spaces, dashes, parentheses
+    let n = raw.replace(/[\s\-().]/g, '').trim();
+    // Already has + prefix — normalize +923... and +92...
+    if (n.startsWith('+')) {
+        // Ensure no double +
+        n = n.replace(/^\++/, '+');
+        return n;
+    }
+    // Pakistani local: 03XXXXXXXXX → +923XXXXXXXXX
+    if (/^03\d{9}$/.test(n)) return '+92' + n.slice(1);
+    // 923XXXXXXXXX → +923XXXXXXXXX
+    if (/^923\d{9}$/.test(n)) return '+' + n;
+    // 3XXXXXXXXX (10 digits starting with 3) → +923XXXXXXXXX
+    if (/^3\d{9}$/.test(n)) return '+92' + n;
+    // Already digits only — return as-is with + prefix if looks like intl
+    if (/^\d{10,15}$/.test(n)) return '+' + n;
+    return raw; // unchanged if we can't parse
+}
+
+// ── Duplicate order detection ─────────────────────────────────────────────────
+async function findDuplicateOrders(newOrder, allOrders) {
+    const dupes = [];
+    for (const o of allOrders) {
+        if (o.id === newOrder.id) continue;
+        const sameTx   = newOrder.txId    && o.txId    && newOrder.txId.toLowerCase()    === o.txId.toLowerCase();
+        const sameWa   = newOrder.whatsapp && o.whatsapp && newOrder.whatsapp.replace(/\D/g,'') === o.whatsapp.replace(/\D/g,'');
+        const sameName = newOrder.fullName && o.fullName && newOrder.fullName.toLowerCase() === o.fullName.toLowerCase();
+        const samePlan = newOrder.planKey  && o.planKey  && newOrder.planKey === o.planKey;
+        if (sameTx) dupes.push({ orderId: o.id, reason: 'Same Transaction ID' });
+        else if (sameWa && sameName && samePlan) dupes.push({ orderId: o.id, reason: 'Same phone + name + plan' });
+        else if (sameWa && sameName) dupes.push({ orderId: o.id, reason: 'Same phone + name' });
+    }
+    return dupes;
+}
+
 // ── CSAI License Key Generator ───────────────────────────────────────────────
 // Format: CSAI-XXXX-XXXX-XXXX  (4-4-4 uppercase alphanumeric after prefix)
 // Regex:  ^CSAI-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{3}$
@@ -3308,7 +3426,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         const planPricePKR  = clean(b.planPricePKR);
         const planPriceUSD  = clean(b.planPriceUSD);
         const paymentMethod = clean(b.paymentMethod);
-        const whatsapp      = clean(b.whatsapp);
+        const whatsapp      = normalizeWhatsApp(clean(b.whatsapp));
         const country       = clean(b.country);
         const txId          = clean(b.txId);
         if (!fullName || !planKey || !paymentMethod || !whatsapp) return res.status(400).json({ error: 'Missing required fields' });
@@ -3322,10 +3440,55 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         const id    = 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
         // Fix the screenshot API path now that we have the order id
         if (screenshotData) screenshotPath = '/api/orders/' + id + '/screenshot';
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, screenshotData, licenseKey: '', status: 'Pending', rejectReason: '', createdAt: new Date() };
+        // Duplicate detection before saving
+        const existingOrders = useDatabase ? await Order.find({}).lean().catch(() => []) : ordersMem;
+        const dupes = await findDuplicateOrders({ id: 'TMP', fullName, whatsapp, txId, planKey }, existingOrders);
+        const isDuplicate = dupes.length > 0;
+
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, screenshotData, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate, dupeReasons: dupes.map(d => d.reason), createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
-        res.json({ ok: true, order: { id: order.id } });
+
+        // ── Telegram notification with inline action buttons ──────────────────
+        const ts = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
+        const dupeWarning = isDuplicate ? `\n⚠️ <b>DUPLICATE DETECTED:</b> ${dupes.map(d=>d.reason).join(', ')}` : '';
+        const orderTgText =
+            `📦 <b>New Order Received!</b>${dupeWarning}\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `👤 Name: <b>${fullName}</b>\n` +
+            `📱 WhatsApp: <code>${whatsapp}</code>\n` +
+            `📦 Plan: <b>${planLabel || planKey}</b>\n` +
+            `💰 Price: <b>${planPricePKR ? planPricePKR+' PKR' : ''}${planPriceUSD ? ' / $'+planPriceUSD : ''}</b>\n` +
+            `💳 Payment: <b>${paymentMethod}</b>\n` +
+            `🔖 TX ID: <code>${txId || '—'}</code>\n` +
+            `🆔 Order: <code>${id}</code>\n` +
+            `⏰ Time: <b>${ts}</b>`;
+        await tgApi('sendMessage', {
+            chat_id: TELEGRAM_CHAT_ID,
+            parse_mode: 'HTML',
+            text: orderTgText,
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '✅ Approve & Assign Key', callback_data: `order_approve|${id}` },
+                        { text: '❌ Reject',               callback_data: `order_status|${id}|Rejected` },
+                    ],
+                    [
+                        { text: '💰 Mark Paid',            callback_data: `order_status|${id}|Paid` },
+                        { text: '🔎 Mark Reviewing',       callback_data: `order_status|${id}|Reviewing` },
+                    ],
+                    [
+                        { text: '🚫 Mark Fake',            callback_data: `order_status|${id}|Fake` },
+                        { text: '✔️ Mark Completed',       callback_data: `order_status|${id}|Completed` },
+                    ],
+                    [
+                        { text: '💬 WhatsApp Customer',    url: `https://wa.me/${whatsapp.replace(/\D/g,'')}` },
+                    ],
+                ],
+            },
+        }).catch(() => {});
+
+        res.json({ ok: true, order: { id: order.id, isDuplicate, dupeReasons: order.dupeReasons } });
     } catch(e) { console.error('POST /api/orders error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 app.get('/api/orders', async (req, res) => {
@@ -3357,7 +3520,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     const { id } = req.params;
     const body = req.body || {};
-    const allowedStatuses = ['Pending','Confirmed','Rejected','New','Contacted','Paid','Completed'];
+    const allowedStatuses = ['Pending','Reviewing','Confirmed','Approved','Rejected','New','Contacted','Paid','Completed','Cancelled','Fake'];
     const updates = {};
     if (body.status !== undefined) {
         if (!allowedStatuses.includes(body.status)) return res.status(400).json({ error: 'Invalid status' });
@@ -3366,18 +3529,48 @@ app.patch('/api/orders/:id', async (req, res) => {
     if (body.licenseKey !== undefined) updates.licenseKey = String(body.licenseKey).trim().slice(0, 100);
     if (body.rejectReason !== undefined) updates.rejectReason = String(body.rejectReason).trim().slice(0, 500);
     try {
+        let orderDoc;
         if (useDatabase) {
-            const o = await Order.findOneAndUpdate({ id }, updates, { new: true });
-            if (!o) return res.status(404).json({ error: 'Not found' });
-            broadcastSSE('order_updated', { id, ...updates });
-            return res.json({ ok: true, order: o });
+            orderDoc = await Order.findOneAndUpdate({ id }, updates, { new: true });
+            if (!orderDoc) return res.status(404).json({ error: 'Not found' });
+        } else {
+            orderDoc = ordersMem.find(x => x.id === id);
+            if (!orderDoc) return res.status(404).json({ error: 'Not found' });
+            Object.assign(orderDoc, updates);
+            saveOrdersFile();
         }
-        const o = ordersMem.find(x => x.id === id);
-        if (!o) return res.status(404).json({ error: 'Not found' });
-        Object.assign(o, updates);
-        saveOrdersFile();
+
+        // ── When a license key is assigned, also save it to the Licenses collection ──
+        if (updates.licenseKey && updates.licenseKey.trim()) {
+            const lk = updates.licenseKey.trim();
+            const plan = orderDoc.planKey || '';
+            // Calculate expiry based on plan
+            let expiry = null;
+            if (plan === 'week')     expiry = new Date(Date.now() + 7  * 24 * 3600000);
+            else if (plan === 'month')    expiry = new Date(Date.now() + 30 * 24 * 3600000);
+            // 'lifetime' → expiry stays null
+            const licData = {
+                key:        lk,
+                type:       plan === 'lifetime' ? 'Lifetime' : plan === 'week' ? 'Weekly' : 'Monthly',
+                status:     'Active',
+                assignedTo: orderDoc.fullName || null,
+                dateAdded:  new Date(),
+                expiry,
+            };
+            try {
+                if (useDatabase) {
+                    await License.findOneAndUpdate({ key: lk }, licData, { upsert: true, new: true });
+                } else {
+                    const idx = licenses.findIndex(l => l.key === lk);
+                    if (idx >= 0) Object.assign(licenses[idx], licData);
+                    else licenses.unshift(licData);
+                    saveLicenses();
+                }
+            } catch(licErr) { console.error('License save error:', licErr.message); }
+        }
+
         broadcastSSE('order_updated', { id, ...updates });
-        res.json({ ok: true, order: o });
+        res.json({ ok: true, order: orderDoc });
     } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 app.delete('/api/orders/:id', async (req, res) => {
@@ -3424,6 +3617,52 @@ app.put('/api/payment-settings', async (req, res) => {
         broadcastSSE('payment_settings_updated', { ok: true });
         res.json({ ok: true });
     } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ================== CUSTOM NOTIFICATION BROADCAST ==================
+app.post('/api/notify/send', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { title, body, url, type, userIdentifier } = req.body || {};
+    if (!title || !body) return res.status(400).json({ error: 'title and body required' });
+    const notifPayload = { title, body, url: url || '/', type: type || 'info', timestamp: new Date().toISOString() };
+
+    // 1. SSE broadcast (all or specific user)
+    if (userIdentifier) {
+        sendSSEToUser(userIdentifier, 'custom_notification', notifPayload);
+    } else {
+        broadcastSSE('custom_notification', notifPayload);
+    }
+
+    // 2. Web push
+    let pushSent = 0;
+    if (webPush) {
+        try {
+            const allSubs = useDatabase
+                ? await PushSub.find(userIdentifier ? { userIdentifier } : {}).lean()
+                : (userIdentifier ? pushSubsMem.filter(s => s.userIdentifier === userIdentifier) : pushSubsMem);
+            const pushData = JSON.stringify({ title, body, url: url || '/', icon: '/icon-192x192.png' });
+            for (const sub of allSubs) {
+                try {
+                    await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, pushData);
+                    pushSent++;
+                } catch(e) {
+                    if (e.statusCode === 410 || e.statusCode === 404) {
+                        if (useDatabase) await PushSub.deleteOne({ endpoint: sub.endpoint }).catch(() => {});
+                        else pushSubsMem = pushSubsMem.filter(s => s.endpoint !== sub.endpoint);
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+
+    // 3. Telegram notification (admin channel)
+    await sendTelegramMessage(
+        `📢 <b>Custom Notification Sent</b>\n` +
+        `📋 Title: <b>${title}</b>\n💬 Body: ${body}\n` +
+        `🎯 Target: <b>${userIdentifier || 'All Users'}</b>\n🔔 Push: <b>${pushSent} devices</b>`
+    ).catch(() => {});
+
+    res.json({ ok: true, pushSent, sseClients: sseClients.size });
 });
 
 // ================== WEB PUSH ==================
