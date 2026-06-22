@@ -196,6 +196,13 @@ function loadPushSubsFile() { try { if (fs.existsSync(PUSH_SUBS_FILE)) pushSubsM
 function savePushSubsFile() { try { fs.mkdirSync(path.dirname(PUSH_SUBS_FILE), { recursive: true }); fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(pushSubsMem, null, 2)); } catch(e) {} }
 loadPushSubsFile();
 
+// ── Push notification history log (in-memory, last 200 entries) ───────
+const _pushLog = [];
+function _recordPushLog(entry) {
+    _pushLog.unshift({ ...entry, ts: new Date().toISOString() });
+    if (_pushLog.length > 200) _pushLog.pop();
+}
+
 // ── Multer (screenshot uploads) ────────────────────────────────────────
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -3950,6 +3957,7 @@ async function sendPushToUser(userIdentifier, payload) {
         if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
         else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
     }
+    _recordPushLog({ target: userIdentifier, title: payload.title, body: payload.body, sent, errors, stale: stale.length });
     return { sent, errors };
 }
 app.post('/api/push/send', async (req, res) => {
@@ -4371,6 +4379,131 @@ app.get('/api/export-users', (req, res) => {
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="users-${new Date().toISOString().slice(0,10)}.csv"`);
     res.send(rows);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PUSH SUBSCRIBER MANAGEMENT (admin)
+// ═══════════════════════════════════════════════════════════════════════
+
+// GET /api/push/subscribers — list all subscribers (merged with user info)
+app.get('/api/push/subscribers', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        let subs = useDatabase ? await PushSub.find({}).sort({ createdAt: -1 }).lean() : [...pushSubsMem];
+        // Optionally merge with user data to show full name / status
+        let userMap = {};
+        try {
+            const allUsers = useDatabase ? await User.find({}, 'id fullName username status blocked licenceKey').lean() : users;
+            allUsers.forEach(u => {
+                // userIdentifier can be phone, licenseKey, or username
+                if (u.licenceKey) userMap[u.licenceKey.toLowerCase()] = u;
+                if (u.username)   userMap[u.username.toLowerCase()]   = u;
+            });
+        } catch(e) {}
+        const out = subs.map(s => {
+            const uid   = (s.userIdentifier || '').toLowerCase();
+            const uinfo = userMap[uid] || null;
+            return {
+                endpoint:       s.endpoint,
+                userIdentifier: s.userIdentifier,
+                createdAt:      s.createdAt,
+                // optional enrichment
+                fullName:   uinfo?.fullName  || null,
+                status:     uinfo?.status    || null,
+                blocked:    uinfo?.blocked   || false,
+                // Truncated endpoint for display
+                endpointShort: s.endpoint ? s.endpoint.slice(-40) : '',
+            };
+        });
+        res.json({ subscribers: out, total: out.length });
+    } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
+});
+
+// DELETE /api/push/subscribers — remove a subscriber by endpoint
+app.delete('/api/push/subscribers', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+    try {
+        if (useDatabase) await PushSub.deleteOne({ endpoint });
+        else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== endpoint); savePushSubsFile(); }
+        _recordPushLog({ target: 'ADMIN_DELETE', title: '🗑 Subscriber removed', body: endpoint.slice(-40), sent: 0, errors: 0, stale: 0 });
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /api/push/subscribers/all — purge all subscribers (admin)
+app.delete('/api/push/subscribers/all', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        if (useDatabase) await PushSub.deleteMany({});
+        else { pushSubsMem = []; savePushSubsFile(); }
+        _recordPushLog({ target: 'ALL', title: '🗑 All subscribers purged', body: '', sent: 0, errors: 0, stale: 0 });
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /api/push/test — send a test push to a single endpoint (admin)
+app.post('/api/push/test', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!webPush) return res.status(503).json({ error: 'web-push not configured' });
+    const { endpoint, keys, title, body } = req.body || {};
+    if (!endpoint || !keys) return res.status(400).json({ error: 'endpoint and keys required' });
+    const payload = JSON.stringify({
+        title: title || '🧪 Test Push',
+        body:  body  || 'This is a test notification from the admin panel.',
+        url:   '/',
+        icon:  '/icon-192.png',
+    });
+    try {
+        await webPush.sendNotification({ endpoint, keys }, payload);
+        _recordPushLog({ target: 'TEST', title: title || 'Test Push', body: body || '', sent: 1, errors: 0, stale: 0 });
+        res.json({ ok: true, sent: 1 });
+    } catch(e) {
+        const stale = e.statusCode === 410 || e.statusCode === 404;
+        if (stale) {
+            if (useDatabase) await PushSub.deleteOne({ endpoint }).catch(()=>{});
+            else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== endpoint); savePushSubsFile(); }
+        }
+        res.status(stale ? 410 : 500).json({ error: stale ? 'Subscription expired (removed)' : e.message });
+    }
+});
+
+// POST /api/push/group — send push to a list of userIdentifiers (admin)
+app.post('/api/push/group', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    if (!webPush) return res.status(503).json({ error: 'web-push not configured' });
+    const { userIdentifiers, title, body, url, icon } = req.body || {};
+    if (!Array.isArray(userIdentifiers) || !userIdentifiers.length) return res.status(400).json({ error: 'userIdentifiers array required' });
+    const payload = { title: title || 'Chinese Signal Bot', body: body || '', url: url || '/', icon: icon || '/icon-192.png' };
+    let totalSent = 0, totalErrors = 0;
+    for (const uid of userIdentifiers) {
+        const r = await sendPushToUser(uid, payload).catch(() => ({ sent: 0, errors: 1 }));
+        totalSent   += r.sent;
+        totalErrors += r.errors;
+    }
+    res.json({ ok: true, sent: totalSent, errors: totalErrors, targets: userIdentifiers.length });
+});
+
+// GET /api/push/log — recent push notification history
+app.get('/api/push/log', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    res.json({ log: _pushLog.slice(0, limit), total: _pushLog.length });
+});
+
+// GET /api/push/subscribers/export.csv — download subscriber list as CSV
+app.get('/api/push/subscribers/export.csv', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const subs = useDatabase ? await PushSub.find({}).sort({ createdAt: -1 }).lean() : [...pushSubsMem];
+        const esc  = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+        const rows = subs.map(s => [s.userIdentifier, s.endpoint, s.createdAt ? new Date(s.createdAt).toISOString() : ''].map(esc).join(','));
+        const csv  = [['User Identifier','Endpoint','Subscribed At'].map(esc).join(','), ...rows].join('\r\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="push-subscribers-' + new Date().toISOString().slice(0,10) + '.csv"');
+        res.send('\uFEFF' + csv);
+    } catch(e) { res.status(500).json({ error: 'Export failed' }); }
 });
 
 // ================== ROOT ==================
