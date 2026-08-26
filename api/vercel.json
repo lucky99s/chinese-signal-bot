@@ -1,0 +1,12 @@
+{
+  "routes": [
+    {
+      "src": "/ads.txt",
+      "dest": "/api/ads.js"
+    },
+    {
+      "src": "/robots.txt",
+      "dest": "/api/robots.js"
+    }
+  ]
+}
