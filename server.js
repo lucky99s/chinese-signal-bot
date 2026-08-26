@@ -1,18 +1,4 @@
-const express = require('express'); // Declare it ONLY once here at the top
-const app = express();              // Initialize app right after
-
-// AdSense verification routes
-app.get('/ads.txt', (req, res) => {
-  res.type('text/plain');
-  res.send('google.com, pub-4916676877809398, DIRECT, f08c47fec0942fa0');
-});
-
-app.get('/robots.txt', (req, res) => {
-  res.type('text/plain');
-  res.send('User-agent: *\nAllow: /\nUser-agent: Mediapartners-Google\nAllow: /');
-});
-
-// Remove any other 'const express = require('express');' below this point!
+const express   = require('express');
 const cors      = require('cors');
 const axios     = require('axios');
 const fs        = require('fs');
@@ -22,7 +8,25 @@ const mongoose  = require('mongoose');
 let multer, webPush;
 try { multer   = require('multer'); } catch(e) { console.warn('multer not installed — file uploads disabled'); }
 try { webPush  = require('web-push'); } catch(e) { console.warn('web-push not installed — push notifications disabled'); }
+const app = express();
 
+// ==========================================
+// GOOGLE ADSENSE & CRAWLER VERIFICATION
+// ==========================================
+app.get('/ads.txt', (req, res) => {
+  res.type('text/plain');
+  res.send('google.com, pub-4916676877809398, DIRECT, f08c47fec0942fa0');
+});
+
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain');
+  res.send(`User-agent: *
+Allow: /
+
+User-agent: Mediapartners-Google
+Allow: /`);
+});
+// ==========================================
 // ================== MONGODB SETUP ==================
 const MONGODB_URI = process.env.MONGODB_URI ||
     'mongodb+srv://Luckybot:Lucky8ixx$@lucky.comleed.mongodb.net/csbot?retryWrites=true&w=majority&appName=Lucky';
