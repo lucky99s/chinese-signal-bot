@@ -13,7 +13,6 @@ app.get('/robots.txt', (req, res) => {
 });
 
 // Remove any other 'const express = require('express');' below this point!
-const express   = require('express');
 const cors      = require('cors');
 const axios     = require('axios');
 const fs        = require('fs');
