@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/ads.txt",
+      "destination": "https://chinese-signal-bot.onrender.com/ads.txt"
+    },
+    {
+      "source": "/robots.txt",
+      "destination": "https://chinese-signal-bot.onrender.com/robots.txt"
+    }
+  ]
+}
