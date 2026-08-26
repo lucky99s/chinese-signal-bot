@@ -1,11 +1,7 @@
-// 1. Imports at the very top
-const express = require('express');
-const path = require('path');
+const express = require('express'); // Declare it ONLY once here at the top
+const app = express();              // Initialize app right after
 
-// 2. Initialize the app FIRST
-const app = express(); 
-
-// 3. NOW place the AdSense routes below 'app'
+// AdSense verification routes
 app.get('/ads.txt', (req, res) => {
   res.type('text/plain');
   res.send('google.com, pub-4916676877809398, DIRECT, f08c47fec0942fa0');
@@ -16,12 +12,7 @@ app.get('/robots.txt', (req, res) => {
   res.send('User-agent: *\nAllow: /\nUser-agent: Mediapartners-Google\nAllow: /');
 });
 
-// 4. Other middleware and routes follow...
-// app.use(express.json());
-// app.get('/', ...);
-
-// 5. Server listen at the bottom
-// app.listen(PORT, ...);
+// Remove any other 'const express = require('express');' below this point!
 const express   = require('express');
 const cors      = require('cors');
 const axios     = require('axios');
