@@ -1,3 +1,13 @@
+// Express.js example
+app.get('/ads.txt', (req, res) => {
+  res.type('text/plain');
+  res.send('google.com, pub-4916676877809398, DIRECT, f08c47fec0942fa0');
+});
+
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain');
+  res.send('User-agent: *\nAllow: /');
+});
 const express   = require('express');
 const cors      = require('cors');
 const axios     = require('axios');
