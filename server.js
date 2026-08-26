@@ -1,4 +1,11 @@
-// Express.js example
+// 1. Imports at the very top
+const express = require('express');
+const path = require('path');
+
+// 2. Initialize the app FIRST
+const app = express(); 
+
+// 3. NOW place the AdSense routes below 'app'
 app.get('/ads.txt', (req, res) => {
   res.type('text/plain');
   res.send('google.com, pub-4916676877809398, DIRECT, f08c47fec0942fa0');
@@ -6,8 +13,15 @@ app.get('/ads.txt', (req, res) => {
 
 app.get('/robots.txt', (req, res) => {
   res.type('text/plain');
-  res.send('User-agent: *\nAllow: /');
+  res.send('User-agent: *\nAllow: /\nUser-agent: Mediapartners-Google\nAllow: /');
 });
+
+// 4. Other middleware and routes follow...
+// app.use(express.json());
+// app.get('/', ...);
+
+// 5. Server listen at the bottom
+// app.listen(PORT, ...);
 const express   = require('express');
 const cors      = require('cors');
 const axios     = require('axios');
