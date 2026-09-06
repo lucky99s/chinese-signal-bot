@@ -5,6 +5,7 @@ const fs        = require('fs');
 const path      = require('path');
 const crypto    = require('crypto');
 const mongoose  = require('mongoose');
+const COUNTRY_CFG = require('./countries');
 let multer, webPush;
 try { multer   = require('multer'); } catch(e) { console.warn('multer not installed — file uploads disabled'); }
 try { webPush  = require('web-push'); } catch(e) { console.warn('web-push not installed — push notifications disabled'); }
@@ -28,12 +29,14 @@ Allow: /`);
 });
 // ==========================================
 // ================== MONGODB SETUP ==================
+// Environment variable takes priority; the existing project credentials are
+// kept as the fallback so the app runs with zero configuration.
 const MONGODB_URI = process.env.MONGODB_URI ||
     'mongodb+srv://Luckybot:Lucky8ixx$@lucky.comleed.mongodb.net/csbot?retryWrites=true&w=majority&appName=Lucky';
 
 let useDatabase = false;
 
-mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 5000, maxPoolSize: 100 })
+if (MONGODB_URI) mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 5000, maxPoolSize: 100 })
 .then(async () => {
     useDatabase = true;
     console.log('✅ MongoDB connected: permanent storage enabled');
@@ -151,13 +154,30 @@ const paymentSettingsSchema = new mongoose.Schema({
 }, { _id: false });
 const pushSubscriptionSchema = new mongoose.Schema({
     userIdentifier: { type: String, required: true, index: true },
-    endpoint:       { type: String, required: true },
+    endpoint:       { type: String, required: true, unique: true },
     keys: {
         p256dh: { type: String, default: '' },
         auth:   { type: String, default: '' },
     },
-    createdAt: { type: Date, default: Date.now },
+    // ── ADDITIVE (v6): lifecycle + segmentation. Existing docs default to active. ──
+    active:     { type: Boolean, default: true },
+    country:    { type: String,  default: '' },
+    userAgent:  { type: String,  default: '' },
+    failCount:  { type: Number,  default: 0 },
+    lastError:  { type: String,  default: '' },
+    lastSentAt: { type: Date,    default: null },
+    updatedAt:  { type: Date,    default: Date.now },
+    createdAt:  { type: Date,    default: Date.now },
 });
+
+// ── VAPID keys persisted in MongoDB (survives Render restarts/redeploys) ──────
+const vapidKeySchema = new mongoose.Schema({
+    _id:        { type: String, default: 'main' },
+    publicKey:  { type: String, default: '' },
+    privateKey: { type: String, default: '' },
+    subject:    { type: String, default: '' },
+    updatedAt:  { type: Date,   default: Date.now },
+}, { _id: false });
 
 // ── NEW: Broker session history (logged to DB) ──────────────
 const brokerSessionSchema = new mongoose.Schema({
@@ -182,6 +202,7 @@ const Order           = mongoose.model('Order',           orderSchema);
 const BrokerSession   = mongoose.model('BrokerSession',   brokerSessionSchema);
 const PaymentSettings = mongoose.model('PaymentSettings', paymentSettingsSchema);
 const PushSub         = mongoose.model('PushSub',         pushSubscriptionSchema);
+const VapidKey        = mongoose.model('VapidKey',        vapidKeySchema);
 
 // ── Default payment settings (file fallback) ──────────────────────────
 const _DATA_ROOT = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -247,9 +268,14 @@ function loadStoredVapidKeys() {
 function saveVapidKeys(pub, priv, subj) {
     try { fs.writeFileSync(VAPID_KEYS_FILE, JSON.stringify({ publicKey: pub, privateKey: priv, subject: subj }, null, 2)); } catch(e) {}
 }
+let _activeVapid = { publicKey: '', privateKey: '', subject: '' };
 function initWebPush(publicKey, privateKey, subject) {
     if (!webPush || !publicKey || !privateKey) { webPush = null; return false; }
-    try { webPush.setVapidDetails(subject || 'mailto:admin@csbot.local', publicKey, privateKey); return true; }
+    try {
+        webPush.setVapidDetails(subject || 'mailto:admin@csbot.local', publicKey, privateKey);
+        _activeVapid = { publicKey, privateKey, subject: subject || 'mailto:admin@csbot.local' };
+        return true;
+    }
     catch(e) { console.warn('web-push VAPID setup failed:', e.message); webPush = null; return false; }
 }
 if (webPush) {
@@ -286,6 +312,207 @@ if (webPush) {
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v6 — VAPID KEY PERSISTENCE (MongoDB)
+// Render wipes the filesystem on every restart/redeploy, so keys written to
+// vapid-keys.json were regenerated each boot. Every existing browser
+// subscription then became invalid (403 VapidPkHashMismatch) → "push not
+// working". Keys are now stored in MongoDB and reloaded on every boot.
+// Priority: env vars > MongoDB > local file > freshly generated (then saved).
+// ═══════════════════════════════════════════════════════════════════════════
+async function persistVapidToDb(pub, priv, subj) {
+    if (!useDatabase) return false;
+    try {
+        await VapidKey.findByIdAndUpdate('main',
+            { _id: 'main', publicKey: pub, privateKey: priv, subject: subj, updatedAt: new Date() },
+            { upsert: true });
+        return true;
+    } catch(e) { console.warn('VAPID db save failed:', e.message); return false; }
+}
+async function syncVapidWithDb() {
+    // Wait (max ~30s) for the Mongo connection established at boot.
+    for (let i = 0; i < 30 && !useDatabase; i++) await new Promise(r => setTimeout(r, 1000));
+    if (!useDatabase || !webPush) return;
+    try {
+        const envPub = process.env.VAPID_PUBLIC_KEY, envPriv = process.env.VAPID_PRIVATE_KEY;
+        const subj   = process.env.VAPID_SUBJECT || _activeVapid.subject || 'mailto:admin@csbot.local';
+        if (envPub && envPriv) {
+            await persistVapidToDb(envPub, envPriv, subj);
+            console.info('🔑 VAPID: using environment keys (also mirrored to MongoDB).');
+            return;
+        }
+        const doc = await VapidKey.findById('main').lean();
+        if (doc && doc.publicKey && doc.privateKey) {
+            if (doc.publicKey !== _activeVapid.publicKey) {
+                initWebPush(doc.publicKey, doc.privateKey, doc.subject || subj);
+                saveVapidKeys(doc.publicKey, doc.privateKey, doc.subject || subj);
+                console.info('🔑 VAPID: restored persistent keys from MongoDB — existing subscribers stay valid.');
+            }
+        } else if (_activeVapid.publicKey) {
+            await persistVapidToDb(_activeVapid.publicKey, _activeVapid.privateKey, subj);
+            console.info('🔑 VAPID: stored current keys in MongoDB for future restarts.');
+        }
+    } catch(e) { console.warn('VAPID db sync failed:', e.message); }
+}
+syncVapidWithDb();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v6 — SERVER-SIDE COUNTRY DETECTION (IP based, cached, multi-provider)
+// ═══════════════════════════════════════════════════════════════════════════
+const _geoCache    = new Map();                 // ip -> { country, source, at }
+const GEO_TTL_MS   = 6 * 60 * 60 * 1000;        // 6 hours
+const GEO_TIMEOUT  = 2500;
+
+function getClientIp(req) {
+    const xff = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return xff || req.headers['cf-connecting-ip'] || req.socket?.remoteAddress || '';
+}
+function countryFromHeaders(req) {
+    const h = req.headers;
+    const raw = h['cf-ipcountry'] || h['x-vercel-ip-country'] || h['x-country-code'] ||
+                h['x-appengine-country'] || h['fastly-client-country'] || '';
+    const code = COUNTRY_CFG.normalizeCountry(raw);
+    return code || '';
+}
+async function lookupCountryByIp(ip) {
+    if (!ip || /^(127\.|::1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) return '';
+    const providers = [
+        { url: `https://ipapi.co/${encodeURIComponent(ip)}/json/`, pick: d => d && d.country_code },
+        { url: `https://ipwho.is/${encodeURIComponent(ip)}`,       pick: d => d && d.country_code },
+        { url: `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=countryCode`, pick: d => d && d.countryCode },
+    ];
+    for (const p of providers) {
+        try {
+            const r = await axios.get(p.url, { timeout: GEO_TIMEOUT });
+            const code = COUNTRY_CFG.normalizeCountry(p.pick(r.data));
+            if (code) return code;
+        } catch(e) { /* try the next provider */ }
+    }
+    return '';
+}
+// Never throws. Returns { country, source, detected } — country '' means "unknown".
+async function detectCountry(req) {
+    const headerCode = countryFromHeaders(req);
+    if (headerCode) return { country: headerCode, source: 'edge-header', detected: true };
+
+    const ip = getClientIp(req);
+    const hit = _geoCache.get(ip);
+    if (hit && (Date.now() - hit.at) < GEO_TTL_MS) {
+        return { country: hit.country, source: 'cache', detected: !!hit.country };
+    }
+    let code = '';
+    try { code = await lookupCountryByIp(ip); } catch(e) { code = ''; }
+    _geoCache.set(ip, { country: code, source: 'ip-lookup', at: Date.now() });
+    if (_geoCache.size > 5000) { // simple bound
+        const oldest = [..._geoCache.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, 1000);
+        oldest.forEach(([k]) => _geoCache.delete(k));
+    }
+    return { country: code, source: code ? 'ip-lookup' : 'unknown', detected: !!code };
+}
+
+// Resolve the country to use for a request: explicit ?country= (validated) wins,
+// otherwise server-side detection. Frontend input is never trusted blindly —
+// it is validated against the supported country list.
+async function resolveCountry(req) {
+    const asked = COUNTRY_CFG.normalizeCountry(req.query?.country || req.body?.country || '');
+    if (asked) return { country: asked, source: 'client-selected', detected: true };
+    return await detectCountry(req);
+}
+
+// ── Country configuration (single source of truth for both frontends) ────────
+app.get('/api/countries', (req, res) => {
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json(COUNTRY_CFG.grouped());
+});
+
+// ── Detected country for the current visitor ─────────────────────────────────
+app.get('/api/geo', async (req, res) => {
+    try {
+        const r = await detectCountry(req);
+        res.json({
+            ok: true,
+            country: r.country || '',
+            detected: r.detected,
+            source: r.source,
+            defaultCountry: COUNTRY_CFG.DEFAULT_COUNTRY,
+            info: COUNTRY_CFG.getCountry(r.country) || null,
+        });
+    } catch(e) {
+        // Never block the visitor — the frontend falls back to manual selection.
+        res.json({ ok: false, country: '', detected: false, source: 'error', defaultCountry: COUNTRY_CFG.DEFAULT_COUNTRY, info: null });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v6 — SHARED PUSH DELIVERY (batched, fault tolerant, self-cleaning)
+// ═══════════════════════════════════════════════════════════════════════════
+const PUSH_BATCH_SIZE = 25;
+// Status codes that mean the subscription will never work again.
+const PUSH_DEAD_CODES = [400, 401, 403, 404, 410];
+
+async function deactivateSubscription(endpoint, reason) {
+    try {
+        if (useDatabase) {
+            await PushSub.updateOne({ endpoint }, { active: false, lastError: String(reason || '').slice(0, 200), updatedAt: new Date() });
+        } else {
+            const i = pushSubsMem.findIndex(s => s.endpoint === endpoint);
+            if (i >= 0) { pushSubsMem[i].active = false; pushSubsMem[i].lastError = String(reason || ''); savePushSubsFile(); }
+        }
+    } catch(e) { /* cleanup must never break a broadcast */ }
+}
+
+async function loadSubscriptions(filter) {
+    const base = Object.assign({ active: { $ne: false } }, filter || {});
+    try {
+        if (useDatabase) return await PushSub.find(base).lean();
+    } catch(e) { /* fall through to memory */ }
+    let list = pushSubsMem.filter(s => s && s.active !== false);
+    if (filter && filter.userIdentifier) list = list.filter(s => s.userIdentifier === filter.userIdentifier);
+    return list;
+}
+
+// Sends to every subscription in safe batches. A single bad subscriber can
+// never fail the whole broadcast — each send is isolated.
+async function deliverPush(subs, payload, meta) {
+    if (!webPush) return { sent: 0, failed: 0, removed: 0, total: 0, skipped: (subs || []).length };
+    const valid = (subs || []).filter(s => s && s.endpoint && s.keys && s.keys.p256dh && s.keys.auth);
+    const data  = JSON.stringify(payload);
+    let sent = 0, failed = 0, dead = [];
+
+    for (let i = 0; i < valid.length; i += PUSH_BATCH_SIZE) {
+        const batch = valid.slice(i, i + PUSH_BATCH_SIZE);
+        const results = await Promise.allSettled(batch.map(sub =>
+            webPush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } }, data)
+        ));
+        results.forEach((r, idx) => {
+            const sub = batch[idx];
+            if (r.status === 'fulfilled') { sent++; return; }
+            failed++;
+            const code = r.reason && r.reason.statusCode;
+            if (PUSH_DEAD_CODES.includes(code)) dead.push({ endpoint: sub.endpoint, code });
+        });
+    }
+    for (const d of dead) await deactivateSubscription(d.endpoint, 'HTTP ' + d.code);
+    _recordPushLog({
+        target: (meta && meta.target) || 'broadcast',
+        title: payload.title, body: payload.body,
+        sent, errors: failed, stale: dead.length, total: valid.length,
+    });
+    console.log(`[push] ${(meta && meta.target) || 'broadcast'} → sent:${sent} failed:${failed} deactivated:${dead.length} total:${valid.length}`);
+    return { sent, failed, errors: failed, removed: dead.length, total: valid.length, skipped: (subs || []).length - valid.length };
+}
+
+function sanitizePushField(v, max) {
+    return String(v == null ? '' : v).replace(/[\u0000-\u001F\u007F]/g, ' ').trim().slice(0, max || 200);
+}
+function sanitizePushUrl(v) {
+    const raw = String(v || '/').trim();
+    if (!raw) return '/';
+    if (raw.startsWith('/')) return raw.slice(0, 500);
+    if (/^https?:\/\//i.test(raw)) return raw.slice(0, 500);
+    return '/';
 }
 
 // ── Saved Credentials (for quick Quotex batch launch) ───────────────────────
@@ -3779,15 +4006,58 @@ app.delete('/api/orders/:id', async (req, res) => {
 });
 
 // ================== PAYMENT SETTINGS ==================
+// Methods that only exist for the Pakistan market.
+const PK_ONLY_METHODS = ['easypaisa', 'jazzcash'];
+
+function planIsActive(p) { return p && p.active !== false; }
+function planAllowsCountry(p, country) {
+    // No country list configured  →  available everywhere (backward compatible).
+    if (!p || !Array.isArray(p.countries) || p.countries.length === 0) return true;
+    return p.countries.map(c => String(c).toUpperCase()).includes(String(country || '').toUpperCase());
+}
+// Builds the country-specific view of the admin-managed settings.
+// The admin document remains the single source of truth — nothing is hard-coded here.
+function projectSettingsForCountry(doc, country) {
+    const out = JSON.parse(JSON.stringify(doc || {}));
+    const cc  = String(country || '').toUpperCase();
+    const isPK = cc === 'PK' || !cc; // unknown country keeps the existing PK experience
+
+    let plans = Array.isArray(out.plans) ? out.plans : [];
+    plans = plans.filter(p => planIsActive(p) && planAllowsCountry(p, isPK ? 'PK' : cc));
+    plans.sort((a, b) => (Number(a.order || 0) - Number(b.order || 0)));
+
+    // Per-plan payment-method restriction (admin configurable), then the
+    // global rule: outside Pakistan only Binance / USDT are offered.
+    if (!isPK) {
+        PK_ONLY_METHODS.forEach(m => { if (out[m]) out[m] = Object.assign({}, out[m], { enabled: false }); });
+    }
+    out.plans           = plans;
+    out.country         = cc || 'PK';
+    out.isPakistan      = isPK;
+    out.currency        = isPK ? 'PKR' : 'USD';
+    out.plansAvailable  = plans.length > 0;
+    return out;
+}
+
 app.get('/api/payment-settings', async (req, res) => {
+    let doc = paymentSettingsMem;
     try {
         if (useDatabase) {
-            let doc = await PaymentSettings.findById('main').lean();
-            if (!doc) doc = paymentSettingsMem;
-            return res.json(doc);
+            const found = await PaymentSettings.findById('main').lean();
+            if (found) doc = found;
         }
-        res.json(paymentSettingsMem);
-    } catch(e) { res.json(paymentSettingsMem); }
+    } catch(e) { doc = paymentSettingsMem; }
+    try {
+        // Admin panel keeps receiving the untouched document.
+        if (isAdmin(req) || req.query.raw === '1') return res.json(doc);
+        // Public callers get the view for their country (detected server-side,
+        // or an explicitly selected + validated country).
+        const resolved = await resolveCountry(req);
+        const view = projectSettingsForCountry(doc, resolved.country || COUNTRY_CFG.DEFAULT_COUNTRY);
+        view.countryDetected = resolved.detected;
+        view.countrySource   = resolved.source;
+        res.json(view);
+    } catch(e) { res.json(doc); }
 });
 app.put('/api/payment-settings', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
@@ -3800,9 +4070,20 @@ app.put('/api/payment-settings', async (req, res) => {
         binance:    { enabled: !!b.binance?.enabled,    id:     sanitize(b.binance?.id) },
         usdtTrc20:  { enabled: !!b.usdtTrc20?.enabled,  address: sanitize(b.usdtTrc20?.address) },
         usdtBep20:  { enabled: !!b.usdtBep20?.enabled,  address: sanitize(b.usdtBep20?.address) },
-        plans: Array.isArray(b.plans) ? b.plans.slice(0, 20).map(p => ({
+        plans: Array.isArray(b.plans) ? b.plans.slice(0, 40).map((p, i) => ({
             key: sanitize(p.key), label: sanitize(p.label),
             pricePKR: sanitize(p.pricePKR), priceUSD: sanitize(p.priceUSD), duration: sanitize(p.duration),
+            // ── v6 additive, admin-managed fields (all optional) ──
+            description: sanitize(p.description),
+            currency:    sanitize(p.currency),
+            countries:   Array.isArray(p.countries)
+                ? p.countries.map(c => COUNTRY_CFG.normalizeCountry(c)).filter(Boolean).slice(0, 60)
+                : [],
+            paymentMethods: Array.isArray(p.paymentMethods)
+                ? p.paymentMethods.map(m => sanitize(m)).filter(Boolean).slice(0, 10)
+                : [],
+            active: p.active !== false,
+            order:  Number.isFinite(Number(p.order)) ? Number(p.order) : i,
         })) : paymentSettingsMem.plans,
         updatedAt: new Date(),
     };
@@ -3833,22 +4114,15 @@ app.post('/api/notify/send', async (req, res) => {
     let pushSent = 0;
     if (webPush) {
         try {
-            const allSubs = useDatabase
-                ? await PushSub.find(userIdentifier ? { userIdentifier } : {}).lean()
-                : (userIdentifier ? pushSubsMem.filter(s => s.userIdentifier === userIdentifier) : pushSubsMem);
-            const pushData = JSON.stringify({ title, body, url: url || '/', icon: '/icon-192x192.png' });
-            for (const sub of allSubs) {
-                try {
-                    await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, pushData);
-                    pushSent++;
-                } catch(e) {
-                    if (e.statusCode === 410 || e.statusCode === 404) {
-                        if (useDatabase) await PushSub.deleteOne({ endpoint: sub.endpoint }).catch(() => {});
-                        else pushSubsMem = pushSubsMem.filter(s => s.endpoint !== sub.endpoint);
-                    }
-                }
-            }
-        } catch(e) {}
+            const subs = await loadSubscriptions(userIdentifier ? { userIdentifier } : null);
+            const result = await deliverPush(subs, {
+                title: sanitizePushField(title, 120),
+                body:  sanitizePushField(body, 500),
+                url:   sanitizePushUrl(url),
+                icon:  '/icon-192.png',
+            }, { target: userIdentifier || 'broadcast' });
+            pushSent = result.sent;
+        } catch(e) { /* push failure must never break SSE/Telegram delivery */ }
     }
 
     // 3. Telegram notification (admin channel)
@@ -3863,13 +4137,15 @@ app.post('/api/notify/send', async (req, res) => {
 
 // ================== WEB PUSH ==================
 app.get('/api/push/vapid-public', (req, res) => {
+    // Always advertise the key web-push is actually signing with, otherwise
+    // browsers subscribe with a stale applicationServerKey and every send 403s.
     const stored = loadStoredVapidKeys();
-    const key = process.env.VAPID_PUBLIC_KEY || stored?.publicKey || '';
+    const key = _activeVapid.publicKey || process.env.VAPID_PUBLIC_KEY || stored?.publicKey || '';
     res.json({ ok: !!key, publicKey: key });
 });
 
 // Generate + store VAPID keys (admin only)
-app.post('/api/push/vapid-generate', (req, res) => {
+app.post('/api/push/vapid-generate', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     if (!webPush && !require) return res.status(503).json({ error: 'web-push not installed' });
     try {
@@ -3881,6 +4157,15 @@ app.post('/api/push/vapid-generate', (req, res) => {
         try {
             wp.setVapidDetails(subj, keys.publicKey, keys.privateKey);
             webPush = wp;
+            _activeVapid = { publicKey: keys.publicKey, privateKey: keys.privateKey, subject: subj };
+        } catch(e) {}
+        // Persist to MongoDB so the keys survive restarts/redeploys.
+        await persistVapidToDb(keys.publicKey, keys.privateKey, subj);
+        // Rotating keys invalidates every existing subscription — clear them so
+        // broadcasts are not wasted on subscribers that can never be reached.
+        try {
+            if (useDatabase) await PushSub.updateMany({}, { active: false, lastError: 'VAPID rotated' });
+            else { pushSubsMem = pushSubsMem.map(x => Object.assign({}, x, { active: false })); savePushSubsFile(); }
         } catch(e) {}
         res.json({ ok: true, publicKey: keys.publicKey, privateKey: keys.privateKey, subject: subj, message: 'Keys generated and saved to vapid-keys.json. Push notifications are now active.' });
     } catch(e) {
@@ -3892,12 +4177,13 @@ app.post('/api/push/vapid-generate', (req, res) => {
 app.get('/api/push/stats', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     try {
-        const total = useDatabase ? await PushSub.countDocuments() : pushSubsMem.length;
+        const total    = useDatabase ? await PushSub.countDocuments({ active: { $ne: false } }) : pushSubsMem.filter(s => s.active !== false).length;
+        const inactive = useDatabase ? await PushSub.countDocuments({ active: false }) : pushSubsMem.filter(s => s.active === false).length;
         const stored = loadStoredVapidKeys();
-        const vapidConfigured = !!(process.env.VAPID_PUBLIC_KEY || stored?.publicKey);
+        const vapidConfigured = !!(_activeVapid.publicKey || process.env.VAPID_PUBLIC_KEY || stored?.publicKey);
         const pushActive = !!webPush;
-        res.json({ total, vapidConfigured, pushActive });
-    } catch(e) { res.json({ total: pushSubsMem.length, vapidConfigured: false, pushActive: false }); }
+        res.json({ total, inactive, vapidConfigured, pushActive, vapidPersisted: useDatabase, lastSends: _pushLog.slice(0, 10) });
+    } catch(e) { res.json({ total: pushSubsMem.length, inactive: 0, vapidConfigured: false, pushActive: false }); }
 });
 
 // Order stats
@@ -3938,9 +4224,23 @@ app.get('/api/orders/export.csv', async (req, res) => {
 });
 app.post('/api/push/subscribe', async (req, res) => {
     const { endpoint, keys, userIdentifier } = req.body || {};
-    if (!endpoint || !keys) return res.status(400).json({ error: 'endpoint and keys required' });
+    if (!endpoint || !keys || !keys.p256dh || !keys.auth) return res.status(400).json({ error: 'endpoint and keys required' });
     const uid = String(userIdentifier || 'anonymous').trim().slice(0, 100);
-    const sub = { userIdentifier: uid, endpoint, keys, createdAt: new Date() };
+    // Country is resolved/validated server-side — never trusted raw from the client.
+    let country = '';
+    try { country = (await resolveCountry(req)).country || ''; } catch(e) { country = ''; }
+    const sub = {
+        userIdentifier: uid,
+        endpoint,
+        keys: { p256dh: String(keys.p256dh), auth: String(keys.auth) },
+        active: true,
+        country,
+        userAgent: String(req.headers['user-agent'] || '').slice(0, 300),
+        failCount: 0,
+        lastError: '',
+        updatedAt: new Date(),
+        createdAt: new Date(),
+    };
     try {
         if (useDatabase) {
             await PushSub.findOneAndUpdate({ endpoint }, sub, { upsert: true });
@@ -3962,89 +4262,49 @@ app.post('/api/push/unsubscribe', async (req, res) => {
     } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 async function sendPushToUser(userIdentifier, payload) {
-    if (!webPush) return { sent: 0, errors: 0 };
-    let subs;
-    try {
-        subs = useDatabase
-            ? await PushSub.find({ userIdentifier }).lean()
-            : pushSubsMem.filter(s => s.userIdentifier === userIdentifier);
-    } catch(e) { subs = pushSubsMem.filter(s => s.userIdentifier === userIdentifier); }
-    let sent = 0, errors = 0, stale = [];
-    for (const sub of subs) {
-        try {
-            await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload));
-            sent++;
-        } catch(e) {
-            errors++;
-            if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint);
-        }
-    }
-    for (const ep of stale) {
-        if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
-        else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
-    }
-    _recordPushLog({ target: userIdentifier, title: payload.title, body: payload.body, sent, errors, stale: stale.length });
-    return { sent, errors };
+    if (!webPush) return { sent: 0, errors: 0, failed: 0, removed: 0, total: 0 };
+    const subs = await loadSubscriptions({ userIdentifier });
+    return await deliverPush(subs, payload, { target: userIdentifier });
 }
 app.post('/api/push/send', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     if (!webPush) return res.status(503).json({ error: 'web-push not configured (missing VAPID keys)' });
-    const { userIdentifier, title, body, url, icon, broadcast } = req.body || {};
-    const payload = { title: title || 'Chinese Signal Bot', body: body || '', url: url || '/', icon: icon || '/icon-192.png' };
+    const { userIdentifier, broadcast } = req.body || {};
+    const payload = {
+        title: sanitizePushField(req.body?.title, 120) || 'Chinese Signal Bot',
+        body:  sanitizePushField(req.body?.body, 500),
+        url:   sanitizePushUrl(req.body?.url),
+        icon:  sanitizePushUrl(req.body?.icon) === '/' ? '/icon-192.png' : sanitizePushUrl(req.body?.icon),
+    };
+    if (!payload.body) return res.status(400).json({ error: 'body required' });
     try {
-        if (broadcast) {
-            let subs;
-            try { subs = useDatabase ? await PushSub.find({}).lean() : pushSubsMem; } catch(e) { subs = pushSubsMem; }
-            let sent = 0, errors = 0, stale = [];
-            for (const sub of subs) {
-                try { await webPush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, JSON.stringify(payload)); sent++; }
-                catch(e) { errors++; if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint); }
-            }
-            for (const ep of stale) {
-                if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
-                else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
-            }
-            return res.json({ ok: true, sent, errors });
+        if (broadcast || !userIdentifier) {
+            const subs   = await loadSubscriptions(null);
+            const result = await deliverPush(subs, payload, { target: 'broadcast' });
+            return res.json(Object.assign({ ok: true }, result));
         }
-        const result = await sendPushToUser(userIdentifier || '', payload);
-        res.json({ ok: true, ...result });
-    } catch(e) { res.status(500).json({ error: 'Server error' }); }
+        const result = await sendPushToUser(String(userIdentifier).trim(), payload);
+        res.json(Object.assign({ ok: true }, result));
+    } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
 });
 
 // ── POST /api/push/broadcast — broadcast push to all subscribers ──────────────
 app.post('/api/push/broadcast', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     if (!webPush) return res.status(503).json({ error: 'web-push not configured (missing VAPID keys)' });
-    const { title, body, url, icon } = req.body || {};
-    const payload = { title: title || 'Chinese Signal Bot', body: body || '', url: url || '/', icon: icon || '/icon-192.png' };
+    const payload = {
+        title: sanitizePushField(req.body?.title, 120) || 'Chinese Signal Bot',
+        body:  sanitizePushField(req.body?.body, 500),
+        url:   sanitizePushUrl(req.body?.url),
+        icon:  req.body?.icon ? sanitizePushUrl(req.body.icon) : '/icon-192.png',
+    };
+    if (!payload.body) return res.status(400).json({ error: 'body required' });
+    // Optional country segmentation (validated against the supported list).
+    const country = COUNTRY_CFG.normalizeCountry(req.body?.country || '');
     try {
-        let allSubs;
-        try { allSubs = useDatabase ? await PushSub.find({}).lean() : pushSubsMem; } catch(e) { allSubs = pushSubsMem; }
-        // Only attempt valid subscriptions (must have endpoint + keys.p256dh + keys.auth)
-        const subs = (allSubs || []).filter(s => s && s.endpoint && s.keys && s.keys.p256dh && s.keys.auth);
-        const total = subs.length;
-        let sent = 0, failed = 0, stale = [];
-        console.log(`[push/broadcast] Sending to ${total} valid subscribers`);
-        for (const sub of subs) {
-            try {
-                await webPush.sendNotification(
-                    { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } },
-                    JSON.stringify(payload)
-                );
-                sent++;
-            } catch(e) {
-                failed++;
-                console.warn(`[push/broadcast] Failed for ${sub.endpoint.slice(0,60)}: ${e.statusCode} ${e.message}`);
-                if (e.statusCode === 410 || e.statusCode === 404) stale.push(sub.endpoint);
-            }
-        }
-        // Remove dead subscriptions
-        for (const ep of stale) {
-            if (useDatabase) await PushSub.deleteOne({ endpoint: ep }).catch(()=>{});
-            else { pushSubsMem = pushSubsMem.filter(s => s.endpoint !== ep); savePushSubsFile(); }
-        }
-        console.log(`[push/broadcast] Done — sent:${sent} failed:${failed} stale:${stale.length} total:${total}`);
-        res.json({ ok: true, sent, failed, total, stale: stale.length });
+        const subs   = await loadSubscriptions(country ? { country } : null);
+        const result = await deliverPush(subs, payload, { target: country ? 'broadcast:' + country : 'broadcast' });
+        res.json(Object.assign({ ok: true }, result, { stale: result.removed }));
     } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
 });
 
