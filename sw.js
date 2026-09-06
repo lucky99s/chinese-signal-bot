@@ -1,8 +1,11 @@
 // ═══ Chinese Signal Bot — Service Worker (Push Notifications) ═══
 // Handles push events, notification clicks, install & activate lifecycle.
 
-const CACHE_VERSION = 'csai-sw-v1';
-const OFFLINE_ASSETS = ['/'];
+const CACHE_VERSION = 'csai-sw-v2';
+// Intentionally EMPTY: the app HTML must never be served from cache, otherwise
+// users would keep running outdated application code after a deploy.
+// (There is no fetch handler in this worker — every request goes to the network.)
+const OFFLINE_ASSETS = [];
 
 // ── Install ───────────────────────────────────────────────────────────────────
 self.addEventListener('install', event => {
@@ -55,16 +58,23 @@ self.addEventListener('notificationclick', event => {
     event.notification.close();
     const targetUrl = event.notification.data?.url || '/';
 
+    const target = new URL(targetUrl, self.location.origin);
+
     event.waitUntil(
-        clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windowClients => {
-            // Focus existing tab if already open
+        clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async windowClients => {
+            // 1. Exact match → just focus it.
             for (const client of windowClients) {
-                if (new URL(client.url).pathname === new URL(targetUrl, self.location.origin).pathname) {
+                if (new URL(client.url).href === target.href) return client.focus();
+            }
+            // 2. Any tab of this site → reuse it and navigate (no duplicate tabs).
+            for (const client of windowClients) {
+                if (new URL(client.url).origin === target.origin) {
+                    if ('navigate' in client) { try { await client.navigate(target.href); } catch (e) {} }
                     return client.focus();
                 }
             }
-            // Open new tab
-            return clients.openWindow(targetUrl);
+            // 3. Nothing open → open one window.
+            return clients.openWindow(target.href);
         })
     );
 });
