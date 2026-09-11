@@ -163,6 +163,11 @@ const pushSubscriptionSchema = new mongoose.Schema({
     active:     { type: Boolean, default: true },
     country:    { type: String,  default: '' },
     userAgent:  { type: String,  default: '' },
+    // ── v7 (mobile fix): lower-cased key for case-insensitive targeting,
+    //    plus device identity so one user can hold many phones/desktops. ──
+    uidKey:     { type: String,  default: '', index: true },
+    deviceId:   { type: String,  default: '', index: true },
+    platform:   { type: String,  default: '' },
     failCount:  { type: Number,  default: 0 },
     lastError:  { type: String,  default: '' },
     lastSentAt: { type: Date,    default: null },
@@ -463,13 +468,21 @@ async function deactivateSubscription(endpoint, reason) {
     } catch(e) { /* cleanup must never break a broadcast */ }
 }
 
+function _uidKey(v) { return String(v == null ? '' : v).trim().toLowerCase(); }
+
 async function loadSubscriptions(filter) {
-    const base = Object.assign({ active: { $ne: false } }, filter || {});
+    // v7 — target by case-insensitive user key so a phone that subscribed as
+    // "ahmed" still receives a notification addressed to "Ahmed".
+    const base = { active: { $ne: false } };
+    let uid = null;
+    if (filter && filter.userIdentifier) uid = _uidKey(filter.userIdentifier);
+    else if (filter) Object.assign(base, filter);
+    if (uid) base.$or = [{ uidKey: uid }, { userIdentifier: new RegExp('^' + uid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }];
     try {
         if (useDatabase) return await PushSub.find(base).lean();
     } catch(e) { /* fall through to memory */ }
     let list = pushSubsMem.filter(s => s && s.active !== false);
-    if (filter && filter.userIdentifier) list = list.filter(s => s.userIdentifier === filter.userIdentifier);
+    if (uid) list = list.filter(s => _uidKey(s.uidKey || s.userIdentifier) === uid);
     return list;
 }
 
@@ -484,7 +497,14 @@ async function deliverPush(subs, payload, meta) {
     for (let i = 0; i < valid.length; i += PUSH_BATCH_SIZE) {
         const batch = valid.slice(i, i + PUSH_BATCH_SIZE);
         const results = await Promise.allSettled(batch.map(sub =>
-            webPush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } }, data)
+            webPush.sendNotification(
+                { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } },
+                data,
+                // v7 — mobile delivery: high urgency wakes Android/iOS out of
+                // doze/low-power mode, TTL keeps the message queued for 24h
+                // while the phone is offline instead of being dropped.
+                { TTL: 86400, urgency: 'high' }
+            )
         ));
         results.forEach((r, idx) => {
             const sub = batch[idx];
@@ -4223,14 +4243,18 @@ app.get('/api/orders/export.csv', async (req, res) => {
     } catch(e) { res.status(500).json({ error: 'Export failed' }); }
 });
 app.post('/api/push/subscribe', async (req, res) => {
-    const { endpoint, keys, userIdentifier } = req.body || {};
+    const { endpoint, keys, userIdentifier, deviceId, platform } = req.body || {};
     if (!endpoint || !keys || !keys.p256dh || !keys.auth) return res.status(400).json({ error: 'endpoint and keys required' });
     const uid = String(userIdentifier || 'anonymous').trim().slice(0, 100);
     // Country is resolved/validated server-side — never trusted raw from the client.
     let country = '';
     try { country = (await resolveCountry(req)).country || ''; } catch(e) { country = ''; }
+    const dev = String(deviceId || '').trim().slice(0, 80);
     const sub = {
         userIdentifier: uid,
+        uidKey: _uidKey(uid),
+        deviceId: dev,
+        platform: String(platform || '').trim().slice(0, 40),
         endpoint,
         keys: { p256dh: String(keys.p256dh), auth: String(keys.auth) },
         active: true,
@@ -4239,14 +4263,23 @@ app.post('/api/push/subscribe', async (req, res) => {
         failCount: 0,
         lastError: '',
         updatedAt: new Date(),
-        createdAt: new Date(),
     };
     try {
         if (useDatabase) {
-            await PushSub.findOneAndUpdate({ endpoint }, sub, { upsert: true });
+            await PushSub.findOneAndUpdate({ endpoint }, { $set: sub, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+            if (dev) {
+                // v7 — the same phone re-subscribes with a NEW endpoint after a
+                // browser update or key rotation. Drop only that device's old
+                // endpoints; every OTHER device of the user stays subscribed.
+                await PushSub.deleteMany({ deviceId: dev, endpoint: { $ne: endpoint } });
+                // Adopt earlier anonymous subscriptions of this device once the
+                // visitor logs in, so targeted sends reach their phone too.
+                if (uid && uid !== 'anonymous') await PushSub.updateMany({ deviceId: dev }, { userIdentifier: uid, uidKey: _uidKey(uid) });
+            }
         } else {
+            if (dev) pushSubsMem = pushSubsMem.filter(s => !(s.deviceId === dev && s.endpoint !== endpoint));
             const i = pushSubsMem.findIndex(s => s.endpoint === endpoint);
-            if (i >= 0) pushSubsMem[i] = sub; else pushSubsMem.unshift(sub);
+            if (i >= 0) pushSubsMem[i] = Object.assign({}, pushSubsMem[i], sub); else pushSubsMem.unshift(Object.assign({ createdAt: new Date() }, sub));
             savePushSubsFile();
         }
         res.json({ ok: true });
@@ -4321,6 +4354,225 @@ app.post('/api/orders/:id/notify', async (req, res) => {
         const result = wa ? await sendPushToUser(wa, payload) : { ok: false, error: 'No WhatsApp on order' };
         res.json({ ok: result.ok || false, ...result });
     } catch(e) { res.status(500).json({ error: 'Server error', detail: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v7 — LICENCE OFFERS + AUTO PROMOTIONAL PUSH (1–3 per day)
+// Every visitor who allows notifications is automatically enrolled. The
+// scheduler picks the next active offer and pushes it to all subscribers,
+// spread evenly across the configured active hours. Fully controlled from
+// the admin panel (Offers & Auto Promo). Nothing here removes or changes
+// any existing notification behaviour — it only adds a new sender.
+// ═══════════════════════════════════════════════════════════════════════════
+const promoSettingsSchema = new mongoose.Schema({
+    _id:          { type: String, default: 'main' },
+    enabled:      { type: Boolean, default: true },
+    perDay:       { type: Number,  default: 2 },     // 1–3
+    startHour:    { type: Number,  default: 11 },    // local hour (tzOffset)
+    endHour:      { type: Number,  default: 21 },
+    tzOffset:     { type: Number,  default: 5 },     // PKT = UTC+5
+    skipLicensed: { type: Boolean, default: true },  // don't nag paying users
+    offers:       { type: Array,   default: [] },
+    rotation:     { type: Number,  default: 0 },
+    dayKey:       { type: String,  default: '' },
+    sentToday:    { type: Number,  default: 0 },
+    lastSentAt:   { type: Date,    default: null },
+    updatedAt:    { type: Date,    default: Date.now },
+}, { _id: false });
+const PromoSettings = mongoose.models.PromoSettings || mongoose.model('PromoSettings', promoSettingsSchema);
+
+const PROMO_FILE = path.join(_DATA_ROOT, 'promo_settings.json');
+const DEFAULT_PROMO = {
+    enabled: true, perDay: 2, startHour: 11, endHour: 21, tzOffset: 5, skipLicensed: true,
+    rotation: 0, dayKey: '', sentToday: 0, lastSentAt: null,
+    offers: [
+        { id: 'offer-launch',  title: '🔥 50% OFF — Chinese Bot Licence', body: 'Limited time: get your licence key at half price and start receiving live signals today. Code: HALF50', code: 'HALF50', url: '/#pricing', active: true, expiresAt: '' },
+        { id: 'offer-monthly', title: '⚡ 1 Month Plan — Only 3000 PKR', body: 'Unlock premium auto signals for 30 days. Instant licence key after payment.', code: '', url: '/#pricing', active: true, expiresAt: '' },
+        { id: 'offer-life',    title: '👑 Lifetime Premium — 7000 PKR', body: 'Pay once, use forever. Lifetime access to Chinese Bot signals + priority support.', code: '', url: '/#pricing', active: true, expiresAt: '' },
+    ],
+};
+let promoMem = Object.assign({}, DEFAULT_PROMO);
+function loadPromoFile() { try { if (fs.existsSync(PROMO_FILE)) promoMem = Object.assign({}, DEFAULT_PROMO, JSON.parse(fs.readFileSync(PROMO_FILE, 'utf8'))); } catch(e) {} }
+function savePromoFile() { try { fs.mkdirSync(path.dirname(PROMO_FILE), { recursive: true }); fs.writeFileSync(PROMO_FILE, JSON.stringify(promoMem, null, 2)); } catch(e) {} }
+loadPromoFile();
+
+async function getPromoSettings() {
+    if (useDatabase) {
+        try {
+            const doc = await PromoSettings.findById('main').lean();
+            if (doc) return Object.assign({}, DEFAULT_PROMO, doc);
+            await PromoSettings.findByIdAndUpdate('main', Object.assign({ _id: 'main' }, promoMem), { upsert: true });
+        } catch(e) { /* fall back to memory */ }
+    }
+    return promoMem;
+}
+async function savePromoSettings(patch) {
+    promoMem = Object.assign({}, promoMem, patch, { updatedAt: new Date() });
+    savePromoFile();
+    if (useDatabase) {
+        try { await PromoSettings.findByIdAndUpdate('main', Object.assign({ _id: 'main' }, promoMem), { upsert: true }); } catch(e) {}
+    }
+    return promoMem;
+}
+
+function _promoLocalNow(tzOffset) {
+    const d = new Date(Date.now() + (Number(tzOffset) || 0) * 3600000);
+    return { hour: d.getUTCHours(), minute: d.getUTCMinutes(), dayKey: d.toISOString().slice(0, 10) };
+}
+function _promoActiveOffers(cfg) {
+    const now = Date.now();
+    return (cfg.offers || []).filter(o => o && o.active !== false && o.title && o.body &&
+        (!o.expiresAt || isNaN(Date.parse(o.expiresAt)) || Date.parse(o.expiresAt) > now));
+}
+// Slot times for today, evenly spread between startHour and endHour.
+function _promoSlots(cfg) {
+    const per   = Math.min(3, Math.max(1, Number(cfg.perDay) || 1));
+    const start = Math.min(23, Math.max(0, Number(cfg.startHour) || 0));
+    const end   = Math.min(23, Math.max(start, Number(cfg.endHour) || 23));
+    if (per === 1) return [start];
+    const step = (end - start) / (per - 1);
+    return Array.from({ length: per }, (_, i) => Math.round(start + step * i));
+}
+
+// Subscribers that should receive promos (optionally excluding licence holders).
+async function _promoAudience(cfg) {
+    const subs = await loadSubscriptions(null);
+    if (!cfg.skipLicensed) return subs;
+    let paidKeys = new Set();
+    try {
+        const list = useDatabase ? await User.find({}).lean() : (Array.isArray(users) ? users : []);
+        (list || []).forEach(u => {
+            const active = u && (u.licenseKey || u.licence || u.status === 'Active') && !u.blocked;
+            if (active && u.name) paidKeys.add(String(u.name).trim().toLowerCase());
+            if (active && u.userName) paidKeys.add(String(u.userName).trim().toLowerCase());
+        });
+    } catch(e) { paidKeys = new Set(); }
+    if (!paidKeys.size) return subs;
+    return subs.filter(s => !paidKeys.has(String(s.uidKey || s.userIdentifier || '').trim().toLowerCase()));
+}
+
+async function runPromoOnce(force) {
+    if (!webPush) return { ok: false, reason: 'web-push not configured' };
+    const cfg = await getPromoSettings();
+    if (!cfg.enabled && !force) return { ok: false, reason: 'disabled' };
+    const offers = _promoActiveOffers(cfg);
+    if (!offers.length) return { ok: false, reason: 'no active offers' };
+
+    const { hour, dayKey } = _promoLocalNow(cfg.tzOffset);
+    let sentToday = cfg.dayKey === dayKey ? (Number(cfg.sentToday) || 0) : 0;
+
+    if (!force) {
+        const slots = _promoSlots(cfg);
+        const due   = slots.filter(h => hour >= h).length;   // how many slots have passed
+        if (due <= sentToday) return { ok: false, reason: 'not due' };
+    }
+
+    const rotation = Number(cfg.rotation) || 0;
+    const offer    = offers[rotation % offers.length];
+    const audience = await _promoAudience(cfg);
+    const payload  = {
+        title: sanitizePushField(offer.title, 120),
+        body:  sanitizePushField(offer.body + (offer.code ? ` — Code: ${offer.code}` : ''), 500),
+        url:   sanitizePushUrl(offer.url || '/'),
+        icon:  '/icon-192.png',
+        type:  'promo',
+    };
+    const result = await deliverPush(audience, payload, { target: 'promo:' + (offer.id || rotation) });
+    await savePromoSettings({
+        rotation: rotation + 1,
+        dayKey,
+        sentToday: force && cfg.dayKey === dayKey ? sentToday : sentToday + 1,
+        lastSentAt: new Date(),
+    });
+    return { ok: true, offer: offer.title, audience: audience.length, sent: result.sent, failed: result.failed };
+}
+
+// Checks every 10 minutes; sends only when a slot is due.
+setInterval(() => { runPromoOnce(false).catch(() => {}); }, 10 * 60 * 1000);
+setTimeout(() => { runPromoOnce(false).catch(() => {}); }, 60 * 1000);
+
+// ── Public: offers shown on the website ───────────────────────────────────
+app.get('/api/offers', async (req, res) => {
+    try {
+        const cfg = await getPromoSettings();
+        res.json({ ok: true, offers: _promoActiveOffers(cfg).map(o => ({
+            id: o.id, title: o.title, body: o.body, code: o.code || '', url: o.url || '/', expiresAt: o.expiresAt || '',
+        })) });
+    } catch(e) { res.json({ ok: false, offers: [] }); }
+});
+
+// ── Admin: read settings + offers ─────────────────────────────────────────
+app.get('/api/promo/settings', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const cfg = await getPromoSettings();
+    let subscribers = 0;
+    try { subscribers = (await _promoAudience(cfg)).length; } catch(e) {}
+    res.json({ ok: true, settings: {
+        enabled: cfg.enabled, perDay: cfg.perDay, startHour: cfg.startHour, endHour: cfg.endHour,
+        tzOffset: cfg.tzOffset, skipLicensed: cfg.skipLicensed, offers: cfg.offers || [],
+        sentToday: cfg.dayKey === _promoLocalNow(cfg.tzOffset).dayKey ? cfg.sentToday : 0,
+        lastSentAt: cfg.lastSentAt, slots: _promoSlots(cfg), subscribers, pushActive: !!webPush,
+    } });
+});
+
+// ── Admin: save settings ──────────────────────────────────────────────────
+app.post('/api/promo/settings', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const b = req.body || {};
+    const patch = {};
+    if (b.enabled      !== undefined) patch.enabled      = !!b.enabled;
+    if (b.skipLicensed !== undefined) patch.skipLicensed = !!b.skipLicensed;
+    if (b.perDay       !== undefined) patch.perDay       = Math.min(3, Math.max(1, parseInt(b.perDay, 10) || 1));
+    if (b.startHour    !== undefined) patch.startHour    = Math.min(23, Math.max(0, parseInt(b.startHour, 10) || 0));
+    if (b.endHour      !== undefined) patch.endHour      = Math.min(23, Math.max(0, parseInt(b.endHour, 10) || 0));
+    if (b.tzOffset     !== undefined) patch.tzOffset     = Math.min(14, Math.max(-12, parseInt(b.tzOffset, 10) || 0));
+    const cfg = await savePromoSettings(patch);
+    res.json({ ok: true, settings: cfg });
+});
+
+// ── Admin: create / update one offer ──────────────────────────────────────
+app.post('/api/promo/offers', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const b = req.body || {};
+    const title = sanitizePushField(b.title, 120), body = sanitizePushField(b.body, 500);
+    if (!title || !body) return res.status(400).json({ error: 'title and body required' });
+    const cfg  = await getPromoSettings();
+    const list = [...(cfg.offers || [])];
+    const item = {
+        id:        String(b.id || 'offer-' + Date.now()),
+        title, body,
+        code:      sanitizePushField(b.code, 40),
+        url:       sanitizePushUrl(b.url || '/'),
+        expiresAt: b.expiresAt ? String(b.expiresAt).slice(0, 30) : '',
+        active:    b.active === undefined ? true : !!b.active,
+    };
+    const i = list.findIndex(o => o && o.id === item.id);
+    if (i >= 0) list[i] = item; else list.unshift(item);
+    await savePromoSettings({ offers: list });
+    res.json({ ok: true, offer: item, offers: list });
+});
+
+// ── Admin: toggle / delete an offer ───────────────────────────────────────
+app.post('/api/promo/offers/:id/toggle', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const cfg  = await getPromoSettings();
+    const list = (cfg.offers || []).map(o => o && o.id === req.params.id ? Object.assign({}, o, { active: !o.active }) : o);
+    await savePromoSettings({ offers: list });
+    res.json({ ok: true, offers: list });
+});
+app.delete('/api/promo/offers/:id', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const cfg  = await getPromoSettings();
+    const list = (cfg.offers || []).filter(o => o && o.id !== req.params.id);
+    await savePromoSettings({ offers: list });
+    res.json({ ok: true, offers: list });
+});
+
+// ── Admin: send one promo right now (test / manual blast) ─────────────────
+app.post('/api/promo/run-now', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try { res.json(await runPromoOnce(true)); }
+    catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── GET /sw.js — serve the service worker for push notifications ──────────────
