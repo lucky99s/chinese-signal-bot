@@ -108,6 +108,15 @@ const orderSchema = new mongoose.Schema({
     planPriceUSD:   { type: String, default: '' },
     paymentMethod:  { type: String, default: '' },
     whatsapp:       { type: String, default: '' },
+    // ── ADDITIVE (v8): Telegram handle for non-Pakistan customers. Pakistan
+    //    orders keep using `whatsapp` exactly as before.
+    telegram:       { type: String, default: '' },
+    // ── ADDITIVE (v8): promo code applied at checkout ──
+    promoCode:      { type: String, default: '' },
+    discountPKR:    { type: Number, default: 0 },
+    discountUSD:    { type: Number, default: 0 },
+    finalPricePKR:  { type: String, default: '' },
+    finalPriceUSD:  { type: String, default: '' },
     country:        { type: String, default: '' },
     txId:           { type: String, default: '' },
     screenshotPath: { type: String, default: '' },
@@ -503,7 +512,9 @@ async function deliverPush(subs, payload, meta) {
                 // v7 — mobile delivery: high urgency wakes Android/iOS out of
                 // doze/low-power mode, TTL keeps the message queued for 24h
                 // while the phone is offline instead of being dropped.
-                { TTL: 86400, urgency: 'high' }
+                // v8 — `topic` lets a newer message replace a queued older one
+                // instead of both being dropped on mobile push services.
+                { TTL: 86400, urgency: 'high', topic: (meta && meta.topic) || undefined }
             )
         ));
         results.forEach((r, idx) => {
@@ -3842,6 +3853,198 @@ function generateLicKey() {
 function isValidLicKey(key) { return CSAI_KEY_REGEX.test(key); }
 loadOrdersFile();
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDITIVE (v8) — TELEGRAM USERNAME NORMALIZER
+// Non-Pakistan customers give a Telegram @username instead of a WhatsApp
+// number. Stored canonically as "@username" so links are always buildable.
+// ═══════════════════════════════════════════════════════════════════════════
+function normalizeTelegram(raw) {
+    if (!raw) return '';
+    let t = String(raw).trim();
+    t = t.replace(/^https?:\/\/(t\.me|telegram\.me)\//i, '');   // full link → handle
+    t = t.replace(/^@+/, '').replace(/[\s]/g, '');
+    if (!t) return '';
+    if (!/^[A-Za-z0-9_]{3,64}$/.test(t)) return '@' + t.slice(0, 64); // keep, don't reject
+    return '@' + t;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDITIVE (v8) — PROMO CODE SYSTEM
+// Mongo-backed when the DB is up, in-memory fallback otherwise (same pattern
+// the rest of this server already uses). Nothing existing is modified.
+// ═══════════════════════════════════════════════════════════════════════════
+const promoCodeSchema = new mongoose.Schema({
+    code:        { type: String, required: true, unique: true, uppercase: true, trim: true },
+    label:       { type: String, default: '' },
+    // 'flat'  → subtract amountPKR / amountUSD from the plan price
+    // 'fixed' → the final price becomes amountPKR / amountUSD
+    type:        { type: String, default: 'flat' },
+    amountPKR:   { type: Number, default: 0 },
+    amountUSD:   { type: Number, default: 0 },
+    planKey:     { type: String, default: '' },     // '' = valid on every plan
+    active:      { type: Boolean, default: true },
+    uses:        { type: Number, default: 0 },
+    maxUses:     { type: Number, default: 0 },      // 0 = unlimited
+    expiresAt:   { type: Date,   default: null },
+    createdAt:   { type: Date,   default: Date.now },
+});
+const PromoCode = mongoose.model('PromoCode', promoCodeSchema);
+
+const PROMO_DEFAULTS = [
+    { code: 'OFF500',    label: '500 PKR OFF — any plan',        type: 'flat',  amountPKR: 500,  amountUSD: 2,  planKey: '',     active: true },
+    { code: 'OFF1000',   label: '1000 PKR OFF — any plan',       type: 'flat',  amountPKR: 1000, amountUSD: 4,  planKey: '',     active: true },
+    { code: 'SPECIAL1K', label: '1 Week deal — only 1000 PKR',   type: 'fixed', amountPKR: 1000, amountUSD: 4,  planKey: 'week', active: true },
+    { code: 'VIP2000',   label: 'VIP — 2000 PKR OFF',            type: 'flat',  amountPKR: 2000, amountUSD: 7,  planKey: '',     active: true },
+];
+
+let promoCodesMem = PROMO_DEFAULTS.map(p => ({ ...p, uses: 0, maxUses: 0, expiresAt: null, createdAt: new Date() }));
+
+async function seedPromoCodes() {
+    if (!useDatabase) return;
+    try {
+        for (const d of PROMO_DEFAULTS) {
+            const exists = await PromoCode.findOne({ code: d.code }).lean();
+            if (!exists) await PromoCode.create(d);
+        }
+        console.info('🎁 Promo codes ready (OFF500 / OFF1000 / SPECIAL1K / VIP2000)');
+    } catch (e) { console.warn('Promo seed skipped:', e.message); }
+}
+// Seed once the DB connection settles (and harmlessly retry a bit later).
+setTimeout(() => { seedPromoCodes().catch(() => {}); }, 6000);
+setTimeout(() => { seedPromoCodes().catch(() => {}); }, 30000);
+
+async function listPromoCodes() {
+    try { if (useDatabase) return await PromoCode.find({}).sort({ createdAt: -1 }).lean(); }
+    catch (e) { /* fall through */ }
+    return promoCodesMem;
+}
+async function findPromoCode(code) {
+    const c = String(code || '').trim().toUpperCase();
+    if (!c) return null;
+    try { if (useDatabase) return await PromoCode.findOne({ code: c }).lean(); }
+    catch (e) { /* fall through */ }
+    return promoCodesMem.find(p => p.code === c) || null;
+}
+async function incrementPromoUse(code) {
+    const c = String(code || '').trim().toUpperCase();
+    try { if (useDatabase) { await PromoCode.updateOne({ code: c }, { $inc: { uses: 1 } }); return; } }
+    catch (e) { /* fall through */ }
+    const m = promoCodesMem.find(p => p.code === c); if (m) m.uses = (m.uses || 0) + 1;
+}
+
+// Core discount calculator — used by /validate AND by POST /api/orders so the
+// browser can never invent its own price.
+async function applyPromoCode(code, opts) {
+    const o        = opts || {};
+    const pricePKR = Number(String(o.pricePKR || '').replace(/[^\d.]/g, '')) || 0;
+    const priceUSD = Number(String(o.priceUSD || '').replace(/[^\d.]/g, '')) || 0;
+    const promo    = await findPromoCode(code);
+
+    if (!promo)                                   return { ok: false, error: 'Invalid promo code' };
+    if (promo.active === false)                   return { ok: false, error: 'This promo code is suspended' };
+    if (promo.expiresAt && new Date(promo.expiresAt) < new Date())
+                                                  return { ok: false, error: 'This promo code has expired' };
+    if (promo.maxUses && promo.uses >= promo.maxUses)
+                                                  return { ok: false, error: 'This promo code has reached its limit' };
+    if (promo.planKey && o.planKey && promo.planKey !== o.planKey)
+                                                  return { ok: false, error: 'This code is only valid on another plan' };
+
+    let finalPKR = pricePKR, finalUSD = priceUSD;
+    if (promo.type === 'fixed') {
+        finalPKR = promo.amountPKR || pricePKR;
+        finalUSD = promo.amountUSD || priceUSD;
+    } else {
+        finalPKR = Math.max(0, pricePKR - (promo.amountPKR || 0));
+        finalUSD = Math.max(0, priceUSD - (promo.amountUSD || 0));
+    }
+    if (finalPKR > pricePKR) finalPKR = pricePKR;
+    if (finalUSD > priceUSD) finalUSD = priceUSD;
+
+    return {
+        ok: true,
+        code: promo.code,
+        label: promo.label || '',
+        type: promo.type || 'flat',
+        originalPKR: pricePKR,
+        originalUSD: priceUSD,
+        finalPKR,
+        finalUSD,
+        discountPKR: Math.max(0, pricePKR - finalPKR),
+        discountUSD: Math.max(0, priceUSD - finalUSD),
+    };
+}
+
+// ── PUBLIC: validate a code and get the discounted price ─────────────────────
+app.post('/api/promo-codes/validate', async (req, res) => {
+    try {
+        const b = req.body || {};
+        const r = await applyPromoCode(b.code, { planKey: b.planKey, pricePKR: b.pricePKR, priceUSD: b.priceUSD });
+        if (!r.ok) return res.status(200).json({ ok: false, valid: false, error: r.error });
+        res.json({ ok: true, valid: true, ...r });
+    } catch (e) { res.status(500).json({ ok: false, valid: false, error: 'Server error' }); }
+});
+
+// ── ADMIN: list / create / toggle / delete ───────────────────────────────────
+app.get('/api/promo-codes', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try { res.json(await listPromoCodes()); }
+    catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/promo-codes', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const b    = req.body || {};
+        const code = String(b.code || '').trim().toUpperCase().replace(/\s+/g, '');
+        if (!code) return res.status(400).json({ error: 'Code is required' });
+        const doc = {
+            code,
+            label:     String(b.label || '').slice(0, 200),
+            type:      b.type === 'fixed' ? 'fixed' : 'flat',
+            amountPKR: Number(b.amountPKR) || 0,
+            amountUSD: Number(b.amountUSD) || 0,
+            planKey:   String(b.planKey || ''),
+            active:    b.active !== false,
+            maxUses:   Number(b.maxUses) || 0,
+            expiresAt: b.expiresAt ? new Date(b.expiresAt) : null,
+        };
+        if (useDatabase) {
+            const existing = await PromoCode.findOne({ code }).lean();
+            if (existing) { await PromoCode.updateOne({ code }, doc); return res.json({ ok: true, updated: true, promo: doc }); }
+            await PromoCode.create(doc);
+        } else {
+            const i = promoCodesMem.findIndex(p => p.code === code);
+            if (i >= 0) promoCodesMem[i] = { ...promoCodesMem[i], ...doc };
+            else promoCodesMem.unshift({ ...doc, uses: 0, createdAt: new Date() });
+        }
+        res.json({ ok: true, promo: doc });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/promo-codes/:id/toggle', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const code  = String(req.params.id || '').trim().toUpperCase();
+        const promo = await findPromoCode(code);
+        if (!promo) return res.status(404).json({ error: 'Not found' });
+        const next  = promo.active === false;
+        if (useDatabase) await PromoCode.updateOne({ code }, { active: next });
+        else { const m = promoCodesMem.find(p => p.code === code); if (m) m.active = next; }
+        res.json({ ok: true, code, active: next });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/api/promo-codes/:id', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    try {
+        const code = String(req.params.id || '').trim().toUpperCase();
+        if (useDatabase) await PromoCode.deleteOne({ code });
+        promoCodesMem = promoCodesMem.filter(p => p.code !== code);
+        res.json({ ok: true, deleted: code });
+    } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
 // POST /api/orders — multipart/form-data with optional screenshot
 const _ordersUpload = uploadMiddleware ? uploadMiddleware.single('screenshot') : (req, res, next) => next();
 app.post('/api/orders', _ordersUpload, async (req, res) => {
@@ -3855,9 +4058,29 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         const planPriceUSD  = clean(b.planPriceUSD);
         const paymentMethod = clean(b.paymentMethod);
         const whatsapp      = normalizeWhatsApp(clean(b.whatsapp));
+        const telegram      = normalizeTelegram(clean(b.telegram));
         const country       = clean(b.country);
         const txId          = clean(b.txId);
-        if (!fullName || !planKey || !paymentMethod || !whatsapp) return res.status(400).json({ error: 'Missing required fields' });
+        // ── ADDITIVE (v8): promo code (validated server-side, never trusted) ──
+        const promoCodeRaw  = clean(b.promoCode).toUpperCase();
+        // v8 — Pakistan keeps requiring WhatsApp; every other country may send a
+        // Telegram username instead. At least ONE contact channel is mandatory.
+        if (!fullName || !planKey || !paymentMethod) return res.status(400).json({ error: 'Missing required fields' });
+        if (!whatsapp && !telegram) return res.status(400).json({ error: 'Please provide a WhatsApp number or a Telegram username' });
+        // ── Recompute the discount on the server ──
+        let promoCode = '', discountPKR = 0, discountUSD = 0;
+        let finalPricePKR = planPricePKR, finalPriceUSD = planPriceUSD;
+        if (promoCodeRaw) {
+            const pr = await applyPromoCode(promoCodeRaw, { planKey, pricePKR: planPricePKR, priceUSD: planPriceUSD });
+            if (pr.ok) {
+                promoCode     = pr.code;
+                discountPKR   = pr.discountPKR;
+                discountUSD   = pr.discountUSD;
+                finalPricePKR = String(pr.finalPKR);
+                finalPriceUSD = String(pr.finalUSD);
+                incrementPromoUse(pr.code).catch(() => {});
+            }
+        }
         // Store screenshot as base64 in DB — disk files on Render are wiped on restart
         let screenshotPath = '';
         let screenshotData = '';
@@ -3872,7 +4095,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         if (screenshotData) screenshotPath = '/api/orders/' + id + '/screenshot';
         // Duplicate detection before saving (includes SHA-256 hash check)
         const existingOrders = useDatabase ? await Order.find({}).lean().catch(() => []) : ordersMem;
-        const dupes = await findDuplicateOrders({ id: 'TMP', fullName, whatsapp, txId, planKey, screenshotHash }, existingOrders);
+        const dupes = await findDuplicateOrders({ id: 'TMP', fullName, whatsapp: whatsapp || telegram, txId, planKey, screenshotHash }, existingOrders);
         const isDuplicate = dupes.length > 0;
 
         // Block duplicate submissions — return 409 with details so the client can show a popup
@@ -3888,7 +4111,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             });
         }
 
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, promoCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
 
@@ -3899,7 +4122,9 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             `📦 <b>New Order Received!</b>${dupeWarning}\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
             `👤 Name: <b>${fullName}</b>\n` +
-            `📱 WhatsApp: <code>${whatsapp}</code>\n` +
+            `📱 WhatsApp: <code>${whatsapp || '—'}</code>\n` +
+            (telegram ? `✈️ Telegram: <code>${telegram}</code>\n` : '') +
+            (promoCode ? `🎁 Promo: <b>${promoCode}</b> (−${discountPKR} PKR)\n` : '') +
             `📦 Plan: <b>${planLabel || planKey}</b>\n` +
             `💰 Price: <b>${planPricePKR ? planPricePKR+' PKR' : ''}${planPriceUSD ? ' / $'+planPriceUSD : ''}</b>\n` +
             `💳 Payment: <b>${paymentMethod}</b>\n` +
@@ -3925,8 +4150,9 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
                     // Row 5: Delete & View Details
                     [{ text: '🗑 Delete Order',            callback_data: `order_delete|${id}` },
                      { text: '👁 View Details',            callback_data: `order_details|${id}` }],
-                    // Row 6: WhatsApp
-                    [{ text: '💬 WhatsApp Customer',       url: `https://wa.me/${whatsapp.replace(/\D/g,'')}` }],
+                    // Row 6: WhatsApp / Telegram 1-click contact
+                    ...(whatsapp ? [[{ text: '💬 WhatsApp Customer', url: `https://wa.me/${whatsapp.replace(/\D/g,'')}` }]] : []),
+                    ...(telegram ? [[{ text: '✈️ Telegram Customer', url: `https://t.me/${telegram.replace(/^@/, '')}` }]] : []),
                 ],
             },
         }).catch(() => {});
