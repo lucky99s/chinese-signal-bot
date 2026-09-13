@@ -4160,6 +4160,66 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         res.json({ ok: true, order: { id: order.id } });
     } catch(e) { console.error('POST /api/orders error:', e); res.status(500).json({ error: 'Server error' }); }
 });
+// ── ADDITIVE (v10): PUBLIC order tracking ────────────────────────────────────
+// GET /api/orders/track/:id            → safe status only
+// GET /api/orders/track/:id?contact=…  → also reveals the license key when the
+//                                        WhatsApp number / Telegram username matches
+const TRACK_STEPS = [
+    { key: 'received',  label: 'Order Received'    },
+    { key: 'reviewing', label: 'Verifying Payment' },
+    { key: 'approved',  label: 'Approved'          },
+    { key: 'delivered', label: 'License Delivered' },
+];
+function _trackStage(order) {
+    const st = String(order?.status || 'Pending').toLowerCase();
+    if (st === 'rejected' || st === 'cancelled' || st === 'fake') return -1;
+    if (order?.licenseKey) return 3;
+    if (['confirmed', 'approved', 'paid', 'completed'].includes(st)) return 2;
+    if (['reviewing', 'contacted'].includes(st)) return 1;
+    return 0;
+}
+function _trackContactMatches(order, contact) {
+    const c = String(contact || '').trim().toLowerCase().replace(/^@/, '');
+    if (!c) return false;
+    const wa = String(order?.whatsapp || '').replace(/\D/g, '');
+    const cd = c.replace(/\D/g, '');
+    if (wa && cd && (wa === cd || wa.endsWith(cd.slice(-9)))) return true;
+    const tg = String(order?.telegram || '').toLowerCase().replace(/^@/, '');
+    return !!tg && tg === c;
+}
+app.get('/api/orders/track/:id', async (req, res) => {
+    try {
+        const id = String(req.params.id || '').trim().toUpperCase();
+        if (!id || id.length < 4) return res.status(400).json({ ok: false, error: 'Please enter a valid Order ID' });
+        let order;
+        if (useDatabase) order = await Order.findOne({ id }).lean();
+        else order = ordersMem.find(x => String(x.id).toUpperCase() === id);
+        if (!order) return res.status(404).json({ ok: false, error: 'No order found with this ID' });
+
+        const stage    = _trackStage(order);
+        const verified = _trackContactMatches(order, req.query.contact);
+        const first    = String(order.fullName || '').trim().split(/\s+/)[0] || 'Customer';
+        res.json({
+            ok: true,
+            order: {
+                id:        order.id,
+                firstName: first,
+                planLabel: order.planLabel || order.planKey || '',
+                method:    order.paymentMethod || '',
+                status:    order.status || 'Pending',
+                stage,
+                steps:     TRACK_STEPS,
+                rejected:  stage === -1,
+                reason:    stage === -1 ? (order.rejectReason || '') : '',
+                hasKey:    !!order.licenseKey,
+                verified,
+                licenseKey: verified ? (order.licenseKey || '') : '',
+                createdAt: order.createdAt || null,
+            },
+        });
+    } catch(e) { console.error('GET /api/orders/track error:', e.message); res.status(500).json({ ok: false, error: 'Server error' }); }
+});
+
 app.get('/api/orders', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
     try { res.json(useDatabase ? await Order.find({}).sort({ createdAt: -1 }).limit(1000).lean() : ordersMem); }
