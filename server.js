@@ -4,6 +4,8 @@ const axios     = require('axios');
 const fs        = require('fs');
 const path      = require('path');
 const crypto    = require('crypto');
+let nodemailer;
+try { nodemailer = require('nodemailer'); } catch(e) { console.warn('nodemailer not installed — email license delivery disabled'); }
 const mongoose  = require('mongoose');
 const COUNTRY_CFG = require('./countries');
 let multer, webPush;
@@ -111,6 +113,7 @@ const orderSchema = new mongoose.Schema({
     // ── ADDITIVE (v8): Telegram handle for non-Pakistan customers. Pakistan
     //    orders keep using `whatsapp` exactly as before.
     telegram:       { type: String, default: '' },
+    email:          { type: String, default: '' },
     // ── ADDITIVE (v8): promo code applied at checkout ──
     promoCode:      { type: String, default: '' },
     discountPKR:    { type: Number, default: 0 },
@@ -1641,6 +1644,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use('/uploads', express.static(UPLOADS_DIR));
+app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 // ================== TELEGRAM SETTINGS ==================
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc';
@@ -1993,6 +1997,7 @@ async function tgHandleCallback(chatId, data, callbackId) {
                 if (useDatabase) await License.findOneAndUpdate({ key: newKey }, licData, { upsert: true }).catch(() => {});
                 else { if (!licenses) global.licenses = []; licenses.unshift(licData); saveLicenses?.(); }
                 broadcastSSE('license_added', licData);
+                sendLicenseEmail(orderDoc, newKey).catch(emailErr => console.error('License email error:', emailErr.message));
             }
             broadcastSSE('order_updated', { id: orderId, ...updates });
             const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your order has been approved!\n\n🔑 License Key: ${newKey}\n\nPaste this key when prompted on the bot.`)}` : '#';
@@ -2734,6 +2739,7 @@ async function tgHandleMessage(msg) {
                 else { licenses.unshift(licData); saveLicenses?.(); }
                 broadcastSSE('order_updated', { id: sess.orderId, licenseKey: key, status: 'Approved' });
                 broadcastSSE('license_added', licData);
+                sendLicenseEmail(orderDoc, key).catch(emailErr => console.error('License email error:', emailErr.message));
             }
             const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your license key:\n\n🔑 ${key}\n\nPaste this in the bot when prompted.`)}` : '#';
             return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
@@ -4059,6 +4065,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         const paymentMethod = clean(b.paymentMethod);
         const whatsapp      = normalizeWhatsApp(clean(b.whatsapp));
         const telegram      = normalizeTelegram(clean(b.telegram));
+        const email         = clean(b.email).toLowerCase();
         const country       = clean(b.country);
         const txId          = clean(b.txId);
         // ── ADDITIVE (v8): promo code (validated server-side, never trusted) ──
@@ -4066,7 +4073,13 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
         // v8 — Pakistan keeps requiring WhatsApp; every other country may send a
         // Telegram username instead. At least ONE contact channel is mandatory.
         if (!fullName || !planKey || !paymentMethod) return res.status(400).json({ error: 'Missing required fields' });
-        if (!whatsapp && !telegram) return res.status(400).json({ error: 'Please provide a WhatsApp number or a Telegram username' });
+        const isPakistan = country === '+92' || country.toUpperCase() === 'PK';
+        if (country && isPakistan && !whatsapp) return res.status(400).json({ error: 'Please provide a WhatsApp number' });
+        if (country && !isPakistan && !telegram) return res.status(400).json({ error: 'Please provide a Telegram username' });
+        if (!country && !whatsapp && !telegram) return res.status(400).json({ error: 'Please provide a WhatsApp number or a Telegram username' });
+        if (whatsapp && whatsapp.replace(/\D/g, '').length < 7) return res.status(400).json({ error: 'Please provide a valid WhatsApp number' });
+        if (telegram && !/^@[A-Za-z0-9_]{5,32}$/.test(telegram)) return res.status(400).json({ error: 'Please provide a valid Telegram username' });
+        if (email && !_validEmail(email)) return res.status(400).json({ error: 'Please provide a valid email address' });
         // ── Recompute the discount on the server ──
         let promoCode = '', discountPKR = 0, discountUSD = 0;
         let finalPricePKR = planPricePKR, finalPriceUSD = planPriceUSD;
@@ -4111,7 +4124,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             });
         }
 
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, promoCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, email, promoCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
 
@@ -4124,6 +4137,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             `👤 Name: <b>${fullName}</b>\n` +
             `📱 WhatsApp: <code>${whatsapp || '—'}</code>\n` +
             (telegram ? `✈️ Telegram: <code>${telegram}</code>\n` : '') +
+            (email ? `✉️ Email: <code>${email}</code>\n` : '') +
             (promoCode ? `🎁 Promo: <b>${promoCode}</b> (−${discountPKR} PKR)\n` : '') +
             `📦 Plan: <b>${planLabel || planKey}</b>\n` +
             `💰 Price: <b>${planPricePKR ? planPricePKR+' PKR' : ''}${planPriceUSD ? ' / $'+planPriceUSD : ''}</b>\n` +
@@ -4187,17 +4201,48 @@ function _trackContactMatches(order, contact) {
     const tg = String(order?.telegram || '').toLowerCase().replace(/^@/, '');
     return !!tg && tg === c;
 }
+function _validEmail(value) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim()) && String(value || '').length <= 254;
+}
+async function sendLicenseEmail(order, key) {
+    if (!nodemailer || !order?.email || !_validEmail(order.email)) return false;
+    const user = process.env.DELIVERY_EMAIL || process.env.OTP_EMAIL || '';
+    const pass = process.env.DELIVERY_EMAIL_PASSWORD || process.env.OTP_EMAIL_PASSWORD || '';
+    if (!user || !pass) return false;
+    const transport = nodemailer.createTransport({
+        host: process.env.DELIVERY_SMTP_HOST || 'smtp.gmail.com',
+        port: Number(process.env.DELIVERY_SMTP_PORT || 465),
+        secure: String(process.env.DELIVERY_SMTP_SECURE || 'true') !== 'false',
+        auth: { user, pass },
+    });
+    await transport.sendMail({
+        from: process.env.DELIVERY_EMAIL_FROM || user,
+        to: order.email,
+        subject: `Your Chinese Signal Bot license — ${order.id}`,
+        text: `Hello ${order.fullName || 'Customer'},\n\nYour payment has been approved.\nOrder ID: ${order.id}\nPlan: ${order.planLabel || order.planKey || 'License'}\nLicense Key: ${key}\n\nPaste this key when prompted in Chinese Signal Bot.`,
+    });
+    return true;
+}
 app.get('/api/orders/track/:id', async (req, res) => {
     try {
-        const id = String(req.params.id || '').trim().toUpperCase();
-        if (!id || id.length < 4) return res.status(400).json({ ok: false, error: 'Please enter a valid Order ID' });
+        const value = String(req.params.id || '').trim();
+        const method = ['id','telegram','whatsapp'].includes(String(req.query.method || 'id')) ? String(req.query.method || 'id') : 'id';
+        if (!value || value.length < 4 || value.length > 100) return res.status(400).json({ ok: false, error: 'Please enter valid tracking details' });
         let order;
-        if (useDatabase) order = await Order.findOne({ id }).lean();
-        else order = ordersMem.find(x => String(x.id).toUpperCase() === id);
-        if (!order) return res.status(404).json({ ok: false, error: 'No order found with this ID' });
+        if (method === 'id') {
+            const id = value.toUpperCase();
+            if (useDatabase) order = await Order.findOne({ id }).lean();
+            else order = ordersMem.find(x => String(x.id).toUpperCase() === id);
+        } else {
+            const all = useDatabase ? await Order.find({}).sort({ createdAt: -1 }).limit(1000).lean() : [...ordersMem];
+            order = all.find(x => method === 'telegram'
+                ? String(x.telegram || '').toLowerCase().replace(/^@/, '') === value.toLowerCase().replace(/^@/, '')
+                : _trackContactMatches({ whatsapp: x.whatsapp }, value));
+        }
+        if (!order) return res.status(404).json({ ok: false, error: 'No order found. Please check your details and try again.' });
 
         const stage    = _trackStage(order);
-        const verified = _trackContactMatches(order, req.query.contact);
+        const verified = method === 'id' ? true : _trackContactMatches(order, value);
         const first    = String(order.fullName || '').trim().split(/\s+/)[0] || 'Customer';
         res.json({
             ok: true,
@@ -4296,6 +4341,7 @@ app.patch('/api/orders/:id', async (req, res) => {
                     saveLicenses();
                 }
             } catch(licErr) { console.error('License save error:', licErr.message); }
+            sendLicenseEmail(orderDoc, lk).catch(emailErr => console.error('License email error:', emailErr.message));
         }
 
         broadcastSSE('order_updated', { id, ...updates });
