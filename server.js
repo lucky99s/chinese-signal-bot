@@ -634,18 +634,25 @@ async function dbPollAndClearMessages(userName) {
 }
 async function dbDeleteUser(licenceKey) { await User.deleteOne({ licenceKey }); }
 
-// ================== PUPPETEER SETUP ==================
-// Quotex Auto-Login — uses headless browser to log into Quotex on behalf of clients
-// Install: npm install puppeteer  (first run downloads ~170MB Chromium)
+// ================== PUPPETEER SETUP WITH STEALTH ==================
 let puppeteer = null;
 let puppeteerAvailable = false;
 
 try {
-    puppeteer = require('puppeteer');
+    const puppeteerExtra = require('puppeteer-extra');
+    const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+    puppeteerExtra.use(StealthPlugin());
+    puppeteer = puppeteerExtra;
     puppeteerAvailable = true;
-    console.log('✅ Puppeteer available — Quotex Auto-Login ENABLED');
-} catch(e) {
-    console.warn('⚠️  Puppeteer not installed. Run: npm install puppeteer  to enable Auto-Login.');
+    console.log('✅ Puppeteer Stealth available — Quotex Auto-Login ENABLED');
+} catch (e) {
+    try {
+        puppeteer = require('puppeteer');
+        puppeteerAvailable = true;
+        console.log('✅ Standard Puppeteer available (Stealth not found)');
+    } catch (_) {
+        console.warn('⚠️ Puppeteer not installed. Run: npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth');
+    }
 }
 
 // ================== AUTO-OTP (IMAP EMAIL WATCHER) ==================
