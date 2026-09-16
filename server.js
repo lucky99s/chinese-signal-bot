@@ -894,7 +894,8 @@ async function launchQuotexSession(session) {
             args: [
                 '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
-                '--single-process', '--disable-gpu',
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
                 '--window-size=1280,800',
             ],
         };
@@ -953,6 +954,33 @@ async function launchQuotexSession(session) {
             }
         }
         if (!navigated) throw new Error('All Quotex login URLs failed or returned empty pages');
+
+        // ── Cloudflare Turnstile / "Just a moment" challenge handler ─────────
+        // Purely additive: if no challenge is present nothing changes.
+        try {
+            const challenged = await page.evaluate(() => {
+                const t = (document.title || '').toLowerCase();
+                const b = (document.body && document.body.innerText || '').toLowerCase();
+                return t.includes('just a moment')
+                    || b.includes('verifying you are human')
+                    || b.includes('performing security verification');
+            });
+            if (challenged) {
+                await updateSession(session, 'navigating', '🛡️ Cloudflare challenge detected — solving...', { screenshot: true });
+                await sleep(4000);
+                for (const frame of page.frames()) {
+                    try {
+                        const box = await frame.$('input[type="checkbox"], .ctp-checkbox-label');
+                        if (box) { await box.click().catch(() => {}); }
+                    } catch(_) {}
+                }
+                await sleep(5000);
+                await updateSession(session, 'navigating', '🛡️ Challenge step finished — continuing...', { screenshot: true });
+            }
+        } catch(cfErr) {
+            console.warn('[QX] Cloudflare challenge handler skipped:', cfErr.message);
+        }
+
         await updateSession(session, 'navigating', '🌐 Page loaded — waiting for form...', { screenshot: true });
 
         // Wait for the login form to render (SPA may be async)
@@ -5398,6 +5426,31 @@ app.get('/api/push/subscribers/export.csv', async (req, res) => {
         res.send('\uFEFF' + csv);
     } catch(e) { res.status(500).json({ error: 'Export failed' }); }
 });
+
+// ================== AI CUSTOMER SUPPORT (ADDITIVE v9) ==================
+// Text + voice support assistant. Purely additive: it only registers new
+// /api/support/* routes and a /support-tickets admin page.
+try {
+    require('./support-ai')({
+        app, mongoose, express, multer, axios, isAdmin, sendTelegramMessage,
+        trackStage: _trackStage,
+        // Read-only access to existing order data (DB or file mode).
+        getOrders: async () => {
+            if (useDatabase) return await Order.find({}).sort({ createdAt: -1 }).limit(1000).lean();
+            return [...ordersMem];
+        },
+        // Plans + enabled payment methods straight from admin settings.
+        getPlansAndPayments: async () => {
+            let doc = paymentSettingsMem;
+            try { if (useDatabase) doc = (await PaymentSettings.findById('main').lean()) || paymentSettingsMem; } catch (e) {}
+            const plans = (Array.isArray(doc?.plans) ? doc.plans : []).filter(p => p && p.active !== false);
+            const payments = ['easypaisa','jazzcash','binance','usdt']
+                .filter(k => doc?.[k] && doc[k].enabled !== false)
+                .map(k => k.charAt(0).toUpperCase() + k.slice(1));
+            return { plans, payments };
+        },
+    });
+} catch (e) { console.warn('AI Support Assistant not loaded:', e.message); }
 
 // ================== ROOT ==================
 app.get('/', (req, res) => {
