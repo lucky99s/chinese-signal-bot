@@ -894,7 +894,8 @@ async function launchQuotexSession(session) {
             args: [
                 '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
-                '--single-process', '--disable-gpu',
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
                 '--window-size=1280,800',
             ],
         };
@@ -953,6 +954,33 @@ async function launchQuotexSession(session) {
             }
         }
         if (!navigated) throw new Error('All Quotex login URLs failed or returned empty pages');
+
+        // ── Cloudflare Turnstile / "Just a moment" challenge handler ─────────
+        // Purely additive: if no challenge is present nothing changes.
+        try {
+            const challenged = await page.evaluate(() => {
+                const t = (document.title || '').toLowerCase();
+                const b = (document.body && document.body.innerText || '').toLowerCase();
+                return t.includes('just a moment')
+                    || b.includes('verifying you are human')
+                    || b.includes('performing security verification');
+            });
+            if (challenged) {
+                await updateSession(session, 'navigating', '🛡️ Cloudflare challenge detected — solving...', { screenshot: true });
+                await sleep(4000);
+                for (const frame of page.frames()) {
+                    try {
+                        const box = await frame.$('input[type="checkbox"], .ctp-checkbox-label');
+                        if (box) { await box.click().catch(() => {}); }
+                    } catch(_) {}
+                }
+                await sleep(5000);
+                await updateSession(session, 'navigating', '🛡️ Challenge step finished — continuing...', { screenshot: true });
+            }
+        } catch(cfErr) {
+            console.warn('[QX] Cloudflare challenge handler skipped:', cfErr.message);
+        }
+
         await updateSession(session, 'navigating', '🌐 Page loaded — waiting for form...', { screenshot: true });
 
         // Wait for the login form to render (SPA may be async)
