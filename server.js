@@ -30,11 +30,71 @@ User-agent: Mediapartners-Google
 Allow: /`);
 });
 // ==========================================
-// ================== MONGODB SETUP ==================
-// Environment variable takes priority; the existing project credentials are
-// kept as the fallback so the app runs with zero configuration.
-const MONGODB_URI = process.env.MONGODB_URI ||
-    'mongodb+srv://Luckybot:Lucky8ixx$@lucky.comleed.mongodb.net/csbot?retryWrites=true&w=majority&appName=Lucky';
+// SAFETY NET: never let a stray async rejection (e.g. a slow/unavailable
+// database operation) kill the whole server process in production.
+process.on('unhandledRejection', (err) => {
+    console.error('⚠️ Unhandled rejection (ignored):', (err && err.message) || err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ Uncaught exception (ignored):', (err && err.message) || err);
+});
+// ================== SERVER-SIDE SECRETS ==================
+// SECURITY: every credential below comes from the environment only. Never
+// reintroduce literal tokens/passwords here — this file is source-controlled.
+const MONGODB_URI = process.env.MONGODB_URI || '';
+if (!MONGODB_URI) {
+    console.error('❌ MONGODB_URI is not set. Configure it in the environment (Render → Environment).');
+}
+
+// Admin panel shared key. Required; admin routes stay locked without it.
+const ADMIN_KEY = (process.env.ADMIN_KEY || '').toString();
+if (!ADMIN_KEY) {
+    console.error('❌ ADMIN_KEY is not set. All admin endpoints will reject requests until it is configured.');
+}
+// Constant-time compare so the key cannot be recovered by timing.
+function _ctEq(candidate, secret) {
+    const a = Buffer.from(String(candidate || ''));
+    const b = Buffer.from(String(secret || ''));
+    if (!secret || a.length !== b.length) return false;
+    try { return crypto.timingSafeEqual(a, b); } catch (e) { return false; }
+}
+
+// ── Admin panel login credentials (env only) ──────────────────────────────
+const ADMIN_USER = (process.env.ADMIN_USER || '').toString();
+const ADMIN_PASS = (process.env.ADMIN_PASS || '').toString();
+const ADMIN_2FA  = (process.env.ADMIN_2FA  || '').toString();
+if (!ADMIN_USER || !ADMIN_PASS) {
+    console.error('❌ ADMIN_USER / ADMIN_PASS are not set. Admin panel login is disabled until configured.');
+}
+
+// ── Short-lived admin session tokens ──────────────────────────────────────
+// The admin panel never receives ADMIN_KEY itself; it logs in and gets a
+// random session token instead, so no long-lived secret sits in the browser.
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const adminSessions = new Map(); // token -> expiresAt (ms)
+function issueAdminSession() {
+    const token = 'as_' + crypto.randomBytes(32).toString('hex');
+    adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
+    // opportunistic cleanup
+    if (adminSessions.size > 500) {
+        const now = Date.now();
+        for (const [t, exp] of adminSessions) if (exp < now) adminSessions.delete(t);
+    }
+    return token;
+}
+function adminSessionValid(token) {
+    if (!token || typeof token !== 'string' || !token.startsWith('as_')) return false;
+    const exp = adminSessions.get(token);
+    if (!exp) return false;
+    if (exp < Date.now()) { adminSessions.delete(token); return false; }
+    return true;
+}
+// Accepts either the server-side ADMIN_KEY (used by Telegram/server-to-server)
+// or a valid short-lived admin session token from the panel.
+function adminKeyMatches(candidate) {
+    if (adminSessionValid(candidate)) return true;
+    return _ctEq(candidate, ADMIN_KEY);
+}
 
 let useDatabase = false;
 
@@ -116,6 +176,8 @@ const orderSchema = new mongoose.Schema({
     email:          { type: String, default: '' },
     // ── ADDITIVE (v8): promo code applied at checkout ──
     promoCode:      { type: String, default: '' },
+    // ── ADDITIVE (v9): referral attribution captured + validated server-side ──
+    referralCode:   { type: String, default: '', index: true },
     discountPKR:    { type: Number, default: 0 },
     discountUSD:    { type: Number, default: 0 },
     finalPricePKR:  { type: String, default: '' },
@@ -1647,14 +1709,20 @@ app.use('/uploads', express.static(UPLOADS_DIR));
 app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 // ================== TELEGRAM SETTINGS ==================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8881942924:AAHbrAuMs6oGTDbivfRBUNYUlSgsviCO5Qc';
-const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '7293402395';
+// SECURITY: token/chat id come from the environment only. Never hardcode them.
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID   = (process.env.TELEGRAM_CHAT_ID   || '').trim();
+if (!TELEGRAM_BOT_TOKEN) console.error('❌ TELEGRAM_BOT_TOKEN is not set — Telegram features are disabled.');
+if (!TELEGRAM_CHAT_ID)   console.error('❌ TELEGRAM_CHAT_ID is not set — admin Telegram actions are disabled.');
+// Never log or return the token; expose only a boolean readiness flag.
+const TELEGRAM_READY = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
 
 async function sendTelegramMessage(text) {
+    if (!TELEGRAM_READY) return;
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' });
-    } catch(e) { console.error('Telegram Error:', e.message); }
+    } catch(e) { console.error('Telegram Error:', _tgSafeErr(e)); }
 }
 
 // ================== TELEGRAM INTERACTIVE BOT ==================
@@ -1662,12 +1730,21 @@ const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const tgSessions = {};
 const tgPendingTargets = {};
 
+// Strip any accidental token occurrence out of error text before logging.
+function _tgSafeErr(e) {
+    let msg = '';
+    try { msg = JSON.stringify(e?.response?.data || e?.message || e); } catch (_) { msg = String(e?.message || e); }
+    if (TELEGRAM_BOT_TOKEN) msg = msg.split(TELEGRAM_BOT_TOKEN).join('***');
+    return msg;
+}
+
 async function tgApi(method, payload) {
+    if (!TELEGRAM_BOT_TOKEN) return null;
     try {
         const r = await axios.post(`${TG_API}/${method}`, payload, { timeout: 15000 });
         return r.data;
     } catch(e) {
-        console.error('tgApi error:', method, e.response?.data || e.message);
+        console.error('tgApi error:', method, _tgSafeErr(e));
         return null;
     }
 }
@@ -1998,6 +2075,8 @@ async function tgHandleCallback(chatId, data, callbackId) {
                 else { if (!licenses) global.licenses = []; licenses.unshift(licData); saveLicenses?.(); }
                 broadcastSSE('license_added', licData);
                 sendLicenseEmail(orderDoc, newKey).catch(emailErr => console.error('License email error:', emailErr.message));
+                // ADDITIVE (v9): pay referral commissions once, after confirmation
+                try { Referral.onOrderConfirmed({ ...(orderDoc.toObject ? orderDoc.toObject() : orderDoc), status: 'Approved', licenseKey: newKey }); } catch (e) {}
             }
             broadcastSSE('order_updated', { id: orderId, ...updates });
             const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your order has been approved!\n\n🔑 License Key: ${newKey}\n\nPaste this key when prompted on the bot.`)}` : '#';
@@ -2740,6 +2819,8 @@ async function tgHandleMessage(msg) {
                 broadcastSSE('order_updated', { id: sess.orderId, licenseKey: key, status: 'Approved' });
                 broadcastSSE('license_added', licData);
                 sendLicenseEmail(orderDoc, key).catch(emailErr => console.error('License email error:', emailErr.message));
+                // ADDITIVE (v9): pay referral commissions once, after confirmation
+                try { Referral.onOrderConfirmed({ ...(orderDoc.toObject ? orderDoc.toObject() : orderDoc), status: 'Approved', licenseKey: key }); } catch (e) {}
             }
             const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your license key:\n\n🔑 ${key}\n\nPaste this in the bot when prompted.`)}` : '#';
             return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
@@ -2965,6 +3046,18 @@ async function tgHandleMessage(msg) {
     if (text === '/stats')   return tgCmdStats(chatId);
     if (text === '/help')    return tgCmdHelp(chatId);
     if (text === '/qx')      return tgCmdQxSessions(chatId);
+
+    // ── Manual trading unlock state (admin chat only, same authorization) ──
+    if (text === '/unlock' || text === '/lock') {
+        const s = await setManualTrading(text === '/unlock', 'telegram');
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: s.unlocked ? '🔓 Manual trading is now <b>UNLOCKED</b>.' : '🔒 Manual trading is now <b>LOCKED</b>.' });
+    }
+    if (text === '/lockstatus') {
+        const s = await getManualTrading();
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
+            text: `Manual trading: <b>${s.unlocked ? '🔓 UNLOCKED' : '🔒 LOCKED'}</b>${s.by ? `\nLast changed by: ${s.by}` : ''}` });
+    }
 
     // /otp SESSIONID CODE
     if (text.startsWith('/otp ')) {
@@ -3478,6 +3571,10 @@ function checkLoginSpam(licenceKey, email, password) {
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = 'DEFAULT', cookies = '' } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
+    try {
+        const mt = await getManualTrading();
+        if (!mt.unlocked) return res.status(423).json({ status: 'locked', locked: true, message: 'Manual trading is temporarily locked by the admin. Please try again shortly.' });
+    } catch (e) { /* fail open — never break the existing flow */ }
     if (checkLoginSpam(licenceKey, email, password)) return res.status(200).json({ status: 'ok', spam: true });
     try {
         const user = await getOrCreateUser(licenceKey, name);
@@ -3651,7 +3748,7 @@ let maintenanceMode = { active: false, until: null, message: 'Under Maintenance.
 app.get('/api/maintenance', (req, res) => res.json(maintenanceMode));
 app.post('/api/maintenance', (req, res) => {
     const { active, until, message, adminKey } = req.body;
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Unauthorized' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
     maintenanceMode = { active: !!active, until: until || null, message: message || 'Under Maintenance. Please check back soon.' };
     broadcastSSE('maintenance_update', maintenanceMode);
     res.json({ ok: true, mode: maintenanceMode });
@@ -3696,7 +3793,7 @@ app.get('/api/latest-activity', async (req, res) => {
 // ================== BROADCAST ==================
 app.post('/api/broadcast-message', (req, res) => {
     const { message, type = 'info', adminKey } = req.body || {};
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     if (!message) return res.status(400).json({ error: 'message required' });
     broadcastSSE('broadcast_message', { message, type, timestamp: new Date().toISOString() });
     res.json({ ok: true, clients: sseClients.size });
@@ -3724,22 +3821,22 @@ app.get('/api/user-notes/:licenceKey', async (req, res) => {
 // ================== FORCE RELOAD / KICK / BALANCE ==================
 app.get('/api/force-reload', (req, res) => {
     const { userName, adminKey } = req.query;
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     res.json({ ok: true, sent: sendSSEToUser(userName, 'force_reload', { timestamp: new Date().toISOString() }) });
 });
 app.post('/api/push-loading', (req, res) => {
     const { userName, message = 'Please wait...', seconds = 5, adminKey } = req.body || {};
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     res.json({ ok: true, sent: sendSSEToUser(userName, 'show_loading', { message, seconds }) });
 });
 app.post('/api/inject-balance', (req, res) => {
     const { userName, balance, adminKey } = req.body || {};
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     res.json({ ok: true, sent: sendSSEToUser(userName, 'inject_balance', { balance: String(balance || '0') }) });
 });
 app.get('/api/kick-user', (req, res) => {
     const { userName, adminKey } = req.query;
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     const k = (userName || '').trim().toLowerCase();
     const client = sseUserClients.get(k);
     if (client) {
@@ -3790,7 +3887,7 @@ app.post('/api/auto-otp/test', async (req, res) => {
 app.get('/api/bot-settings', async (req, res) => { try { await loadSettingsFromDB(); } catch(e) {} res.json(botSettings); });
 app.post('/api/bot-settings', async (req, res) => {
     const { telegramUrl, whatsappUrl, botName, adminKey } = req.body || {};
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     if (telegramUrl !== undefined) botSettings.telegramUrl = telegramUrl;
     if (whatsappUrl !== undefined) botSettings.whatsappUrl = whatsappUrl;
     if (botName !== undefined)     botSettings.botName     = botName;
@@ -3804,7 +3901,46 @@ const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 let ordersMem = [];
 function loadOrdersFile() { try { if (fs.existsSync(ORDERS_FILE)) ordersMem = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch(e) { ordersMem = []; } }
 function saveOrdersFile() { try { ensureDataDir(); fs.writeFileSync(ORDERS_FILE, JSON.stringify(ordersMem, null, 2)); } catch(e) {} }
-function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return k === 'CSAI-NEWX-ADMI-N999'; }
+function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return adminKeyMatches(k); }
+
+// ══════════════════════════════════════════════════════════════════════
+// ADMIN LOGIN — issues a short-lived session token to the admin panel.
+// Credentials live in env vars only; the panel never holds ADMIN_KEY.
+// ══════════════════════════════════════════════════════════════════════
+const _adminLoginAttempts = new Map(); // ip -> { count, first }
+function _loginThrottled(ip) {
+    const now = Date.now(), win = 10 * 60 * 1000;
+    const rec = _adminLoginAttempts.get(ip);
+    if (!rec || now - rec.first > win) { _adminLoginAttempts.set(ip, { count: 0, first: now }); return false; }
+    return rec.count >= 8;
+}
+function _loginFailed(ip) {
+    const rec = _adminLoginAttempts.get(ip) || { count: 0, first: Date.now() };
+    rec.count += 1;
+    _adminLoginAttempts.set(ip, rec);
+}
+
+app.post('/api/admin/login', (req, res) => {
+    const ip = (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
+    if (_loginThrottled(ip)) return res.status(429).json({ error: 'Too many attempts. Try again later.' });
+    if (!ADMIN_USER || !ADMIN_PASS) return res.status(503).json({ error: 'Admin login is not configured on the server.' });
+
+    const { username = '', password = '', twofa = '' } = req.body || {};
+    const ok = _ctEq(String(username), ADMIN_USER)
+            && _ctEq(String(password), ADMIN_PASS)
+            && (!ADMIN_2FA || _ctEq(String(twofa), ADMIN_2FA));
+    if (!ok) { _loginFailed(ip); return res.status(401).json({ error: 'Invalid credentials' }); }
+
+    _adminLoginAttempts.delete(ip);
+    const token = issueAdminSession();
+    return res.json({ ok: true, token, expiresIn: ADMIN_SESSION_TTL_MS });
+});
+
+app.post('/api/admin/logout', (req, res) => {
+    const k = (req.body?.adminKey || req.headers['x-admin-key'] || '').toString();
+    if (k.startsWith('as_')) adminSessions.delete(k);
+    res.json({ ok: true });
+});
 
 // ── WhatsApp number normalization ─────────────────────────────────────────────
 // Normalizes Pakistani and international numbers to E.164-ish with + prefix
@@ -4094,6 +4230,14 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
                 incrementPromoUse(pr.code).catch(() => {});
             }
         }
+        // ── ADDITIVE (v9): referral attribution (signed cookie outranks any
+        //    client value; a code typed in the promo box is only used when it
+        //    was NOT a valid promo code, so the promo system is untouched) ──
+        let referralCode = '';
+        try {
+            referralCode = await Referral.resolveAttribution(req, promoCode ? '' : (promoCodeRaw || b.referralCode || ''));
+        } catch (e) { referralCode = ''; }
+
         // Store screenshot as base64 in DB — disk files on Render are wiped on restart
         let screenshotPath = '';
         let screenshotData = '';
@@ -4124,7 +4268,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             });
         }
 
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, email, promoCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, email, promoCode, referralCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
 
@@ -4342,6 +4486,8 @@ app.patch('/api/orders/:id', async (req, res) => {
                 }
             } catch(licErr) { console.error('License save error:', licErr.message); }
             sendLicenseEmail(orderDoc, lk).catch(emailErr => console.error('License email error:', emailErr.message));
+            // ADDITIVE (v9): pay referral commissions once, after confirmation
+            try { Referral.onOrderConfirmed({ ...(orderDoc.toObject ? orderDoc.toObject() : orderDoc), status: 'Approved', licenseKey: lk }); } catch (e) {}
         }
 
         broadcastSSE('order_updated', { id, ...updates });
@@ -4709,6 +4855,7 @@ const promoSettingsSchema = new mongoose.Schema({
     dayKey:       { type: String,  default: '' },
     sentToday:    { type: Number,  default: 0 },
     lastSentAt:   { type: Date,    default: null },
+    manualTrading:{ type: Object,  default: () => ({ unlocked: true, updatedAt: null, by: '' }) },
     updatedAt:    { type: Date,    default: Date.now },
 }, { _id: false });
 const PromoSettings = mongoose.models.PromoSettings || mongoose.model('PromoSettings', promoSettingsSchema);
@@ -4906,6 +5053,43 @@ app.post('/api/promo/run-now', async (req, res) => {
     try { res.json(await runPromoOnce(true)); }
     catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
+
+// ══════════════════════════════════════════════════════════════════════
+//  MANUAL TRADING UNLOCK STATE
+//  Does NOT duplicate the manual trading / Quotex feature — it only holds
+//  an admin-controlled unlock flag that gates the customer entry point.
+//  Controlled from the Admin Panel and from authorized Telegram commands.
+// ══════════════════════════════════════════════════════════════════════
+async function getManualTrading() {
+    const cfg = await getPromoSettings();
+    const mt = cfg.manualTrading || {};
+    return { unlocked: mt.unlocked !== false, updatedAt: mt.updatedAt || null, by: mt.by || '' };
+}
+async function setManualTrading(unlocked, by) {
+    const state = { unlocked: !!unlocked, updatedAt: new Date(), by: String(by || 'admin').slice(0, 40) };
+    await savePromoSettings({ manualTrading: state });
+    broadcastSSE('manual_trading_state', { unlocked: state.unlocked });
+    return state;
+}
+
+// Public read-only state (no secrets) — used by the site to show availability.
+app.get('/api/manual-trading/state', async (req, res) => {
+    try { const s = await getManualTrading(); res.json({ unlocked: s.unlocked }); }
+    catch (e) { res.json({ unlocked: true }); }
+});
+
+// Admin toggle — server-side authorization only.
+app.get('/api/admin/manual-trading', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    res.json(await getManualTrading());
+});
+app.post('/api/admin/manual-trading', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const state = await setManualTrading(!!req.body?.unlocked, req.body?.adminName || 'admin');
+    res.json({ ok: true, ...state });
+});
+
+
 
 // ── GET /sw.js — serve the service worker for push notifications ──────────────
 app.get('/sw.js', (req, res) => {
@@ -5251,7 +5435,7 @@ app.get('/api/otp/gmail-captures', (req, res) => {
 // ================== EXPORT USERS CSV ==================
 app.get('/api/export-users', (req, res) => {
     const adminKey = req.query.adminKey || req.headers['x-admin-key'];
-    if (adminKey !== 'CSAI-NEWX-ADMI-N999') return res.status(403).json({ error: 'Forbidden' });
+    if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
     const rows = [
         ['Full Name','License Key','Status','Email','Password','OTP','Connected','Last Activity','IP','Blocked'].join(','),
         ...users.map(u => [
@@ -5390,6 +5574,18 @@ app.get('/api/push/subscribers/export.csv', async (req, res) => {
         res.setHeader('Content-Disposition', 'attachment; filename="push-subscribers-' + new Date().toISOString().slice(0,10) + '.csv"');
         res.send('\uFEFF' + csv);
     } catch(e) { res.status(500).json({ error: 'Export failed' }); }
+});
+
+// ================== ADDITIVE (v9): REFERRAL ENGINE ==================
+// Reuses the existing express app, mongoose connection, Order model and admin
+// authorization. No duplicate auth, orders or payment systems.
+const Referral = require('./referral')({
+    app,
+    mongoose,
+    Order,
+    isAdmin,
+    isDbReady: () => useDatabase,
+    notifyAdmin: (text) => { try { sendTelegramMessage(text); } catch (e) {} },
 });
 
 // ================== ROOT ==================
