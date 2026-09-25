@@ -1,22 +1,12 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DEPRECATED STANDALONE BOT PROCESS
-// The main Telegram bot now lives inside server.js (long-polling loop) and uses
-// the same TELEGRAM_BOT_TOKEN environment variable. Do NOT run this file at the
-// same time as server.js — two pollers on one token cause Telegram 409 errors.
-// Kept only for the legacy /trigger helper commands.
-// SECURITY: no credential fallbacks. Everything comes from the environment.
-// ─────────────────────────────────────────────────────────────────────────────
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const API_BASE  = (process.env.API_BASE  || '').trim();
-const ADMIN_KEY = (process.env.ADMIN_KEY || '').trim();
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+if (!TELEGRAM_BOT_TOKEN) { console.error("[telegram] TELEGRAM_BOT_TOKEN is not set. Add it to your environment/.env file."); process.exit(1); }
 
-if (!TELEGRAM_BOT_TOKEN || !API_BASE || !ADMIN_KEY) {
-    console.error('❌ TELEGRAM_BOT_TOKEN, API_BASE and ADMIN_KEY must all be set in the environment. Exiting.');
-    process.exit(1);
-}
+// ── ADDITIVE (v8): shared config for the new admin helper commands ────────────
+const API_BASE  = process.env.API_BASE  || "https://chinese-signal-bot.onrender.com";
+const ADMIN_KEY = process.env.ADMIN_KEY || ""; if (!ADMIN_KEY) console.warn("[bot] ADMIN_KEY is not set — admin API calls will be rejected.");
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
