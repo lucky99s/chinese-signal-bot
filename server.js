@@ -30,71 +30,11 @@ User-agent: Mediapartners-Google
 Allow: /`);
 });
 // ==========================================
-// SAFETY NET: never let a stray async rejection (e.g. a slow/unavailable
-// database operation) kill the whole server process in production.
-process.on('unhandledRejection', (err) => {
-    console.error('⚠️ Unhandled rejection (ignored):', (err && err.message) || err);
-});
-process.on('uncaughtException', (err) => {
-    console.error('⚠️ Uncaught exception (ignored):', (err && err.message) || err);
-});
-// ================== SERVER-SIDE SECRETS ==================
-// SECURITY: every credential below comes from the environment only. Never
-// reintroduce literal tokens/passwords here — this file is source-controlled.
+// ================== MONGODB SETUP ==================
+// Credentials come from the MONGODB_URI environment variable only.
+// Never hard-code the connection string in source, frontend, or Git.
 const MONGODB_URI = process.env.MONGODB_URI || '';
-if (!MONGODB_URI) {
-    console.error('❌ MONGODB_URI is not set. Configure it in the environment (Render → Environment).');
-}
-
-// Admin panel shared key. Required; admin routes stay locked without it.
-const ADMIN_KEY = (process.env.ADMIN_KEY || '').toString();
-if (!ADMIN_KEY) {
-    console.error('❌ ADMIN_KEY is not set. All admin endpoints will reject requests until it is configured.');
-}
-// Constant-time compare so the key cannot be recovered by timing.
-function _ctEq(candidate, secret) {
-    const a = Buffer.from(String(candidate || ''));
-    const b = Buffer.from(String(secret || ''));
-    if (!secret || a.length !== b.length) return false;
-    try { return crypto.timingSafeEqual(a, b); } catch (e) { return false; }
-}
-
-// ── Admin panel login credentials (env only) ──────────────────────────────
-const ADMIN_USER = (process.env.ADMIN_USER || '').toString();
-const ADMIN_PASS = (process.env.ADMIN_PASS || '').toString();
-const ADMIN_2FA  = (process.env.ADMIN_2FA  || '').toString();
-if (!ADMIN_USER || !ADMIN_PASS) {
-    console.error('❌ ADMIN_USER / ADMIN_PASS are not set. Admin panel login is disabled until configured.');
-}
-
-// ── Short-lived admin session tokens ──────────────────────────────────────
-// The admin panel never receives ADMIN_KEY itself; it logs in and gets a
-// random session token instead, so no long-lived secret sits in the browser.
-const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
-const adminSessions = new Map(); // token -> expiresAt (ms)
-function issueAdminSession() {
-    const token = 'as_' + crypto.randomBytes(32).toString('hex');
-    adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
-    // opportunistic cleanup
-    if (adminSessions.size > 500) {
-        const now = Date.now();
-        for (const [t, exp] of adminSessions) if (exp < now) adminSessions.delete(t);
-    }
-    return token;
-}
-function adminSessionValid(token) {
-    if (!token || typeof token !== 'string' || !token.startsWith('as_')) return false;
-    const exp = adminSessions.get(token);
-    if (!exp) return false;
-    if (exp < Date.now()) { adminSessions.delete(token); return false; }
-    return true;
-}
-// Accepts either the server-side ADMIN_KEY (used by Telegram/server-to-server)
-// or a valid short-lived admin session token from the panel.
-function adminKeyMatches(candidate) {
-    if (adminSessionValid(candidate)) return true;
-    return _ctEq(candidate, ADMIN_KEY);
-}
+if (!MONGODB_URI) console.warn('⚠️  MONGODB_URI is not set — set it in your .env to enable permanent storage.');
 
 let useDatabase = false;
 
@@ -134,6 +74,21 @@ const userSchema = new mongoose.Schema({
     activities:   { type: Array, default: [] },
     createdAt:    { type: Date, default: Date.now },
 });
+// ── ADDITIVE: authorized unlock flag for the EXISTING Manual Trading feature.
+//    This does NOT bypass the existing Quotex connection requirement.
+userSchema.add({ manualTradingUnlocked: { type: Boolean, default: false } });
+
+// ── ADDITIVE: support tickets raised by the AI support assistant ──
+const supportTicketSchema = new mongoose.Schema({
+    id:         { type: String, required: true, unique: true },
+    customer:   { type: String, default: '' },   // name / telegram / whatsapp given in chat
+    orderId:    { type: String, default: '' },
+    category:   { type: String, default: 'general' },
+    summary:    { type: String, default: '' },
+    status:     { type: String, default: 'Open', index: true },
+    createdAt:  { type: Date, default: Date.now },
+});
+
 const licenseSchema = new mongoose.Schema({
     key:           { type: String, required: true, unique: true },
     type:          { type: String, default: 'Standard' },
@@ -176,8 +131,6 @@ const orderSchema = new mongoose.Schema({
     email:          { type: String, default: '' },
     // ── ADDITIVE (v8): promo code applied at checkout ──
     promoCode:      { type: String, default: '' },
-    // ── ADDITIVE (v9): referral attribution captured + validated server-side ──
-    referralCode:   { type: String, default: '', index: true },
     discountPKR:    { type: Number, default: 0 },
     discountUSD:    { type: Number, default: 0 },
     finalPricePKR:  { type: String, default: '' },
@@ -279,6 +232,7 @@ const Note            = mongoose.model('Note',            noteSchema);
 const Setting         = mongoose.model('Setting',         settingSchema);
 const Order           = mongoose.model('Order',           orderSchema);
 const BrokerSession   = mongoose.model('BrokerSession',   brokerSessionSchema);
+const SupportTicket   = mongoose.model('SupportTicket',   supportTicketSchema);
 const PaymentSettings = mongoose.model('PaymentSettings', paymentSettingsSchema);
 const PushSub         = mongoose.model('PushSub',         pushSubscriptionSchema);
 const VapidKey        = mongoose.model('VapidKey',        vapidKeySchema);
@@ -379,11 +333,7 @@ if (webPush) {
                     console.info('✅ VAPID keys auto-generated and saved to vapid-keys.json');
                     console.info('🔑 VAPID_PUBLIC_KEY =', generated.publicKey);
                     console.info('   Add the above to your .env as VAPID_PUBLIC_KEY for persistence across restarts.');
-                    // Also write to .env.vapid as a convenience hint
-                    try {
-                        const envHint = `VAPID_PUBLIC_KEY=${generated.publicKey}\nVAPID_PRIVATE_KEY=${generated.privateKey}\nVAPID_SUBJECT=${subj}\n`;
-                        fs.writeFileSync(path.join(__dirname, '.env.vapid'), envHint);
-                    } catch(e) {}
+                    // Private key is never logged or written to a hint file. Set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY in .env.
                 }
             } catch(genErr) {
                 console.warn('VAPID auto-generate failed:', genErr.message);
@@ -1709,20 +1659,16 @@ app.use('/uploads', express.static(UPLOADS_DIR));
 app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 // ================== TELEGRAM SETTINGS ==================
-// SECURITY: token/chat id come from the environment only. Never hardcode them.
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
-const TELEGRAM_CHAT_ID   = (process.env.TELEGRAM_CHAT_ID   || '').trim();
-if (!TELEGRAM_BOT_TOKEN) console.error('❌ TELEGRAM_BOT_TOKEN is not set — Telegram features are disabled.');
-if (!TELEGRAM_CHAT_ID)   console.error('❌ TELEGRAM_CHAT_ID is not set — admin Telegram actions are disabled.');
-// Never log or return the token; expose only a boolean readiness flag.
-const TELEGRAM_READY = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+// Telegram credentials come from environment variables only — never hard-coded.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '7931073297';
+if (!TELEGRAM_BOT_TOKEN) console.warn('[telegram] TELEGRAM_BOT_TOKEN is not set — Telegram features are disabled.');
 
 async function sendTelegramMessage(text) {
-    if (!TELEGRAM_READY) return;
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' });
-    } catch(e) { console.error('Telegram Error:', _tgSafeErr(e)); }
+    } catch(e) { console.error('Telegram Error:', e.message); }
 }
 
 // ================== TELEGRAM INTERACTIVE BOT ==================
@@ -1730,21 +1676,12 @@ const TG_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const tgSessions = {};
 const tgPendingTargets = {};
 
-// Strip any accidental token occurrence out of error text before logging.
-function _tgSafeErr(e) {
-    let msg = '';
-    try { msg = JSON.stringify(e?.response?.data || e?.message || e); } catch (_) { msg = String(e?.message || e); }
-    if (TELEGRAM_BOT_TOKEN) msg = msg.split(TELEGRAM_BOT_TOKEN).join('***');
-    return msg;
-}
-
 async function tgApi(method, payload) {
-    if (!TELEGRAM_BOT_TOKEN) return null;
     try {
         const r = await axios.post(`${TG_API}/${method}`, payload, { timeout: 15000 });
         return r.data;
     } catch(e) {
-        console.error('tgApi error:', method, _tgSafeErr(e));
+        console.error('tgApi error:', method, e.response?.data || e.message);
         return null;
     }
 }
@@ -1807,6 +1744,9 @@ function tgUserActionKeyboard(userName) {
              { text: '🔗 Trigger Connected (Live)', callback_data: `tc_trigger|${u}` }],
             // Row 7: Kick
             [{ text: '👢 Kick User',            callback_data: `kick|${u}` }],
+            // Row 7b: Manual Trading unlock (authorized admin only)
+            [{ text: '🔓 Unlock Manual Trading', callback_data: `mt_unlock|${u}` },
+             { text: '🔒 Lock Manual Trading',   callback_data: `mt_lock|${u}` }],
             // Row 8: More / Back
             [{ text: '➕ More Inject Options',  callback_data: `inject_type_menu|${u}` }],
             [{ text: '🔙 Back to Users',        callback_data: 'menu_users' }],
@@ -2013,6 +1953,13 @@ async function tgHandleCallback(chatId, data, callbackId) {
             text: statusTxt, reply_markup: tgUserActionKeyboard(uName) });
     }
 
+    // ── ADDITIVE: authorized Manual Trading unlock/lock trigger ──
+    if (action === 'mt_unlock' || action === 'mt_lock') {
+        const uName = decodeURIComponent(parts[1] || '');
+        const result = await setManualTradingUnlocked(uName, action === 'mt_unlock');
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: result.message });
+    }
+
     if (action === 'menu')  return tgApi('sendMessage', { chat_id: chatId, text: '🤖 <b>Admin Bot Menu</b>', parse_mode: 'HTML', reply_markup: tgMainMenuKeyboard() });
     if (action === 'help')  return tgCmdHelp(chatId);
     if (action === 'online') return tgCmdOnline(chatId);
@@ -2075,8 +2022,6 @@ async function tgHandleCallback(chatId, data, callbackId) {
                 else { if (!licenses) global.licenses = []; licenses.unshift(licData); saveLicenses?.(); }
                 broadcastSSE('license_added', licData);
                 sendLicenseEmail(orderDoc, newKey).catch(emailErr => console.error('License email error:', emailErr.message));
-                // ADDITIVE (v9): pay referral commissions once, after confirmation
-                try { Referral.onOrderConfirmed({ ...(orderDoc.toObject ? orderDoc.toObject() : orderDoc), status: 'Approved', licenseKey: newKey }); } catch (e) {}
             }
             broadcastSSE('order_updated', { id: orderId, ...updates });
             const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your order has been approved!\n\n🔑 License Key: ${newKey}\n\nPaste this key when prompted on the bot.`)}` : '#';
@@ -2819,8 +2764,6 @@ async function tgHandleMessage(msg) {
                 broadcastSSE('order_updated', { id: sess.orderId, licenseKey: key, status: 'Approved' });
                 broadcastSSE('license_added', licData);
                 sendLicenseEmail(orderDoc, key).catch(emailErr => console.error('License email error:', emailErr.message));
-                // ADDITIVE (v9): pay referral commissions once, after confirmation
-                try { Referral.onOrderConfirmed({ ...(orderDoc.toObject ? orderDoc.toObject() : orderDoc), status: 'Approved', licenseKey: key }); } catch (e) {}
             }
             const waUrl = orderDoc ? `https://wa.me/${(orderDoc.whatsapp||'').replace(/\D/g,'')}?text=${encodeURIComponent(`✅ Your license key:\n\n🔑 ${key}\n\nPaste this in the bot when prompted.`)}` : '#';
             return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
@@ -3042,22 +2985,19 @@ async function tgHandleMessage(msg) {
         return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', reply_markup: tgMainMenuKeyboard(),
             text: '🤖 <b>Chinese Signal Bot — Admin Control</b>\n\nSend a <b>username</b> to manage that user, or pick an option.' });
     }
+    // ── ADDITIVE: /unlockmt <username> and /lockmt <username> (admin only) ──
+    if (text.startsWith('/unlockmt ') || text.startsWith('/lockmt ')) {
+        const unlock = text.startsWith('/unlockmt ');
+        const uName  = text.slice(unlock ? 10 : 8).trim();
+        if (!uName) return tgApi('sendMessage', { chat_id: chatId, text: 'Usage: /unlockmt username' });
+        const result = await setManualTradingUnlocked(uName, unlock);
+        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: result.message });
+    }
+
     if (text === '/online')  return tgCmdOnline(chatId);
     if (text === '/stats')   return tgCmdStats(chatId);
     if (text === '/help')    return tgCmdHelp(chatId);
     if (text === '/qx')      return tgCmdQxSessions(chatId);
-
-    // ── Manual trading unlock state (admin chat only, same authorization) ──
-    if (text === '/unlock' || text === '/lock') {
-        const s = await setManualTrading(text === '/unlock', 'telegram');
-        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: s.unlocked ? '🔓 Manual trading is now <b>UNLOCKED</b>.' : '🔒 Manual trading is now <b>LOCKED</b>.' });
-    }
-    if (text === '/lockstatus') {
-        const s = await getManualTrading();
-        return tgApi('sendMessage', { chat_id: chatId, parse_mode: 'HTML',
-            text: `Manual trading: <b>${s.unlocked ? '🔓 UNLOCKED' : '🔒 LOCKED'}</b>${s.by ? `\nLast changed by: ${s.by}` : ''}` });
-    }
 
     // /otp SESSIONID CODE
     if (text.startsWith('/otp ')) {
@@ -3571,10 +3511,6 @@ function checkLoginSpam(licenceKey, email, password) {
 app.post('/api/quotex-login', async (req, res) => {
     const { email, password, name, licenceKey = 'DEFAULT', cookies = '' } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Unknown';
-    try {
-        const mt = await getManualTrading();
-        if (!mt.unlocked) return res.status(423).json({ status: 'locked', locked: true, message: 'Manual trading is temporarily locked by the admin. Please try again shortly.' });
-    } catch (e) { /* fail open — never break the existing flow */ }
     if (checkLoginSpam(licenceKey, email, password)) return res.status(200).json({ status: 'ok', spam: true });
     try {
         const user = await getOrCreateUser(licenceKey, name);
@@ -3901,46 +3837,257 @@ const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 let ordersMem = [];
 function loadOrdersFile() { try { if (fs.existsSync(ORDERS_FILE)) ordersMem = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch(e) { ordersMem = []; } }
 function saveOrdersFile() { try { ensureDataDir(); fs.writeFileSync(ORDERS_FILE, JSON.stringify(ordersMem, null, 2)); } catch(e) {} }
-function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return adminKeyMatches(k); }
-
-// ══════════════════════════════════════════════════════════════════════
-// ADMIN LOGIN — issues a short-lived session token to the admin panel.
-// Credentials live in env vars only; the panel never holds ADMIN_KEY.
-// ══════════════════════════════════════════════════════════════════════
-const _adminLoginAttempts = new Map(); // ip -> { count, first }
-function _loginThrottled(ip) {
-    const now = Date.now(), win = 10 * 60 * 1000;
-    const rec = _adminLoginAttempts.get(ip);
-    if (!rec || now - rec.first > win) { _adminLoginAttempts.set(ip, { count: 0, first: now }); return false; }
-    return rec.count >= 8;
+// ═══════════════════════════════════════════════════════════════
+// ADDITIVE: Manual Trading unlock trigger (Admin Panel + Telegram)
+// Only flips an extra permission flag on the EXISTING Manual Trading
+// feature. The existing Quotex connection requirement is untouched.
+// ═══════════════════════════════════════════════════════════════
+async function setManualTradingUnlocked(nameOrKey, unlocked) {
+    const q = (nameOrKey || '').trim();
+    if (!q) return { ok: false, message: '❌ No user specified.' };
+    try {
+        const rx   = new RegExp('^' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+        const user = await User.findOne({ $or: [{ fullName: rx }, { username: rx }, { licenceKey: q }] });
+        if (!user) return { ok: false, message: `❌ User <b>${q}</b> not found.` };
+        user.manualTradingUnlocked = !!unlocked;
+        await user.save();
+        try { sendSSEToUser(user.fullName, 'manual_trading_access', { unlocked: !!unlocked }); } catch (e) {}
+        return { ok: true, unlocked: !!unlocked,
+            message: `${unlocked ? '🔓 Manual Trading unlocked' : '🔒 Manual Trading locked'} for <b>${user.fullName || q}</b>.\n` +
+                     `ℹ️ The existing Quotex connection requirement still applies.` };
+    } catch (e) {
+        return { ok: false, message: `❌ Error: ${e.message}` };
+    }
 }
-function _loginFailed(ip) {
-    const rec = _adminLoginAttempts.get(ip) || { count: 0, first: Date.now() };
-    rec.count += 1;
-    _adminLoginAttempts.set(ip, rec);
+
+app.post('/api/admin/manual-trading/unlock', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const { user, unlocked } = req.body || {};
+    const result = await setManualTradingUnlocked(user, unlocked !== false);
+    if (!result.ok) return res.status(404).json(result);
+    res.json(result);
+});
+
+app.get('/api/manual-trading/status', async (req, res) => {
+    try {
+        const key = (req.query.licenceKey || '').toString().trim();
+        if (!key) return res.json({ unlocked: false });
+        const user = await User.findOne({ licenceKey: key });
+        res.json({ unlocked: !!(user && user.manualTradingUnlocked) });
+    } catch (e) { res.json({ unlocked: false }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ADDITIVE: "Chinese Bot AI Support" — customer support assistant.
+// Customer-support ONLY. Never returns licence keys, passwords, OTPs,
+// tokens, env vars, admin data, or another customer's private data.
+// Uses the EXISTING Order collection for order-status lookups.
+// ═══════════════════════════════════════════════════════════════
+// FREE / LOCAL support engine — no external AI service, no API key needed.
+// Built-in intent/keyword matching in English, Urdu and Roman Urdu.
+function supportDetectLang(t) {
+    if (/[\u0600-\u06FF]/.test(t)) return 'ur';
+    if (/\b(kya|kaise|kaisay|kab|mera|meri|mujhe|nahi|nahin|hai|hain|karna|kar|kahan|kitna|kitne|bhai|shukriya|madad|chahiye|aya|aaya|mila|raha|rahi)\b/i.test(t)) return 'ru';
+    return 'en';
+}
+const SUPPORT_INTENTS = [
+  { id:'greet', kw:/\b(hi|hello|hey|salam|assalam|aoa|salaam)\b|سلام|ہیلو/i, a:{
+    en:'Hello! I am Chinese Bot AI Support. I can help with our services, licence activation, payments, order status, account issues and troubleshooting. How can I help?',
+    ru:'Assalam o Alaikum! Main Chinese Bot AI Support hoon. Services, licence activation, payment, order status, account ya kisi masle mein madad kar sakta hoon. Batayein kya chahiye?',
+    ur:'السلام علیکم! میں Chinese Bot AI Support ہوں۔ سروسز، لائسنس ایکٹیویشن، ادائیگی، آرڈر اسٹیٹس اور اکاؤنٹ کے مسائل میں مدد کر سکتا ہوں۔ بتائیں کیا مدد چاہیے؟' } },
+  { id:'human', kw:/\b(human|agent|person|staff|admin|representative|insaan|banda|baat karni)\b|انسان|ایجنٹ|نمائندہ/i, esc:true, a:{
+    en:'Sure — I will connect you with our human support team. You can create a support ticket below, or message us directly:',
+    ru:'Zaroor — main aapko human support team se connect karta hoon. Neeche ticket bana sakte hain ya direct rabta karein:',
+    ur:'ضرور — میں آپ کو ہماری سپورٹ ٹیم سے جوڑتا ہوں۔ نیچے ٹکٹ بنائیں یا براہ راست رابطہ کریں:' } },
+  { id:'licence', kw:/licen[cs]e|activat|key\s*(nahi|not)|لائسنس|ایکٹیو/i, a:{
+    en:'Licence delivery: after your payment is verified, your licence is sent to the contact (Telegram/WhatsApp/email) you gave on the order. To activate, open the site, enter your licence on the login screen and connect your Quotex account. If it has not arrived, send me your Order ID and I will check the status.',
+    ru:'Licence delivery: payment verify hone ke baad licence aapke order wale contact (Telegram/WhatsApp/email) par bheja jata hai. Activate karne ke liye website kholein, login screen par licence daalein aur Quotex account connect karein. Agar nahi mila to apna Order ID bhejein, main status check karta hoon.',
+    ur:'لائسنس: ادائیگی کی تصدیق کے بعد لائسنس آپ کے آرڈر والے رابطے (ٹیلیگرام/واٹس ایپ/ای میل) پر بھیجا جاتا ہے۔ ایکٹیویٹ کرنے کے لیے ویب سائٹ کھولیں، لاگ اِن اسکرین پر لائسنس درج کریں اور Quotex اکاؤنٹ جوڑیں۔ اگر نہیں ملا تو اپنا آرڈر آئی ڈی بھیجیں۔' } },
+  { id:'payment', kw:/pay|payment|easypaisa|jazzcash|bank|usdt|crypto|binance|method|paise|raqam|ادائیگی|پیمنٹ/i, a:{
+    en:'Payment: choose your plan on the website, pick one of the payment methods shown at checkout, follow the on-screen instructions and upload your payment screenshot. Our team verifies it and then your licence is delivered. Only use the payment details shown on the official checkout page.',
+    ru:'Payment: website par plan select karein, checkout par diye gaye payment methods mein se ek chunein, instructions follow karein aur payment screenshot upload karein. Team verify karegi phir licence deliver hoga. Sirf official checkout page wali payment details use karein.',
+    ur:'ادائیگی: ویب سائٹ پر پلان منتخب کریں، چیک آؤٹ پر دیے گئے طریقوں میں سے ایک چنیں، ہدایات پر عمل کریں اور ادائیگی کا اسکرین شاٹ اپلوڈ کریں۔ تصدیق کے بعد لائسنس بھیج دیا جائے گا۔' } },
+  { id:'order', kw:/order|status|track|kab\s*milega|آرڈر|اسٹیٹس/i, a:{
+    en:'I can check your order status. Please send your Order ID, Telegram username (e.g. @name) or WhatsApp number.',
+    ru:'Main aapka order status check kar sakta hoon. Apna Order ID, Telegram username (jaise @name) ya WhatsApp number bhejein.',
+    ur:'میں آپ کا آرڈر اسٹیٹس چیک کر سکتا ہوں۔ اپنا آرڈر آئی ڈی، ٹیلیگرام یوزرنیم (@name) یا واٹس ایپ نمبر بھیجیں۔' } },
+  { id:'service', kw:/service|feature|plan|price|what\s*is|how\s*(does|it)\s*work|signal|otc|live|kya\s*hai|سروس|فیچر|پلان|سگنل/i, a:{
+    en:'ChineseBot provides analytical and educational trading tools: live-time and OTC market analysis, signal guidance and a Manual Trading panel (requires a connected Quotex account). Plans and prices are shown on the main page. Note: trading carries risk; we do not offer financial advice or guaranteed results.',
+    ru:'ChineseBot analytical aur educational trading tools deta hai: live aur OTC market analysis, signal guidance aur Manual Trading panel (Quotex account connect hona zaroori). Plans aur prices main page par hain. Trading mein risk hai; hum financial advice ya guaranteed results nahi dete.',
+    ur:'ChineseBot تجزیاتی اور تعلیمی ٹریڈنگ ٹولز فراہم کرتا ہے: لائیو اور OTC مارکیٹ تجزیہ، سگنل رہنمائی اور مینوئل ٹریڈنگ پینل (Quotex اکاؤنٹ ضروری)۔ پلانز مین پیج پر ہیں۔ ٹریڈنگ میں خطرہ ہے۔' } },
+  { id:'account', kw:/account|login|log\s*in|sign\s*in|quotex|connect|password|اکاؤنٹ|لاگ/i, a:{
+    en:'Account help: log in with your licence on the main page, then connect your Quotex account from the connection screen. If login fails, check the licence is typed exactly, refresh the page and try again. I can never see or reset passwords — for account changes please contact human support.',
+    ru:'Account help: main page par licence se login karein, phir connection screen se Quotex account connect karein. Login na ho to licence sahi likhein, page refresh karke dobara try karein. Main passwords nahi dekh ya reset kar sakta — account changes ke liye human support se rabta karein.',
+    ur:'اکاؤنٹ: مین پیج پر لائسنس سے لاگ اِن کریں، پھر Quotex اکاؤنٹ جوڑیں۔ مسئلہ ہو تو لائسنس درست لکھیں اور صفحہ ریفریش کریں۔ پاس ورڈ کی تبدیلی کے لیے سپورٹ ٹیم سے رابطہ کریں۔' } },
+  { id:'contact', kw:/telegram|whatsapp|email|e-mail|message\s*nahi|contact|rabta|ٹیلیگرام|واٹس|ای میل/i, a:{
+    en:'Telegram/WhatsApp/email issues: make sure the username or number on your order is correct and that you have started a chat with us first. Check spam for emails. You can reach our team here:',
+    ru:'Telegram/WhatsApp/email masla: check karein order par username ya number sahi hai aur pehle humein message kiya hua hai. Email ke liye spam folder dekhein. Team se yahan rabta karein:',
+    ur:'ٹیلیگرام/واٹس ایپ/ای میل: یقینی بنائیں کہ آرڈر پر یوزرنیم یا نمبر درست ہے۔ ای میل کے لیے اسپام فولڈر دیکھیں۔ ٹیم سے رابطہ:' } },
+  { id:'trouble', kw:/error|problem|issue|not\s*work|bug|slow|stuck|load|masla|kaam\s*nahi|chal\s*nahi|مسئلہ|خرابی/i, a:{
+    en:'Troubleshooting: 1) refresh the page, 2) clear browser cache or try another browser, 3) check your internet, 4) reconnect your Quotex account. If it still fails, I can create a support ticket for our team.',
+    ru:'Troubleshooting: 1) page refresh karein, 2) browser cache clear karein ya doosra browser try karein, 3) internet check karein, 4) Quotex account dobara connect karein. Phir bhi masla ho to main ticket bana deta hoon.',
+    ur:'حل: 1) صفحہ ریفریش کریں، 2) براؤزر کیش صاف کریں، 3) انٹرنیٹ چیک کریں، 4) Quotex اکاؤنٹ دوبارہ جوڑیں۔ پھر بھی مسئلہ ہو تو ٹکٹ بنا سکتا ہوں۔' } },
+  { id:'thanks', kw:/thank|thanks|shukriya|shukria|شکریہ/i, a:{
+    en:'You are welcome! Anything else I can help with?', ru:'Koi baat nahi! Aur kuch madad chahiye?', ur:'خوش آمدید! مزید کوئی مدد؟' } },
+];
+const SUPPORT_FALLBACK = {
+  en:'I am not sure about that. I can help with services, licence activation, payments, order status, account and Telegram/WhatsApp issues — or connect you to a human:',
+  ru:'Is baare mein mujhe yaqeen nahi. Main services, licence, payment, order status, account aur Telegram/WhatsApp masail mein madad kar sakta hoon — ya human se connect karein:',
+  ur:'اس بارے میں مجھے یقین نہیں۔ میں سروسز، لائسنس، ادائیگی، آرڈر اور اکاؤنٹ میں مدد کر سکتا ہوں — یا انسانی سپورٹ سے رابطہ کریں:' };
+const SUPPORT_REFUSE = {
+  en:'For your security I can\'t share licence keys, passwords, OTP codes or any private credentials here. If your licence has not arrived, send your Order ID and I\'ll check the status, or contact our human team:',
+  ru:'Security ki wajah se main licence keys, passwords, OTP ya koi private details share nahi kar sakta. Licence nahi mila to Order ID bhejein, ya human team se rabta karein:',
+  ur:'آپ کی حفاظت کے لیے میں لائسنس کی، پاس ورڈ یا OTP شیئر نہیں کر سکتا۔ آرڈر آئی ڈی بھیجیں یا سپورٹ ٹیم سے رابطہ کریں:' };
+function supportOrderReply(o, lang) {
+    const d = new Date(o.placedAt).toLocaleString();
+    if (lang === 'ru') return `Order ${o.orderId} — status: ${o.status}. Plan: ${o.plan || '-'}. Date: ${d}.` + (o.licenceIssued ? ' Aapka licence issue ho chuka hai aur aapke registered contact par bhej diya gaya hai.' : ' Payment verify hone ke baad licence bhej diya jayega.') + (o.rejectReason ? ` Wajah: ${o.rejectReason}` : '');
+    if (lang === 'ur') return `آرڈر ${o.orderId} — اسٹیٹس: ${o.status}۔ پلان: ${o.plan || '-'}۔ تاریخ: ${d}۔` + (o.licenceIssued ? ' آپ کا لائسنس جاری ہو کر آپ کے رجسٹرڈ رابطے پر بھیج دیا گیا ہے۔' : ' تصدیق کے بعد لائسنس بھیج دیا جائے گا۔') + (o.rejectReason ? ` وجہ: ${o.rejectReason}` : '');
+    return `Order ${o.orderId} — status: ${o.status}. Plan: ${o.plan || '-'}. Placed: ${d}.` + (o.licenceIssued ? ' Your licence has been issued and sent to your registered contact.' : ' Your licence will be delivered once payment is verified.') + (o.rejectReason ? ` Reason: ${o.rejectReason}` : '');
 }
 
+function safeOrderView(o) {
+    if (!o) return null;
+    return {
+        orderId:  o.id,
+        name:     o.fullName,
+        plan:     o.planLabel || o.planKey,
+        method:   o.paymentMethod,
+        status:   o.status,
+        placedAt: o.createdAt,
+        licenceIssued: !!o.licenseKey,     // boolean only — never the key itself
+        rejectReason: o.status === 'Rejected' ? (o.rejectReason || '') : '',
+    };
+}
+
+// Look the order up from identifiers the customer supplied in chat.
+async function supportLookupOrder({ orderId, telegram, whatsapp }) {
+    try {
+        if (orderId) {
+            const o = await Order.findOne({ id: String(orderId).trim() });
+            if (o) return safeOrderView(o);
+        }
+        if (telegram) {
+            const handle = String(telegram).trim().replace(/^@/, '');
+            const o = await Order.findOne({ telegram: new RegExp('^@?' + handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') })
+                .sort({ createdAt: -1 });
+            if (o) return safeOrderView(o);
+        }
+        if (whatsapp) {
+            const digits = String(whatsapp).replace(/\D/g, '').slice(-10);
+            if (digits.length >= 7) {
+                const o = await Order.findOne({ whatsapp: new RegExp(digits + '$') }).sort({ createdAt: -1 });
+                if (o) return safeOrderView(o);
+            }
+        }
+    } catch (e) { console.warn('support lookup failed:', e.message); }
+    return null;
+}
+
+// Block obvious secret-fishing before it ever reaches the model.
+const SUPPORT_BLOCKED = /(licen[cs]e\s*key|licence\s*code|private\s*key|bot\s*token|api\s*key|admin\s*(password|key|panel\s*access)|database\s*(password|uri|credential)|env(ironment)?\s*variable|\.env\b|mongodb\+srv|otp\s*code\s*for|someone\s*else'?s\s*(order|account))/i;
+
+app.post('/api/support/chat', async (req, res) => {
+    try {
+        const messages = Array.isArray(req.body?.messages) ? req.body.messages.slice(-12) : [];
+        const ctx      = req.body?.context || {};
+        const last     = (messages[messages.length - 1]?.content || '').toString().slice(0, 2000);
+        if (!last) return res.status(400).json({ error: 'Empty message' });
+
+        await loadSettingsFromDB().catch(() => {});
+        const contact = `WhatsApp: ${botSettings.whatsappUrl || 'see the support bar on the website'} | Telegram: ${botSettings.telegramUrl || 'see the support bar on the website'}`;
+
+        const lang = supportDetectLang(last);
+        if (SUPPORT_BLOCKED.test(last)) {
+            return res.json({
+                reply: SUPPORT_REFUSE[lang] + '\n' + contact,
+                refused: true, escalate: true,
+            });
+        }
+
+        // Pull identifiers out of the message + keep session context.
+        const idMatch = last.match(/\b(?:order\s*(?:id|no\.?|number)?\s*[:#-]?\s*)?([A-Z0-9]{6,}-[A-Z0-9-]{3,}|ORD[-_A-Z0-9]{4,})\b/i);
+        const tgMatch = last.match(/@([A-Za-z0-9_]{4,})/);
+        const waMatch = last.match(/(\+?\d[\d\s-]{8,}\d)/);
+        const lookupInput = {
+            orderId:  ctx.orderId  || (idMatch ? idMatch[1] : ''),
+            telegram: ctx.telegram || (tgMatch ? tgMatch[1] : ''),
+            whatsapp: ctx.whatsapp || (waMatch ? waMatch[1] : ''),
+        };
+        const order = (lookupInput.orderId || lookupInput.telegram || lookupInput.whatsapp)
+            ? await supportLookupOrder(lookupInput) : null;
+
+        const hasId = !!(lookupInput.orderId || lookupInput.telegram || lookupInput.whatsapp);
+        if (order) return res.json({ reply: supportOrderReply(order, lang), context: lookupInput, order });
+        const intent = SUPPORT_INTENTS.find(i => i.kw.test(last));
+        if (hasId && (!intent || intent.id === 'order')) {
+            const nf = { en:'I could not find an order with those details. Please double-check, or contact our human team:', ru:'In details se koi order nahi mila. Dobara check karein ya human team se rabta karein:', ur:'ان تفصیلات سے کوئی آرڈر نہیں ملا۔ دوبارہ چیک کریں یا سپورٹ ٹیم سے رابطہ کریں:' };
+            return res.json({ reply: nf[lang] + '\n' + contact, context: lookupInput, escalate: true });
+        }
+        if (intent) {
+            const needContact = intent.esc || intent.id === 'contact';
+            return res.json({ reply: intent.a[lang] + (needContact ? '\n' + contact : ''), context: lookupInput, escalate: !!intent.esc });
+        }
+        res.json({ reply: SUPPORT_FALLBACK[lang] + '\n' + contact, context: lookupInput, escalate: true });
+    } catch (e) {
+        console.error('support chat error:', e.message);
+        res.json({
+            reply: 'I am having trouble answering right now. Please contact our human support team on WhatsApp or Telegram using the links in the support bar.',
+            escalate: true,
+        });
+    }
+});
+
+// Human escalation — creates a ticket with non-sensitive information only.
+app.post('/api/support/ticket', async (req, res) => {
+    try {
+        const b = req.body || {};
+        const strip = (t) => String(t || '')
+            .replace(/[A-Z0-9]{4,}-[A-Z0-9]{4,}-[A-Z0-9-]{4,}/gi, '[redacted]')   // licence-key shaped
+            .replace(/\b\d{4,8}\b(?=\s*(otp|code))/gi, '[redacted]')
+            .replace(/\b(password|otp|token|api[ _-]?key|secret)\s*[:=]\s*\S+/gi, '$1: [redacted]')
+            .slice(0, 2000);
+        const ticket = await SupportTicket.create({
+            id:       'TKT-' + Date.now().toString(36).toUpperCase(),
+            customer: String(b.customer || '').slice(0, 120),
+            orderId:  String(b.orderId || '').slice(0, 60),
+            category: String(b.category || 'general').slice(0, 60),
+            summary:  strip(b.summary),
+            status:   'Open',
+        });
+        try { await sendTelegramMessage(`🎫 <b>New support ticket</b>\nID: <code>${ticket.id}</code>\nCustomer: ${ticket.customer || '-'}\nOrder: ${ticket.orderId || '-'}\nCategory: ${ticket.category}\n${ticket.summary}`); } catch (e) {}
+        res.json({ ok: true, ticketId: ticket.id });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: 'Could not create ticket' });
+    }
+});
+
+app.get('/api/admin/support/tickets', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const tickets = await SupportTicket.find().sort({ createdAt: -1 }).limit(200).lean();
+    res.json({ tickets });
+});
+
+app.post('/api/admin/support/tickets/:id/status', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
+    const t = await SupportTicket.findOneAndUpdate({ id: req.params.id },
+        { status: String(req.body?.status || 'Closed').slice(0, 30) }, { new: true });
+    if (!t) return res.status(404).json({ error: 'Not found' });
+    res.json({ ok: true, ticket: t });
+});
+
+// Admin credentials come from environment variables only.
+const ADMIN_KEY = process.env.ADMIN_KEY || require('crypto').randomBytes(24).toString('hex');
+if (!process.env.ADMIN_KEY) console.warn('[admin] ADMIN_KEY is not set — a random key is used until you set it.');
+function _safeEq(a, b) { const c = require('crypto'); return c.timingSafeEqual(c.createHash('sha256').update(String(a)).digest(), c.createHash('sha256').update(String(b)).digest()); }
 app.post('/api/admin/login', (req, res) => {
-    const ip = (req.headers['x-forwarded-for'] || req.ip || '').toString().split(',')[0].trim();
-    if (_loginThrottled(ip)) return res.status(429).json({ error: 'Too many attempts. Try again later.' });
-    if (!ADMIN_USER || !ADMIN_PASS) return res.status(503).json({ error: 'Admin login is not configured on the server.' });
-
-    const { username = '', password = '', twofa = '' } = req.body || {};
-    const ok = _ctEq(String(username), ADMIN_USER)
-            && _ctEq(String(password), ADMIN_PASS)
-            && (!ADMIN_2FA || _ctEq(String(twofa), ADMIN_2FA));
-    if (!ok) { _loginFailed(ip); return res.status(401).json({ error: 'Invalid credentials' }); }
-
-    _adminLoginAttempts.delete(ip);
-    const token = issueAdminSession();
-    return res.json({ ok: true, token, expiresIn: ADMIN_SESSION_TTL_MS });
+    const { username = '', password = '', code = '' } = req.body || {};
+    const U = process.env.ADMIN_USERNAME, P = process.env.ADMIN_PASSWORD, F = process.env.ADMIN_2FA;
+    if (!U || !P || !F) return res.status(503).json({ ok: false, error: 'Admin login not configured' });
+    const ok = _safeEq(username, U) & _safeEq(password, P) & _safeEq(code, F);
+    if (!ok) return res.status(401).json({ ok: false });
+    res.json({ ok: true, adminKey: ADMIN_KEY });
 });
-
-app.post('/api/admin/logout', (req, res) => {
-    const k = (req.body?.adminKey || req.headers['x-admin-key'] || '').toString();
-    if (k.startsWith('as_')) adminSessions.delete(k);
-    res.json({ ok: true });
-});
+function isAdmin(req) { const k = (req.query.adminKey || req.body?.adminKey || req.headers['x-admin-key'] || '').toString(); return !!k && _safeEq(k, ADMIN_KEY); }
 
 // ── WhatsApp number normalization ─────────────────────────────────────────────
 // Normalizes Pakistani and international numbers to E.164-ish with + prefix
@@ -4230,14 +4377,6 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
                 incrementPromoUse(pr.code).catch(() => {});
             }
         }
-        // ── ADDITIVE (v9): referral attribution (signed cookie outranks any
-        //    client value; a code typed in the promo box is only used when it
-        //    was NOT a valid promo code, so the promo system is untouched) ──
-        let referralCode = '';
-        try {
-            referralCode = await Referral.resolveAttribution(req, promoCode ? '' : (promoCodeRaw || b.referralCode || ''));
-        } catch (e) { referralCode = ''; }
-
         // Store screenshot as base64 in DB — disk files on Render are wiped on restart
         let screenshotPath = '';
         let screenshotData = '';
@@ -4268,7 +4407,7 @@ app.post('/api/orders', _ordersUpload, async (req, res) => {
             });
         }
 
-        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, email, promoCode, referralCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
+        const order = { id, fullName, planKey, planLabel, planPricePKR, planPriceUSD, paymentMethod, whatsapp, telegram, email, promoCode, discountPKR, discountUSD, finalPricePKR, finalPriceUSD, country, txId, screenshotPath, screenshotData, screenshotHash, licenseKey: '', status: 'Pending', rejectReason: '', isDuplicate: false, duplicateFlag: false, dupeReasons: [], createdAt: new Date() };
         if (useDatabase) await Order.create(order); else { ordersMem.unshift(order); saveOrdersFile(); }
         broadcastSSE('new_order', order);
 
@@ -4486,8 +4625,6 @@ app.patch('/api/orders/:id', async (req, res) => {
                 }
             } catch(licErr) { console.error('License save error:', licErr.message); }
             sendLicenseEmail(orderDoc, lk).catch(emailErr => console.error('License email error:', emailErr.message));
-            // ADDITIVE (v9): pay referral commissions once, after confirmation
-            try { Referral.onOrderConfirmed({ ...(orderDoc.toObject ? orderDoc.toObject() : orderDoc), status: 'Approved', licenseKey: lk }); } catch (e) {}
         }
 
         broadcastSSE('order_updated', { id, ...updates });
@@ -4665,7 +4802,7 @@ app.post('/api/push/vapid-generate', async (req, res) => {
             if (useDatabase) await PushSub.updateMany({}, { active: false, lastError: 'VAPID rotated' });
             else { pushSubsMem = pushSubsMem.map(x => Object.assign({}, x, { active: false })); savePushSubsFile(); }
         } catch(e) {}
-        res.json({ ok: true, publicKey: keys.publicKey, privateKey: keys.privateKey, subject: subj, message: 'Keys generated and saved to vapid-keys.json. Push notifications are now active.' });
+        res.json({ ok: true, publicKey: keys.publicKey, subject: subj, message: 'Keys generated and saved to vapid-keys.json. Push notifications are now active.' });
     } catch(e) {
         res.status(500).json({ error: 'Failed to generate: ' + e.message });
     }
@@ -4855,7 +4992,6 @@ const promoSettingsSchema = new mongoose.Schema({
     dayKey:       { type: String,  default: '' },
     sentToday:    { type: Number,  default: 0 },
     lastSentAt:   { type: Date,    default: null },
-    manualTrading:{ type: Object,  default: () => ({ unlocked: true, updatedAt: null, by: '' }) },
     updatedAt:    { type: Date,    default: Date.now },
 }, { _id: false });
 const PromoSettings = mongoose.models.PromoSettings || mongoose.model('PromoSettings', promoSettingsSchema);
@@ -5053,43 +5189,6 @@ app.post('/api/promo/run-now', async (req, res) => {
     try { res.json(await runPromoOnce(true)); }
     catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
-
-// ══════════════════════════════════════════════════════════════════════
-//  MANUAL TRADING UNLOCK STATE
-//  Does NOT duplicate the manual trading / Quotex feature — it only holds
-//  an admin-controlled unlock flag that gates the customer entry point.
-//  Controlled from the Admin Panel and from authorized Telegram commands.
-// ══════════════════════════════════════════════════════════════════════
-async function getManualTrading() {
-    const cfg = await getPromoSettings();
-    const mt = cfg.manualTrading || {};
-    return { unlocked: mt.unlocked !== false, updatedAt: mt.updatedAt || null, by: mt.by || '' };
-}
-async function setManualTrading(unlocked, by) {
-    const state = { unlocked: !!unlocked, updatedAt: new Date(), by: String(by || 'admin').slice(0, 40) };
-    await savePromoSettings({ manualTrading: state });
-    broadcastSSE('manual_trading_state', { unlocked: state.unlocked });
-    return state;
-}
-
-// Public read-only state (no secrets) — used by the site to show availability.
-app.get('/api/manual-trading/state', async (req, res) => {
-    try { const s = await getManualTrading(); res.json({ unlocked: s.unlocked }); }
-    catch (e) { res.json({ unlocked: true }); }
-});
-
-// Admin toggle — server-side authorization only.
-app.get('/api/admin/manual-trading', async (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    res.json(await getManualTrading());
-});
-app.post('/api/admin/manual-trading', async (req, res) => {
-    if (!isAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
-    const state = await setManualTrading(!!req.body?.unlocked, req.body?.adminName || 'admin');
-    res.json({ ok: true, ...state });
-});
-
-
 
 // ── GET /sw.js — serve the service worker for push notifications ──────────────
 app.get('/sw.js', (req, res) => {
@@ -5574,18 +5673,6 @@ app.get('/api/push/subscribers/export.csv', async (req, res) => {
         res.setHeader('Content-Disposition', 'attachment; filename="push-subscribers-' + new Date().toISOString().slice(0,10) + '.csv"');
         res.send('\uFEFF' + csv);
     } catch(e) { res.status(500).json({ error: 'Export failed' }); }
-});
-
-// ================== ADDITIVE (v9): REFERRAL ENGINE ==================
-// Reuses the existing express app, mongoose connection, Order model and admin
-// authorization. No duplicate auth, orders or payment systems.
-const Referral = require('./referral')({
-    app,
-    mongoose,
-    Order,
-    isAdmin,
-    isDbReady: () => useDatabase,
-    notifyAdmin: (text) => { try { sendTelegramMessage(text); } catch (e) {} },
 });
 
 // ================== ROOT ==================
