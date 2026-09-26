@@ -3854,7 +3854,7 @@ async function setManualTradingUnlocked(nameOrKey, unlocked) {
         try { sendSSEToUser(user.fullName, 'manual_trading_access', { unlocked: !!unlocked }); } catch (e) {}
         return { ok: true, unlocked: !!unlocked,
             message: `${unlocked ? '🔓 Manual Trading unlocked' : '🔒 Manual Trading locked'} for <b>${user.fullName || q}</b>.\n` +
-                     `ℹ️ The existing Quotex connection requirement still applies.` };
+                     `ℹ️ This user can use Manual Trading without a Quotex connection.` };
     } catch (e) {
         return { ok: false, message: `❌ Error: ${e.message}` };
     }
@@ -3870,9 +3870,11 @@ app.post('/api/admin/manual-trading/unlock', async (req, res) => {
 
 app.get('/api/manual-trading/status', async (req, res) => {
     try {
-        const key = (req.query.licenceKey || '').toString().trim();
-        if (!key) return res.json({ unlocked: false });
-        const user = await User.findOne({ licenceKey: key });
+        const key  = (req.query.licenceKey || '').toString().trim();
+        const name = (req.query.userName || '').toString().trim();
+        if (!key && !name) return res.json({ unlocked: false });
+        const q = key ? { licenceKey: key } : { fullName: new RegExp('^' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') };
+        const user = await User.findOne(q);
         res.json({ unlocked: !!(user && user.manualTradingUnlocked) });
     } catch (e) { res.json({ unlocked: false }); }
 });
@@ -4517,7 +4519,7 @@ app.get('/api/orders/track/:id', async (req, res) => {
             if (useDatabase) order = await Order.findOne({ id }).lean();
             else order = ordersMem.find(x => String(x.id).toUpperCase() === id);
         } else {
-            const all = useDatabase ? await Order.find({}).sort({ createdAt: -1 }).limit(1000).lean() : [...ordersMem];
+            const all = useDatabase ? await Order.find({}).select('-screenshotData').sort({ createdAt: -1 }).limit(1000).lean() : [...ordersMem];
             order = all.find(x => method === 'telegram'
                 ? String(x.telegram || '').toLowerCase().replace(/^@/, '') === value.toLowerCase().replace(/^@/, '')
                 : _trackContactMatches({ whatsapp: x.whatsapp }, value));
