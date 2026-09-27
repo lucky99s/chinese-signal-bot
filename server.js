@@ -3995,7 +3995,9 @@ app.post('/api/support/chat', async (req, res) => {
         const last     = (messages[messages.length - 1]?.content || '').toString().slice(0, 2000);
         if (!last) return res.status(400).json({ error: 'Empty message' });
 
-        await loadSettingsFromDB().catch(() => {});
+        // Never let a slow/unavailable database block a built-in answer.
+        const _supTimeout = (p, ms, v) => Promise.race([p, new Promise(r => setTimeout(() => r(v), ms))]);
+        await _supTimeout(loadSettingsFromDB().catch(() => {}), 2500, null);
         const contact = `WhatsApp: ${botSettings.whatsappUrl || 'see the support bar on the website'} | Telegram: ${botSettings.telegramUrl || 'see the support bar on the website'}`;
 
         const lang = supportDetectLang(last);
@@ -4016,7 +4018,7 @@ app.post('/api/support/chat', async (req, res) => {
             whatsapp: ctx.whatsapp || (waMatch ? waMatch[1] : ''),
         };
         const order = (lookupInput.orderId || lookupInput.telegram || lookupInput.whatsapp)
-            ? await supportLookupOrder(lookupInput) : null;
+            ? await _supTimeout(supportLookupOrder(lookupInput).catch(() => null), 5000, null) : null;
 
         const hasId = !!(lookupInput.orderId || lookupInput.telegram || lookupInput.whatsapp);
         if (order) return res.json({ reply: supportOrderReply(order, lang), context: lookupInput, order });
